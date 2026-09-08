@@ -1,0 +1,6 @@
+.git
+.seksun-cnc
+**/node_modules
+**/dist
+**/__pycache__
+**/.pytest_cache

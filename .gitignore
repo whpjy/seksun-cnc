@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.seksun-cnc/
+services/geometry/build/
+
+# Local browser, renderer, simulator, and investigation artifacts
+.tmp-*/
+.browser-*-profile/
+tmp-*

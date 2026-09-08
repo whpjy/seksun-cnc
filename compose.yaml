@@ -1,0 +1,29 @@
+name: seksun-cnc
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      CNC_STORAGE_ROOT: /var/lib/seksun-cnc/jobs
+      CNC_ANALYZER_BIN: /opt/seksun-cnc/bin/occt-analyzer
+      CNC_FREECAD_CMD: FreeCADCmd
+      CNC_CAMOTICS_CMD: camsim
+      CNC_MAX_UPLOAD_MB: "200"
+      CNC_CORS_ORIGINS: http://localhost:5174,http://localhost:3001
+      CNC_PUBLIC_BASE_URL: ${CNC_PUBLIC_BASE_URL:-}
+    volumes:
+      - ./.seksun-cnc:/var/lib/seksun-cnc
+    ports:
+      - "8090:8090"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: apps/web
+    depends_on:
+      - api
+    ports:
+      - "3001:80"
+    restart: unless-stopped

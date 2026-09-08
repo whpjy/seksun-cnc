@@ -1,0 +1,992 @@
+import { useEffect, useRef, useState } from "react";
+import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
+import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
+import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
+import type { FixtureComponent, ManufacturingFeature, SimulationResult, ToolpathSegment, Vec3 } from "./types";
+
+type Props = {
+  modelUrl: string;
+  features: ManufacturingFeature[];
+  selectedFeatureIds: string[];
+  onSelectFeature: (id: string) => void;
+  onActiveOperationChange?: (id: string) => void;
+  toolpathSegments?: ToolpathSegment[];
+  profileBoundaries?: { operation_id: string; setup_id: string; work_axis: { x: number; y: number; z: number }; points: { x: number; y: number; z: number }[] }[];
+  simulation?: SimulationResult | null;
+  camoticsSurface?: { url: string; frame: { x: Vec3; y: Vec3; z: Vec3 } } | null;
+  fixtureComponents?: FixtureComponent[];
+  animateToolpath?: boolean;
+  initialProgress?: number;
+  operationTools?: Record<string, { diameter_mm: number; stickout_mm: number; holder_diameter_mm: number; kind: string; drill_point_angle_deg: number }>;
+  topologyEdges?: Vec3[][];
+  activeOperationId?: string;
+  toolpathLoaded?: boolean;
+};
+
+// Siemens NX/UG-style neutral blue-gray: dark enough to preserve the part's
+// silhouette while still allowing the lighting to describe fillets and ribs.
+const UG_PART_COLOR = 0x6f7b7d;
+const UG_TARGET_COLOR = 0x788689;
+const UG_EDGE_COLOR = 0x303a3d;
+
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, onActiveOperationChange, toolpathSegments = [], profileBoundaries = [], simulation = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, toolpathLoaded = true }: Props) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
+  const onSelectRef = useRef(onSelectFeature);
+  const onActiveOperationRef = useRef(onActiveOperationChange);
+  const selectedIdsRef = useRef(selectedFeatureIds);
+  const playbackRef = useRef({ playing: false, progress: initialProgress, speed: 1 });
+  const cameraStateRef = useRef<{ position: THREE.Vector3; target: THREE.Vector3; zoom: number } | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [progress, setProgress] = useState(initialProgress);
+  const [speed, setSpeed] = useState(1);
+  const [activeMotion, setActiveMotion] = useState<{ operation: string; motion: string; removesMaterial: boolean } | null>(null);
+  const [targetVisible, setTargetVisible] = useState(true);
+  const [toolVisible, setToolVisible] = useState(true);
+  const [trailVisible, setTrailVisible] = useState(true);
+  const viewApiRef = useRef<{
+    setView: (view: "iso" | "top" | "front" | "fit") => void;
+    setTargetVisible: (visible: boolean) => void;
+    setToolVisible: (visible: boolean) => void;
+    setTrailVisible: (visible: boolean) => void;
+  } | null>(null);
+
+  const updatePlaying = (value: boolean) => {
+    if (value && playbackRef.current.progress >= 0.999) {
+      playbackRef.current.progress = 0;
+      setProgress(0);
+    }
+    playbackRef.current.playing = value;
+    setPlaying(value);
+  };
+
+  const updateProgress = (value: number) => {
+    playbackRef.current.progress = value;
+    playbackRef.current.playing = false;
+    setProgress(value);
+    setPlaying(false);
+  };
+
+  const updateSpeed = (value: number) => {
+    playbackRef.current.speed = value;
+    setSpeed(value);
+  };
+
+  useEffect(() => {
+    onSelectRef.current = onSelectFeature;
+  }, [onSelectFeature]);
+
+  useEffect(() => {
+    onActiveOperationRef.current = onActiveOperationChange;
+  }, [onActiveOperationChange]);
+
+  useEffect(() => {
+    playbackRef.current.playing = false;
+    playbackRef.current.progress = 0;
+    const reset = window.setTimeout(() => {
+      setPlaying(false);
+      setProgress(0);
+      setActiveMotion(null);
+    }, 0);
+    return () => window.clearTimeout(reset);
+  }, [activeOperationId]);
+
+  useEffect(() => {
+    selectedIdsRef.current = selectedFeatureIds;
+    for (const [featureId, marker] of markersRef.current) {
+      const selected = selectedFeatureIds.includes(featureId);
+      const material = marker.material as THREE.MeshBasicMaterial;
+      material.color.set(selected ? 0x52d8af : 0xf0b35c);
+      material.opacity = selected ? 0.48 : 0.07;
+      marker.renderOrder = selected ? 5 : 3;
+    }
+  }, [selectedFeatureIds]);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xc9cdd0);
+    const camera = new THREE.OrthographicCamera(-100, 100, 100, -100, 0.1, 100000);
+    camera.up.set(0, 0, 1);
+    camera.position.set(120, -140, 150);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 0.92;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    host.appendChild(renderer.domElement);
+
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    const environmentTarget = pmremGenerator.fromScene(new RoomEnvironment(), 0.04);
+    scene.environment = environmentTarget.texture;
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    scene.add(new THREE.HemisphereLight(0xf4f7f8, 0x59636a, 1.15));
+    const light = new THREE.DirectionalLight(0xffffff, 2.15);
+    light.position.set(140, -100, 220);
+    light.castShadow = true;
+    light.shadow.mapSize.set(2048, 2048);
+    scene.add(light);
+    const fillLight = new THREE.DirectionalLight(0xc5d8e0, 0.72);
+    fillLight.position.set(-130, -70, 90);
+    scene.add(fillLight);
+    const rimLight = new THREE.DirectionalLight(0xffffff, 0.62);
+    rimLight.position.set(40, 160, 50);
+    scene.add(rimLight);
+    const floorGrid = new THREE.GridHelper(240, 24, 0x8a949e, 0xaab1b8);
+    floorGrid.rotation.x = Math.PI / 2;
+    const floorMaterials = Array.isArray(floorGrid.material) ? floorGrid.material : [floorGrid.material];
+    for (const material of floorMaterials) {
+      material.transparent = true;
+      material.opacity = 0.25;
+      material.depthWrite = false;
+    }
+    scene.add(floorGrid);
+
+    let model: THREE.Mesh | null = null;
+    let simulationMesh: THREE.Mesh | null = null;
+    let simulationWalls: THREE.Mesh | null = null;
+    let camoticsMesh: THREE.Mesh | null = null;
+    let playbackTool: THREE.Group | null = null;
+    let playbackCutter: THREE.Mesh | null = null;
+    let playbackDrillTip: THREE.Mesh | null = null;
+    let playbackHolder: THREE.Mesh | null = null;
+    let activePath: THREE.Line | null = null;
+    let trailPath: THREE.LineSegments | null = null;
+    let cadEdges: THREE.LineSegments | null = null;
+    let modelCenter = new THREE.Vector3();
+    let viewSize = 100;
+    let viewHeight = 200;
+    let viewAspect = 1;
+    let dynamicHeights: Float32Array | null = null;
+    let surfacePositions: THREE.BufferAttribute | null = null;
+    let materialProgress = 0;
+    let lastNormalsProgress = 0;
+    let processedRatios: number[] = [];
+    const outsideProfileIndices: number[] = [];
+    let profileDetachWeight = Number.POSITIVE_INFINITY;
+    const fixtureMeshes: { mesh: THREE.Mesh; setupId?: string | null }[] = [];
+    let animation = 0;
+    let lastFrameTime = performance.now();
+    let lastReportedSegment = -1;
+    const markerGroup = new THREE.Group();
+    scene.add(markerGroup);
+    markersRef.current = new Map();
+    const surfaceFrame = simulation?.surface.frame ?? {
+      x: { x: 1, y: 0, z: 0 },
+      y: { x: 0, y: 1, z: 0 },
+      z: { x: 0, y: 0, z: 1 },
+    };
+    const localToScene = (x: number, y: number, z: number) => new THREE.Vector3(
+      x * surfaceFrame.x.x + y * surfaceFrame.y.x + z * surfaceFrame.z.x - modelCenter.x,
+      x * surfaceFrame.x.y + y * surfaceFrame.y.y + z * surfaceFrame.z.y - modelCenter.y,
+      x * surfaceFrame.x.z + y * surfaceFrame.y.z + z * surfaceFrame.z.z - modelCenter.z,
+    );
+    const worldToLocal = (x: number, y: number, z: number) => ({
+      x: x * surfaceFrame.x.x + y * surfaceFrame.x.y + z * surfaceFrame.x.z,
+      y: x * surfaceFrame.y.x + y * surfaceFrame.y.y + z * surfaceFrame.y.z,
+      z: x * surfaceFrame.z.x + y * surfaceFrame.z.y + z * surfaceFrame.z.z,
+    });
+    const resize = () => {
+      const width = host.clientWidth;
+      const height = host.clientHeight;
+      renderer.setSize(width, height, false);
+      viewAspect = width / Math.max(height, 1);
+      camera.left = -viewHeight * viewAspect / 2;
+      camera.right = viewHeight * viewAspect / 2;
+      camera.top = viewHeight / 2;
+      camera.bottom = -viewHeight / 2;
+      camera.updateProjectionMatrix();
+    };
+    const observer = new ResizeObserver(resize);
+    observer.observe(host);
+    resize();
+
+    new STLLoader().load(modelUrl, (geometry) => {
+      geometry.computeBoundingBox();
+      const bounds = geometry.boundingBox;
+      modelCenter = new THREE.Vector3();
+      if (bounds) {
+        bounds.getCenter(modelCenter);
+        geometry.translate(-modelCenter.x, -modelCenter.y, -modelCenter.z);
+        const size = bounds.getSize(new THREE.Vector3()).length();
+        viewSize = size;
+        camera.position.set(size * 1.25, -size * 1.7, size * 2.0);
+        camera.near = Math.max(size / 1000, 0.01);
+        camera.far = size * 100;
+        camera.updateProjectionMatrix();
+        const centeredMinimumZ = bounds.min.z - modelCenter.z;
+        floorGrid.position.z = centeredMinimumZ - Math.max(size * 0.025, 0.5);
+        floorGrid.scale.setScalar(Math.max(size / 170, 0.7));
+      }
+      const renderGeometry = toCreasedNormals(geometry, THREE.MathUtils.degToRad(52));
+      const modelPositions = renderGeometry.getAttribute("position") as THREE.BufferAttribute;
+      model = new THREE.Mesh(
+        renderGeometry,
+        new THREE.MeshPhysicalMaterial({
+          color: simulation ? UG_TARGET_COLOR : UG_PART_COLOR,
+          roughness: 0.56,
+          metalness: 0.06,
+          clearcoat: 0.04,
+          clearcoatRoughness: 0.68,
+          envMapIntensity: 0.5,
+          transparent: Boolean(simulation),
+          opacity: simulation ? 0.16 : 1,
+          depthWrite: !simulation,
+          // Keep coplanar CAD edge overlays stable when zoomed in. Without a
+          // small depth bias the edge and surface alternate at sub-pixel depth,
+          // producing the broken/dotted outlines visible at high zoom.
+          polygonOffset: true,
+          polygonOffsetFactor: simulation ? -2 : 1,
+          polygonOffsetUnits: simulation ? -2 : 1,
+        }),
+      );
+      // NX-style translucent target body shows the intended geometry while the
+      // opaque IPW changes beneath it, without coplanar depth flicker.
+      model.visible = true;
+      model.castShadow = true;
+      model.receiveShadow = true;
+      scene.add(model);
+
+      const edgeCoordinates: number[] = [];
+      if (topologyEdges.length) {
+        for (const edge of topologyEdges) {
+          for (let index = 1; index < edge.length; index += 1) {
+            const start = edge[index - 1];
+            const end = edge[index];
+            edgeCoordinates.push(
+              start.x - modelCenter.x, start.y - modelCenter.y, start.z - modelCenter.z,
+              end.x - modelCenter.x, end.y - modelCenter.y, end.z - modelCenter.z,
+            );
+          }
+        }
+      }
+      const edgeGeometry = edgeCoordinates.length
+        ? new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute(edgeCoordinates, 3))
+        : new THREE.EdgesGeometry(renderGeometry, 32);
+      cadEdges = new THREE.LineSegments(
+        edgeGeometry,
+        new THREE.LineBasicMaterial({
+          color: UG_EDGE_COLOR,
+          transparent: true,
+          opacity: simulation ? 0.24 : 0.64,
+          depthTest: true,
+          depthWrite: false,
+        }),
+      );
+      cadEdges.renderOrder = 2;
+      scene.add(cadEdges);
+      if (renderGeometry !== geometry) geometry.dispose();
+
+      if (camoticsSurface) {
+        new STLLoader().load(camoticsSurface.url, (stockGeometry) => {
+          const frame = camoticsSurface.frame;
+          const transform = new THREE.Matrix4().set(
+            frame.x.x, frame.y.x, frame.z.x, -modelCenter.x,
+            frame.x.y, frame.y.y, frame.z.y, -modelCenter.y,
+            frame.x.z, frame.y.z, frame.z.z, -modelCenter.z,
+            0, 0, 0, 1,
+          );
+          stockGeometry.applyMatrix4(transform);
+          stockGeometry.computeVertexNormals();
+          camoticsMesh = new THREE.Mesh(
+            toCreasedNormals(stockGeometry, THREE.MathUtils.degToRad(42)),
+            new THREE.MeshPhysicalMaterial({
+              color: 0xaebbc1,
+              roughness: 0.32,
+              metalness: 0.62,
+              clearcoat: 0.18,
+              clearcoatRoughness: 0.45,
+              envMapIntensity: 0.9,
+            }),
+          );
+          camoticsMesh.visible = !animateToolpath || playbackRef.current.progress >= 0.999;
+          camoticsMesh.castShadow = true;
+          camoticsMesh.receiveShadow = true;
+          scene.add(camoticsMesh);
+        });
+      }
+
+      if (animateToolpath && toolpathSegments.length) {
+        playbackTool = new THREE.Group();
+        playbackCutter = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.5, 0.5, 1, 20),
+          new THREE.MeshStandardMaterial({ color: 0xc7d1d7, emissive: 0x172129, metalness: 0.82, roughness: 0.18 }),
+        );
+        playbackDrillTip = new THREE.Mesh(
+          new THREE.ConeGeometry(0.5, 1, 20),
+          new THREE.MeshStandardMaterial({ color: 0xc7d1d7, emissive: 0x172129, metalness: 0.82, roughness: 0.18 }),
+        );
+        playbackDrillTip.rotation.x = Math.PI;
+        playbackHolder = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.38, 0.5, 1, 32),
+          new THREE.MeshStandardMaterial({ color: 0x4e5961, metalness: 0.76, roughness: 0.24, transparent: true, opacity: 0.55, depthWrite: false }),
+        );
+        playbackTool.add(playbackCutter, playbackDrillTip, playbackHolder);
+        playbackTool.renderOrder = 12;
+        scene.add(playbackTool);
+        const activeGeometry = new THREE.BufferGeometry();
+        activeGeometry.setAttribute("position", new THREE.Float32BufferAttribute([0, 0, 0, 0, 0, 0], 3));
+        activePath = new THREE.Line(activeGeometry, new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false }));
+        activePath.renderOrder = 11;
+        scene.add(activePath);
+        const trailCoordinates = toolpathSegments.flatMap((segment) => [
+          segment.x1 - modelCenter.x, segment.y1 - modelCenter.y, segment.z1 - modelCenter.z,
+          segment.x2 - modelCenter.x, segment.y2 - modelCenter.y, segment.z2 - modelCenter.z,
+        ]);
+        const trailGeometry = new THREE.BufferGeometry();
+        trailGeometry.setAttribute("position", new THREE.Float32BufferAttribute(trailCoordinates, 3));
+        trailGeometry.setDrawRange(0, 0);
+        trailPath = new THREE.LineSegments(
+          trailGeometry,
+          new THREE.LineBasicMaterial({ color: 0x168fc0, transparent: true, opacity: 0.42, depthTest: false }),
+        );
+        trailPath.renderOrder = 10;
+        trailPath.visible = true;
+        scene.add(trailPath);
+      }
+
+      for (const fixture of fixtureComponents) {
+        const size = fixture.bounds.size;
+        const fixtureGeometry = new THREE.BoxGeometry(size.x, size.y, size.z);
+        const sacrificial = fixture.kind === "sacrificial";
+        const fixtureColor = sacrificial ? 0x4da98c : fixture.kind === "machine" ? 0xe15d65 : 0xe15d65;
+        const fixtureMesh = new THREE.Mesh(
+          fixtureGeometry,
+          new THREE.MeshBasicMaterial({
+            color: fixtureColor,
+            transparent: true,
+            opacity: sacrificial ? 0.08 : 0.12,
+            wireframe: !sacrificial,
+            depthTest: true,
+          }),
+        );
+        fixtureMesh.position.set(
+          (fixture.bounds.minimum.x + fixture.bounds.maximum.x) / 2 - modelCenter.x,
+          (fixture.bounds.minimum.y + fixture.bounds.maximum.y) / 2 - modelCenter.y,
+          (fixture.bounds.minimum.z + fixture.bounds.maximum.z) / 2 - modelCenter.z,
+        );
+        fixtureMesh.renderOrder = 6;
+        markerGroup.add(fixtureMesh);
+        fixtureMeshes.push({ mesh: fixtureMesh, setupId: fixture.setup_id });
+      }
+
+      if (simulation && !camoticsSurface) {
+        const surface = simulation.surface;
+        const positions: number[] = [];
+        const indices: number[] = [];
+        for (let row = 0; row < surface.rows; row += 1) {
+          for (let column = 0; column < surface.columns; column += 1) {
+            const index = row * surface.columns + column;
+            const point = localToScene(
+              surface.origin.x + column * surface.resolution_mm,
+              surface.origin.y + row * surface.resolution_mm,
+              animateToolpath ? surface.top_z : surface.heights[index],
+            );
+            positions.push(point.x, point.y, point.z);
+          }
+        }
+        for (let row = 0; row < surface.rows - 1; row += 1) {
+          for (let column = 0; column < surface.columns - 1; column += 1) {
+            const current = row * surface.columns + column;
+            const nextRow = current + surface.columns;
+            indices.push(current, current + 1, nextRow, current + 1, nextRow + 1, nextRow);
+          }
+        }
+        const surfaceGeometry = new THREE.BufferGeometry();
+        surfaceGeometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+        surfacePositions = surfaceGeometry.getAttribute("position") as THREE.BufferAttribute;
+        surfaceGeometry.setIndex(indices);
+        surfaceGeometry.computeVertexNormals();
+        dynamicHeights = new Float32Array(surface.columns * surface.rows);
+        dynamicHeights.fill(animateToolpath ? surface.top_z : 0);
+        if (!animateToolpath) dynamicHeights.set(surface.heights);
+        processedRatios = new Array(toolpathSegments.length).fill(0);
+        simulationMesh = new THREE.Mesh(
+          surfaceGeometry,
+          new THREE.MeshStandardMaterial({ color: 0xbfc8cd, roughness: 0.38, metalness: 0.56, side: THREE.DoubleSide }),
+        );
+        simulationMesh.renderOrder = 4;
+        scene.add(simulationMesh);
+        simulationWalls = new THREE.Mesh(
+          new THREE.BufferGeometry(),
+          new THREE.MeshStandardMaterial({ color: 0x8f9ca4, roughness: 0.46, metalness: 0.48, side: THREE.DoubleSide }),
+        );
+        simulationWalls.renderOrder = 5;
+        scene.add(simulationWalls);
+        rebuildMaterialWalls();
+      }
+
+      for (const motion of (animateToolpath ? [] : ["rapid", "cut"]) as ("rapid" | "cut")[]) {
+        const coordinates: number[] = [];
+        for (const segment of toolpathSegments.filter((item) => item.motion === motion)) {
+          coordinates.push(
+            segment.x1 - modelCenter.x, segment.y1 - modelCenter.y, segment.z1 - modelCenter.z,
+            segment.x2 - modelCenter.x, segment.y2 - modelCenter.y, segment.z2 - modelCenter.z,
+          );
+        }
+        if (!coordinates.length) continue;
+        const pathGeometry = new THREE.BufferGeometry();
+        pathGeometry.setAttribute("position", new THREE.Float32BufferAttribute(coordinates, 3));
+        const pathLines = new THREE.LineSegments(
+          pathGeometry,
+          new THREE.LineBasicMaterial({
+            color: motion === "cut" ? 0x52d8af : 0x718397,
+            transparent: motion === "rapid",
+            opacity: motion === "rapid" ? 0.35 : 1,
+            depthTest: false,
+          }),
+        );
+        pathLines.renderOrder = 8;
+        markerGroup.add(pathLines);
+      }
+
+      for (const feature of simulation ? [] : features) {
+        let markerGeometry: THREE.BufferGeometry;
+        let axisValue;
+        let offset = 0;
+        let cylinderMarker = false;
+        if ("depth" in feature) {
+          markerGeometry = new THREE.BoxGeometry(
+            Math.max(feature.bounds.size.x || (Math.abs(feature.access_direction.x) * feature.depth), 0.2),
+            Math.max(feature.bounds.size.y || (Math.abs(feature.access_direction.y) * feature.depth), 0.2),
+            Math.max(feature.bounds.size.z || (Math.abs(feature.access_direction.z) * feature.depth), 0.2),
+          );
+          axisValue = feature.access_direction;
+          offset = feature.depth / 2;
+        } else {
+          markerGeometry = new THREE.CylinderGeometry(
+            Math.max(feature.radius * 1.04, 0.15),
+            Math.max(feature.radius * 1.04, 0.15),
+            Math.max(feature.length, 0.2),
+            18,
+            1,
+            true,
+          );
+          axisValue = feature.axis;
+          cylinderMarker = true;
+        }
+        const selected = selectedIdsRef.current.includes(feature.id);
+        const marker = new THREE.Mesh(
+          markerGeometry,
+          new THREE.MeshBasicMaterial({
+            color: selected ? 0x52d8af : 0xf0b35c,
+            wireframe: true,
+            transparent: true,
+            opacity: selected ? 0.48 : 0.07,
+            depthTest: false,
+          }),
+        );
+        const axis = new THREE.Vector3(axisValue.x, axisValue.y, axisValue.z).normalize();
+        marker.position.set(
+          feature.center.x + axis.x * offset - modelCenter.x,
+          feature.center.y + axis.y * offset - modelCenter.y,
+          feature.center.z + axis.z * offset - modelCenter.z,
+        );
+        if (cylinderMarker) marker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis);
+        marker.userData.featureId = feature.id;
+        marker.renderOrder = selected ? 5 : 3;
+        markerGroup.add(marker);
+        markersRef.current.set(feature.id, marker);
+      }
+
+      controls.target.set(0, 0, 0);
+      controls.update();
+      const fitDirection = (directionValue: THREE.Vector3) => {
+        const direction = directionValue.lengthSq() < 1e-6
+          ? new THREE.Vector3(1.05, -1.35, 1.15).normalize()
+          : directionValue.normalize();
+        const forward = direction.clone().negate();
+        const right = new THREE.Vector3().crossVectors(forward, camera.up);
+        if (right.lengthSq() < 1e-6) right.set(1, 0, 0);
+        right.normalize();
+        const screenUp = new THREE.Vector3().crossVectors(right, forward).normalize();
+        let minX = Number.POSITIVE_INFINITY;
+        let maxX = Number.NEGATIVE_INFINITY;
+        let minY = Number.POSITIVE_INFINITY;
+        let maxY = Number.NEGATIVE_INFINITY;
+        let minDepth = Number.POSITIVE_INFINITY;
+        let maxDepth = Number.NEGATIVE_INFINITY;
+        const positions = modelPositions.array as ArrayLike<number>;
+        for (let index = 0; index < positions.length; index += 3) {
+          const x = positions[index];
+          const y = positions[index + 1];
+          const z = positions[index + 2];
+          const projectedX = x * right.x + y * right.y + z * right.z;
+          const projectedY = x * screenUp.x + y * screenUp.y + z * screenUp.z;
+          const projectedDepth = x * forward.x + y * forward.y + z * forward.z;
+          minX = Math.min(minX, projectedX);
+          maxX = Math.max(maxX, projectedX);
+          minY = Math.min(minY, projectedY);
+          maxY = Math.max(maxY, projectedY);
+          minDepth = Math.min(minDepth, projectedDepth);
+          maxDepth = Math.max(maxDepth, projectedDepth);
+        }
+        const halfWidth = (maxX - minX) / 2;
+        const halfHeight = (maxY - minY) / 2;
+        viewHeight = Math.max(halfHeight * 2, halfWidth * 2 / Math.max(viewAspect, 0.1)) / 0.82;
+        const radius = viewSize / 2;
+        const distance = viewSize * 2.2;
+        const target = right.clone().multiplyScalar((minX + maxX) / 2)
+          .add(screenUp.clone().multiplyScalar((minY + maxY) / 2))
+          .add(forward.clone().multiplyScalar((minDepth + maxDepth) / 2));
+        controls.target.copy(target);
+        camera.position.copy(target).add(direction.multiplyScalar(distance));
+        camera.zoom = 1;
+        camera.left = -viewHeight * viewAspect / 2;
+        camera.right = viewHeight * viewAspect / 2;
+        camera.top = viewHeight / 2;
+        camera.bottom = -viewHeight / 2;
+        camera.near = Math.max(distance - radius * 2, 0.01);
+        camera.far = distance + radius * 4;
+        camera.updateProjectionMatrix();
+        controls.update();
+      };
+      const setView = (view: "iso" | "top" | "front" | "fit") => {
+        const direction = view === "fit"
+          ? camera.position.clone().sub(controls.target)
+          : view === "top"
+          ? new THREE.Vector3(0, 0, 1)
+          : view === "front"
+            ? new THREE.Vector3(0, -1, 0.12)
+            : new THREE.Vector3(1.05, -1.35, 1.15);
+        fitDirection(direction);
+      };
+      viewApiRef.current = {
+        setView,
+        setTargetVisible: (visible) => { if (model) model.visible = !simulation || visible; },
+        setToolVisible: (visible) => { if (playbackTool) playbackTool.visible = visible; },
+        setTrailVisible: (visible) => { if (trailPath) trailPath.visible = visible; },
+      };
+      const savedCamera = cameraStateRef.current;
+      if (savedCamera) {
+        camera.position.copy(savedCamera.position);
+        camera.zoom = savedCamera.zoom;
+        controls.target.copy(savedCamera.target);
+        camera.updateProjectionMatrix();
+        controls.update();
+      } else {
+        fitDirection(camera.position.clone());
+      }
+    });
+
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    const pickFeature = (event: PointerEvent) => {
+      const rectangle = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rectangle.left) / rectangle.width) * 2 - 1;
+      pointer.y = -((event.clientY - rectangle.top) / rectangle.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const hit = raycaster.intersectObjects(Array.from(markersRef.current.values()), false)[0];
+      const featureId = hit?.object.userData.featureId as string | undefined;
+      if (featureId) onSelectRef.current(featureId);
+    };
+    renderer.domElement.addEventListener("pointerup", pickFeature);
+
+    const segmentWeights = toolpathSegments.map((segment) => {
+      const distance = Math.hypot(segment.x2 - segment.x1, segment.y2 - segment.y1, segment.z2 - segment.z1);
+      return Math.max(0.01, distance / (segment.motion === "rapid" ? 4 : 1));
+    });
+    const totalWeight = segmentWeights.reduce((sum, value) => sum + value, 0) || 1;
+    const cumulativeWeights = [0];
+    for (const value of segmentWeights) cumulativeWeights.push(cumulativeWeights[cumulativeWeights.length - 1] + value);
+
+    if (simulation && profileBoundaries.length) {
+      const boundary = profileBoundaries[0];
+      const localBoundary = boundary.points.map((point) => worldToLocal(point.x, point.y, point.z));
+      const insidePolygon = (x: number, y: number) => {
+        let inside = false;
+        let previous = localBoundary[localBoundary.length - 1];
+        for (const current of localBoundary) {
+          if ((previous.y > y) !== (current.y > y)) {
+            const crossingX = (current.x - previous.x) * (y - previous.y) / (current.y - previous.y) + previous.x;
+            if (x < crossingX) inside = !inside;
+          }
+          previous = current;
+        }
+        return inside;
+      };
+      for (let row = 0; row < simulation.surface.rows; row += 1) {
+        for (let column = 0; column < simulation.surface.columns; column += 1) {
+          const x = simulation.surface.origin.x + column * simulation.surface.resolution_mm;
+          const y = simulation.surface.origin.y + row * simulation.surface.resolution_mm;
+          if (!insidePolygon(x, y)) outsideProfileIndices.push(row * simulation.surface.columns + column);
+        }
+      }
+      let finalProfileSegment = -1;
+      for (let index = 0; index < toolpathSegments.length; index += 1) {
+        if (toolpathSegments[index].operation_id === boundary.operation_id && toolpathSegments[index].motion === "cut") {
+          finalProfileSegment = index;
+        }
+      }
+      if (finalProfileSegment >= 0) profileDetachWeight = cumulativeWeights[finalProfileSegment + 1];
+    }
+
+    const isMaterialCut = (segment: ToolpathSegment) => {
+      if (!simulation) return false;
+      const tool = operationTools[segment.operation_id];
+      return segment.motion === "cut" && tool?.kind !== "chamfer_mill"
+        && (!simulation.surface.setup_id || !segment.setup_id || segment.setup_id === simulation.surface.setup_id);
+    };
+
+    const resetMaterial = () => {
+      if (!simulation || !dynamicHeights || !surfacePositions) return;
+      dynamicHeights.fill(simulation.surface.top_z);
+      for (let index = 0; index < dynamicHeights.length; index += 1) {
+        const column = index % simulation.surface.columns;
+        const row = Math.floor(index / simulation.surface.columns);
+        const point = localToScene(
+          simulation.surface.origin.x + column * simulation.surface.resolution_mm,
+          simulation.surface.origin.y + row * simulation.surface.resolution_mm,
+          simulation.surface.top_z,
+        );
+        surfacePositions.setXYZ(index, point.x, point.y, point.z);
+      }
+      surfacePositions.needsUpdate = true;
+      processedRatios.fill(0);
+      materialProgress = 0;
+    };
+
+    const rebuildMaterialWalls = () => {
+      if (!simulation || !simulationMesh || !simulationWalls || !dynamicHeights) return;
+      const surface = simulation.surface;
+      const heights = dynamicHeights;
+      const positions: number[] = [];
+      const indices: number[] = [];
+      const addQuad = (a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, d: THREE.Vector3) => {
+        const base = positions.length / 3;
+        for (const point of [a, b, c, d]) positions.push(point.x, point.y, point.z);
+        indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      };
+      const half = surface.resolution_mm / 2;
+      const bottomThreshold = surface.bottom_z + 0.02;
+
+      // A through-cut is empty space, not a sheet of material collapsed onto Z-bottom.
+      // Rebuild the top triangles so completed holes and detached outside scrap are
+      // genuinely open and reveal the sacrificial plate underneath.
+      const surfaceIndices: number[] = [];
+      for (let row = 0; row < surface.rows - 1; row += 1) {
+        for (let column = 0; column < surface.columns - 1; column += 1) {
+          const a = row * surface.columns + column;
+          const b = a + 1;
+          const c = a + surface.columns;
+          const d = c + 1;
+          if (dynamicHeights[a] > bottomThreshold && dynamicHeights[b] > bottomThreshold && dynamicHeights[c] > bottomThreshold) {
+            surfaceIndices.push(a, b, c);
+          }
+          if (dynamicHeights[b] > bottomThreshold && dynamicHeights[d] > bottomThreshold && dynamicHeights[c] > bottomThreshold) {
+            surfaceIndices.push(b, d, c);
+          }
+        }
+      }
+      simulationMesh.geometry.setIndex(surfaceIndices);
+      simulationMesh.geometry.computeVertexNormals();
+
+      for (let row = 0; row < surface.rows; row += 1) {
+        for (let column = 0; column < surface.columns; column += 1) {
+          const index = row * surface.columns + column;
+          const height = dynamicHeights[index];
+          const x = surface.origin.x + column * surface.resolution_mm;
+          const y = surface.origin.y + row * surface.resolution_mm;
+          if (column + 1 < surface.columns) {
+            const neighbor = dynamicHeights[index + 1];
+            if (Math.abs(height - neighbor) > 0.02) {
+              const low = Math.min(height, neighbor);
+              const high = Math.max(height, neighbor);
+              const wallX = x + half;
+              addQuad(
+                localToScene(wallX, y - half, low), localToScene(wallX, y + half, low),
+                localToScene(wallX, y + half, high), localToScene(wallX, y - half, high),
+              );
+            }
+          }
+          if (row + 1 < surface.rows) {
+            const neighbor = dynamicHeights[index + surface.columns];
+            if (Math.abs(height - neighbor) > 0.02) {
+              const low = Math.min(height, neighbor);
+              const high = Math.max(height, neighbor);
+              const wallY = y + half;
+              addQuad(
+                localToScene(x - half, wallY, low), localToScene(x + half, wallY, low),
+                localToScene(x + half, wallY, high), localToScene(x - half, wallY, high),
+              );
+            }
+          }
+        }
+      }
+
+      // Recreate only the outside stock walls that still contain material. This
+      // keeps the raw blank solid at the start and lets detached scrap disappear.
+      const addOutsideWall = (indexA: number, indexB: number) => {
+        const heightA = heights[indexA];
+        const heightB = heights[indexB];
+        if (heightA <= bottomThreshold && heightB <= bottomThreshold) return;
+        const ax = surface.origin.x + (indexA % surface.columns) * surface.resolution_mm;
+        const ay = surface.origin.y + Math.floor(indexA / surface.columns) * surface.resolution_mm;
+        const bx = surface.origin.x + (indexB % surface.columns) * surface.resolution_mm;
+        const by = surface.origin.y + Math.floor(indexB / surface.columns) * surface.resolution_mm;
+        addQuad(
+          localToScene(ax, ay, surface.bottom_z),
+          localToScene(bx, by, surface.bottom_z),
+          localToScene(bx, by, heightB),
+          localToScene(ax, ay, heightA),
+        );
+      };
+      for (let column = 0; column < surface.columns - 1; column += 1) {
+        addOutsideWall(column, column + 1);
+        const bottomRow = (surface.rows - 1) * surface.columns;
+        addOutsideWall(bottomRow + column + 1, bottomRow + column);
+      }
+      for (let row = 0; row < surface.rows - 1; row += 1) {
+        addOutsideWall((row + 1) * surface.columns, row * surface.columns);
+        addOutsideWall(row * surface.columns + surface.columns - 1, (row + 1) * surface.columns + surface.columns - 1);
+      }
+      const geometry = simulationWalls.geometry;
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setIndex(indices);
+      geometry.computeVertexNormals();
+    };
+
+    const detachOutsideScrap = () => {
+      if (!simulation || !dynamicHeights || !surfacePositions) return;
+      for (const index of outsideProfileIndices) {
+        dynamicHeights[index] = simulation.surface.bottom_z;
+        const column = index % simulation.surface.columns;
+        const row = Math.floor(index / simulation.surface.columns);
+        const point = localToScene(
+          simulation.surface.origin.x + column * simulation.surface.resolution_mm,
+          simulation.surface.origin.y + row * simulation.surface.resolution_mm,
+          simulation.surface.bottom_z,
+        );
+        surfacePositions.setXYZ(index, point.x, point.y, point.z);
+      }
+    };
+
+    const removeDisk = (x: number, y: number, cuttingZ: number, radius: number) => {
+      if (!simulation || !dynamicHeights || !surfacePositions) return;
+      const surface = simulation.surface;
+      const local = worldToLocal(x, y, cuttingZ);
+      const clampedZ = Math.max(surface.bottom_z, Math.min(surface.top_z, local.z));
+      const columnMin = Math.max(0, Math.floor((local.x - radius - surface.origin.x) / surface.resolution_mm));
+      const columnMax = Math.min(surface.columns - 1, Math.ceil((local.x + radius - surface.origin.x) / surface.resolution_mm));
+      const rowMin = Math.max(0, Math.floor((local.y - radius - surface.origin.y) / surface.resolution_mm));
+      const rowMax = Math.min(surface.rows - 1, Math.ceil((local.y + radius - surface.origin.y) / surface.resolution_mm));
+      const radiusSquared = radius * radius;
+      for (let row = rowMin; row <= rowMax; row += 1) {
+        const cellY = surface.origin.y + row * surface.resolution_mm;
+        for (let column = columnMin; column <= columnMax; column += 1) {
+          const cellX = surface.origin.x + column * surface.resolution_mm;
+          if ((cellX - local.x) ** 2 + (cellY - local.y) ** 2 > radiusSquared) continue;
+          const index = row * surface.columns + column;
+          if (clampedZ < dynamicHeights[index]) {
+            dynamicHeights[index] = clampedZ;
+            const point = localToScene(cellX, cellY, clampedZ);
+            surfacePositions.setXYZ(index, point.x, point.y, point.z);
+          }
+        }
+      }
+    };
+
+    const applyMaterialSegment = (segment: ToolpathSegment, fromRatio: number, toRatio: number) => {
+      if (!simulation || !isMaterialCut(segment) || toRatio <= fromRatio) return;
+      const distance = Math.hypot(segment.x2 - segment.x1, segment.y2 - segment.y1, segment.z2 - segment.z1);
+      const span = distance * (toRatio - fromRatio);
+      const sampleCount = Math.max(1, Math.ceil(span / Math.max(simulation.surface.resolution_mm * 0.5, 0.1)));
+      const tool = operationTools[segment.operation_id] ?? { diameter_mm: 6, stickout_mm: 25 };
+      for (let sample = 1; sample <= sampleCount; sample += 1) {
+        const ratio = THREE.MathUtils.lerp(fromRatio, toRatio, sample / sampleCount);
+        removeDisk(
+          THREE.MathUtils.lerp(segment.x1, segment.x2, ratio),
+          THREE.MathUtils.lerp(segment.y1, segment.y2, ratio),
+          THREE.MathUtils.lerp(segment.z1, segment.z2, ratio),
+          tool.diameter_mm / 2,
+        );
+      }
+    };
+
+    const updateMaterial = (currentProgress: number, targetWeight: number) => {
+      if (!simulation || !dynamicHeights || !surfacePositions || !animateToolpath) return;
+      if (Math.abs(currentProgress - materialProgress) < 1e-6) return;
+      if (currentProgress + 1e-6 < materialProgress) resetMaterial();
+      for (let index = 0; index < toolpathSegments.length; index += 1) {
+        const desiredRatio = targetWeight >= cumulativeWeights[index + 1]
+          ? 1
+          : targetWeight <= cumulativeWeights[index]
+            ? 0
+            : (targetWeight - cumulativeWeights[index]) / segmentWeights[index];
+        if (desiredRatio > processedRatios[index]) {
+          applyMaterialSegment(toolpathSegments[index], processedRatios[index], desiredRatio);
+          processedRatios[index] = desiredRatio;
+        }
+      }
+      if (targetWeight >= profileDetachWeight) detachOutsideScrap();
+      surfacePositions.needsUpdate = true;
+      if (Math.abs(currentProgress - lastNormalsProgress) >= 0.015 || currentProgress >= 0.999 || currentProgress === 0) {
+        rebuildMaterialWalls();
+        lastNormalsProgress = currentProgress;
+      }
+      materialProgress = currentProgress;
+    };
+
+    const updatePlaybackScene = (currentProgress: number) => {
+      if (!playbackTool || !activePath || !toolpathSegments.length) return;
+      const targetWeight = currentProgress * totalWeight;
+      updateMaterial(currentProgress, targetWeight);
+      let segmentIndex = cumulativeWeights.findIndex((value, index) => index > 0 && value >= targetWeight) - 1;
+      if (segmentIndex < 0) segmentIndex = toolpathSegments.length - 1;
+      segmentIndex = Math.min(segmentIndex, toolpathSegments.length - 1);
+      const segment = toolpathSegments[segmentIndex];
+      for (const fixture of fixtureMeshes) {
+        fixture.mesh.visible = !fixture.setupId || !segment.setup_id || fixture.setupId === segment.setup_id;
+      }
+      const startWeight = cumulativeWeights[segmentIndex];
+      const ratio = Math.min(1, Math.max(0, (targetWeight - startWeight) / segmentWeights[segmentIndex]));
+      const tip = new THREE.Vector3(
+        THREE.MathUtils.lerp(segment.x1, segment.x2, ratio) - modelCenter.x,
+        THREE.MathUtils.lerp(segment.y1, segment.y2, ratio) - modelCenter.y,
+        THREE.MathUtils.lerp(segment.z1, segment.z2, ratio) - modelCenter.z,
+      );
+      const axisValue = segment.work_axis ?? { x: 0, y: 0, z: 1 };
+      const axis = new THREE.Vector3(axisValue.x, axisValue.y, axisValue.z).normalize();
+      const tool = operationTools[segment.operation_id] ?? { diameter_mm: 6, stickout_mm: 25, holder_diameter_mm: 25, kind: "end_mill", drill_point_angle_deg: 118 };
+      const pointAngle = tool.kind === "chamfer_mill" ? 90 : tool.drill_point_angle_deg;
+      const drillTipLength = tool.kind === "drill" || tool.kind === "chamfer_mill"
+        ? tool.diameter_mm / 2 / Math.tan(THREE.MathUtils.degToRad(pointAngle / 2))
+        : 0;
+      const cutterLength = Math.max(1, tool.stickout_mm - drillTipLength);
+      if (playbackCutter) {
+        playbackCutter.scale.set(Math.max(tool.diameter_mm, 1), cutterLength, Math.max(tool.diameter_mm, 1));
+        playbackCutter.position.set(0, drillTipLength + cutterLength / 2, 0);
+        (playbackCutter.material as THREE.MeshStandardMaterial).emissive.set(segment.motion === "cut" ? 0x17362f : 0x172129);
+      }
+      if (playbackDrillTip) {
+        playbackDrillTip.visible = tool.kind === "drill" || tool.kind === "chamfer_mill";
+        playbackDrillTip.scale.set(Math.max(tool.diameter_mm, 1), Math.max(drillTipLength, 0.01), Math.max(tool.diameter_mm, 1));
+        playbackDrillTip.position.set(0, drillTipLength / 2, 0);
+        (playbackDrillTip.material as THREE.MeshStandardMaterial).emissive.set(segment.motion === "cut" ? 0x17362f : 0x172129);
+      }
+      if (playbackHolder) {
+        playbackHolder.scale.set(Math.max(tool.holder_diameter_mm, tool.diameter_mm), 10, Math.max(tool.holder_diameter_mm, tool.diameter_mm));
+        playbackHolder.position.set(0, tool.stickout_mm + 5, 0);
+      }
+      playbackTool.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis);
+      playbackTool.position.copy(tip);
+      const activePositions = activePath.geometry.getAttribute("position") as THREE.BufferAttribute;
+      activePositions.setXYZ(0, segment.x1 - modelCenter.x, segment.y1 - modelCenter.y, segment.z1 - modelCenter.z);
+      activePositions.setXYZ(1, tip.x, tip.y, tip.z);
+      activePositions.needsUpdate = true;
+      (activePath.material as THREE.LineBasicMaterial).color.set(segment.motion === "cut" ? 0x8affda : 0x78bde9);
+      trailPath?.geometry.setDrawRange(0, Math.min(toolpathSegments.length * 2, (segmentIndex + 1) * 2));
+      if (simulationMesh) simulationMesh.visible = true;
+      if (lastReportedSegment !== segmentIndex) {
+        lastReportedSegment = segmentIndex;
+        setActiveMotion({ operation: segment.operation_id, motion: segment.motion, removesMaterial: isMaterialCut(segment) });
+        onActiveOperationRef.current?.(segment.operation_id);
+      }
+    };
+
+    const animate = (time: number) => {
+      const elapsed = Math.min((time - lastFrameTime) / 1000, 0.1);
+      lastFrameTime = time;
+      if (animateToolpath && playbackRef.current.playing && toolpathSegments.length) {
+        const nextProgress = Math.min(1, playbackRef.current.progress + elapsed * playbackRef.current.speed / 30);
+        playbackRef.current.progress = nextProgress;
+        setProgress(nextProgress);
+        if (nextProgress >= 1) {
+          playbackRef.current.playing = false;
+          setPlaying(false);
+        }
+      }
+      if (animateToolpath) updatePlaybackScene(playbackRef.current.progress);
+      if (camoticsMesh) camoticsMesh.visible = playbackRef.current.progress >= 0.999;
+      controls.update();
+      renderer.render(scene, camera);
+      animation = requestAnimationFrame(animate);
+    };
+    rebuildMaterialWalls();
+    animate(performance.now());
+    return () => {
+      cameraStateRef.current = { position: camera.position.clone(), target: controls.target.clone(), zoom: camera.zoom };
+      cancelAnimationFrame(animation);
+      observer.disconnect();
+      renderer.domElement.removeEventListener("pointerup", pickFeature);
+      controls.dispose();
+      renderer.dispose();
+      environmentTarget.dispose();
+      pmremGenerator.dispose();
+      model?.geometry.dispose();
+      (model?.material as THREE.Material | undefined)?.dispose();
+      simulationMesh?.geometry.dispose();
+      (simulationMesh?.material as THREE.Material | undefined)?.dispose();
+      simulationWalls?.geometry.dispose();
+      (simulationWalls?.material as THREE.Material | undefined)?.dispose();
+      camoticsMesh?.geometry.dispose();
+      (camoticsMesh?.material as THREE.Material | undefined)?.dispose();
+      playbackCutter?.geometry.dispose();
+      (playbackCutter?.material as THREE.Material | undefined)?.dispose();
+      playbackDrillTip?.geometry.dispose();
+      (playbackDrillTip?.material as THREE.Material | undefined)?.dispose();
+      playbackHolder?.geometry.dispose();
+      (playbackHolder?.material as THREE.Material | undefined)?.dispose();
+      activePath?.geometry.dispose();
+      (activePath?.material as THREE.Material | undefined)?.dispose();
+      trailPath?.geometry.dispose();
+      (trailPath?.material as THREE.Material | undefined)?.dispose();
+      cadEdges?.geometry.dispose();
+      (cadEdges?.material as THREE.Material | undefined)?.dispose();
+      floorGrid.geometry.dispose();
+      for (const material of floorMaterials) material.dispose();
+      for (const fixture of fixtureMeshes) {
+        fixture.mesh.geometry.dispose();
+        (fixture.mesh.material as THREE.Material).dispose();
+      }
+      for (const marker of markersRef.current.values()) {
+        marker.geometry.dispose();
+        (marker.material as THREE.Material).dispose();
+      }
+      for (const child of markerGroup.children) {
+        if (child instanceof THREE.LineSegments) {
+          child.geometry.dispose();
+          (child.material as THREE.Material).dispose();
+        }
+      }
+      markersRef.current.clear();
+      viewApiRef.current = null;
+      host.removeChild(renderer.domElement);
+    };
+  }, [animateToolpath, camoticsSurface, features, fixtureComponents, modelUrl, operationTools, profileBoundaries, simulation, toolpathSegments, topologyEdges]);
+
+  return (
+    <div className="model-viewer" ref={hostRef}>
+      <div className="viewer-badge">{camoticsSurface ? progress >= 0.999 ? "CAMOTICS · 装夹最终去除结果" : "CAMOTICS 刀路 · 最终结果在 100% 显示" : simulation ? progress >= 0.999 ? "HEIGHT-FIELD · 加工后毛坯" : progress > 0 ? "HEIGHT-FIELD · 动态材料去除" : "HEIGHT-FIELD · 完整毛坯" : "OCCT MODEL · 空间特征可点击"}</div>
+      <div className="viewer-legend"><i />制造特征候选 <i className="selected" />{toolpathSegments.length ? "切削刀路 / 绿色牺牲垫板 / 红色禁入区" : "当前工序"}</div>
+      {simulation && <div className="cad-view-controls" aria-label="三维视图控制">
+        <div><button onClick={() => viewApiRef.current?.setView("iso")}>轴测</button><button onClick={() => viewApiRef.current?.setView("top")}>俯视</button><button onClick={() => viewApiRef.current?.setView("front")}>前视</button><button onClick={() => viewApiRef.current?.setView("fit")}>适应</button></div>
+        <div>
+          <button className={targetVisible ? "active" : ""} onClick={() => { const value = !targetVisible; setTargetVisible(value); viewApiRef.current?.setTargetVisible(value); }}>目标件</button>
+          <button className={toolVisible ? "active" : ""} onClick={() => { const value = !toolVisible; setToolVisible(value); viewApiRef.current?.setToolVisible(value); }}>刀具</button>
+          <button className={trailVisible ? "active" : ""} onClick={() => { const value = !trailVisible; setTrailVisible(value); viewApiRef.current?.setTrailVisible(value); }}>轨迹</button>
+        </div>
+      </div>}
+      {animateToolpath && toolpathLoaded && activeOperationId && toolpathSegments.length === 0 && <div className="empty-toolpath-notice">
+        当前任务没有可播放的有效 FreeCAD 切削刀路
+      </div>}
+      {animateToolpath && toolpathSegments.length > 0 && <div className="playback-controls">
+        <button onClick={() => updatePlaying(!playing)}>{playing ? "❚❚ 暂停" : "▶ 播放"}</button>
+        <button onClick={() => updateProgress(0)}>↺ 重播</button>
+        <input aria-label="仿真进度" type="range" min="0" max="1000" value={Math.round(progress * 1000)} onChange={(event) => updateProgress(Number(event.target.value) / 1000)} />
+        <span>{Math.round(progress * 100)}%</span>
+        <select aria-label="播放速度" value={speed} onChange={(event) => updateSpeed(Number(event.target.value))}>
+          <option value="1">1×</option><option value="5">5×</option><option value="20">20×</option>
+        </select>
+        <em>{activeMotion ? `${activeMotion.operation} · ${activeMotion.motion === "cut" ? activeMotion.removesMaterial ? "切削 · 正在去除材料" : "翻面/成形刀路 · 轨迹回放" : "快移 · 不去除材料"}` : "准备播放 · 完整毛坯"}</em>
+      </div>}
+    </div>
+  );
+}

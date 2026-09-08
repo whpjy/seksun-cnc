@@ -1,0 +1,104 @@
+%%{init: {"theme":"base","flowchart":{"defaultRenderer":"elk","curve":"basis","nodeSpacing":35,"rankSpacing":55},"themeVariables":{"fontFamily":"Microsoft YaHei, Arial, sans-serif","fontSize":"16px","lineColor":"#70818A","clusterBkg":"#FAFBFC","clusterBorder":"#B5C0C7"}}}%%
+flowchart TB
+  classDef ui fill:#EAF6FB,stroke:#1486B1,color:#173746,stroke-width:1.6px
+  classDef app fill:#EAF1F5,stroke:#557583,color:#1E3640,stroke-width:1.5px
+  classDef domain fill:#E7F6EE,stroke:#278461,color:#143C2D,stroke-width:1.8px
+  classDef knowledge fill:#FFF3D8,stroke:#B57B1E,color:#563A0F,stroke-width:1.5px
+  classDef compute fill:#F2ECFA,stroke:#7753AA,color:#35234E,stroke-width:1.5px
+  classDef data fill:#EEF1F3,stroke:#53636C,color:#26353C,stroke-width:1.4px
+  classDef safety fill:#FFF0EE,stroke:#C4584C,color:#61271F,stroke-width:1.6px
+  classDef external fill:#F8F9FA,stroke:#6A7981,color:#26353C,stroke-width:1.2px,stroke-dasharray:5 3
+  classDef anchor fill:#1387B4,stroke:#0A668A,color:#FFFFFF,stroke-width:2px
+
+  subgraph UX["Ⅰ　专业 CAM 用户体验"]
+    direction TB
+    UXH["NX 风格工作台"]:::anchor
+    UX1["制造结构树<br/>Part · Setup · Operation"]:::ui
+    UX2["统一 3D 视口<br/>B-Rep 拾取 · 高亮 · 相机状态"]:::ui
+    UX3["Schema 参数编辑器<br/>撤销/重做 · 工序库"]:::ui
+    UX4["工序路线与时间轴<br/>任务 · 日志 · 审批"]:::ui
+    UXH --- UX1 & UX2 & UX3 & UX4
+  end
+
+  subgraph APP["Ⅱ　API 与应用编排（模块化单体）"]
+    direction TB
+    API["Command / Query API<br/>鉴权 · BFF · 输入校验"]:::anchor
+    JOB["Job & Artifact Service<br/>导入 · 文件 · 状态机"]:::app
+    PLANAPP["Process Plan Service<br/>草案 · 修订 · 审批 · 发布"]:::app
+    ORCH["Compute Orchestrator<br/>幂等 · 排队 · 重试 · 取消"]:::app
+    TRACE["审计与可解释性<br/>输入版本 · 决策依据 · 生成日志"]:::safety
+    API --> JOB & PLANAPP
+    JOB & PLANAPP --> ORCH
+    PLANAPP --> TRACE
+  end
+
+  subgraph CORE["Ⅲ　独立制造领域核心（产品护城河）"]
+    direction TB
+    DOMAIN["Canonical Manufacturing Model"]:::anchor
+    CG["几何与制造特征<br/>Part · Body · Face · Edge<br/>Hole · Pocket · Slot · Surface"]:::domain
+    CS["制造设置与资源<br/>Stock · Setup · WCS · Fixture<br/>Machine · Tool · Holder · Material"]:::domain
+    CO["工序库<br/>Definition · Template · Instance<br/>Parameter Schema · Capability · Maturity"]:::domain
+    CP["工艺路线<br/>依赖图 · 工序排序 · 装夹分配<br/>不可变 Plan Revision"]:::domain
+    CT["Toolpath IR<br/>Rapid · Linear · Arc · Cycle<br/>坐标变换 · 刀具/主轴/冷却事件"]:::domain
+    CV["制造验证规则<br/>参数 · 可达性 · 安全高度<br/>能力边界 · 发布门禁"]:::safety
+    DOMAIN --> CG & CS & CO
+    CG & CS & CO --> CP
+    CV -.约束.-> CO & CP
+    CP --> CT
+  end
+
+  subgraph COMPUTE["Ⅳ　Provider、隔离 Worker 与开源内核"]
+    direction TB
+    CH["可替换计算能力层"]:::anchor
+    C1["Geometry Provider → Geometry Worker<br/>Open CASCADE：STEP / B-Rep / 拓扑 / 网格"]:::compute
+    C2["CAM Provider → CAM Worker<br/>FreeCAD CAM / OpenCAMLib：原生工序与刀路"]:::compute
+    C3["Simulation Provider → Simulation Worker<br/>CAMotics / OpenVDB / Manifold：去料与碰撞"]:::compute
+    C4["Post Provider → Post Worker<br/>GRBL / LinuxCNC / Fanuc / Siemens / Haas"]:::compute
+    CH --> C1 & C2 & C3 & C4
+  end
+
+  subgraph DELIVERY["Ⅴ　验证与制造交付"]
+    direction TB
+    GATE["工程验证门"]:::anchor
+    V1["几何/参数验证<br/>可达性 · 安全高度 · 行程"]:::safety
+    V2["刀路与材料验证<br/>碰撞 · 过切 · 欠切 · 余量"]:::safety
+    REVIEW["制造工程师审核与签名<br/>工艺 · 刀路 · 仿真 · NC"]:::safety
+    MACHINE["机床 / 虚拟控制器<br/>DNC · 试切 · 正式加工"]:::external
+    GATE --> V1 & V2
+    V1 & V2 --> REVIEW --> MACHINE
+  end
+
+  subgraph KNOWLEDGE["工艺知识与智能规划（可插拔决策层）"]
+    direction LR
+    K1["规则知识<br/>特征 → 候选工序<br/>材料/精度/机床约束"]:::knowledge
+    K2["路线模板<br/>板类件 · 支架 · 模具<br/>企业标准工艺"]:::knowledge
+    K3["案例知识<br/>历史零件 · 人工修订<br/>质量/节拍/刀具寿命"]:::knowledge
+    KP["可解释规划器<br/>装夹 · 排序 · 刀具/参数推荐<br/>依据 · 置信度 · 风险"]:::knowledge
+    K1 & K2 & K3 --> KP
+  end
+
+  subgraph INFRA["数据与平台基础设施"]
+    direction LR
+    D1[("PostgreSQL<br/>项目 · 版本 · 工序 · 知识")]:::data
+    D2[("Object Storage / MinIO<br/>STEP · BREP · FCStd · STL<br/>Toolpath · NC · 报告")]:::data
+    D3[("Redis / Task Queue<br/>队列 · 锁 · 进度 · 缓存")]:::data
+    D4[("Observability<br/>Log · Metric · Trace · Alert")]:::data
+  end
+
+  UXH ==>|"用户命令 / 状态查询"| API
+  PLANAPP ==>|"领域命令"| DOMAIN
+  CP ==>|"已批准工艺路线"| CH
+  C2 ==>|"生成标准刀路"| CT
+  CT ==>|"仿真 / 后处理输入"| C3 & C4
+  C1 & C2 & C3 & C4 ==>|"结果与证据"| GATE
+
+  CG & CS & CO -."制造上下文".-> KP
+  KP -."候选路线 + 决策解释".-> CP
+  API -.-> D1
+  ORCH -.-> D3
+  JOB -.-> D2
+  TRACE -.-> D4
+  CH -.-> D2 & D4
+  MACHINE -."质量 / 节拍 / 刀具寿命".-> D1
+
+  linkStyle default stroke:#70818A,stroke-width:1.25px

@@ -1,0 +1,441 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from math import radians, sqrt, tan
+
+from .catalogs import apply_cutting_parameters, resolve_machine, resolve_material
+from .collision import build_safety_configuration
+from .models import GeometryAnalysis, Operation, ProcessPlan, SafetyConfiguration, Setup, Tool, Vec3
+from .operation_library import create_operation_instance
+
+
+def _dot(left: Vec3, right: Vec3) -> float:
+    return left.x * right.x + left.y * right.y + left.z * right.z
+
+
+def _axis_key(axis: Vec3) -> tuple[int, int, int]:
+    values = [axis.x, axis.y, axis.z]
+    dominant = max(range(3), key=lambda index: abs(values[index]))
+    sign = 1 if values[dominant] >= 0 else -1
+    result = [0, 0, 0]
+    result[dominant] = sign
+    return tuple(result)
+
+
+def _vec_from_key(key: tuple[int, int, int]) -> Vec3:
+    return Vec3(x=key[0], y=key[1], z=key[2])
+
+
+def _axis_label(key: tuple[int, int, int]) -> str:
+    labels = {(1, 0, 0): "+X", (-1, 0, 0): "-X", (0, 1, 0): "+Y", (0, -1, 0): "-Y", (0, 0, 1): "+Z", (0, 0, -1): "-Z"}
+    return labels.get(key, "自定义方向")
+
+
+def _extent_along_axis(bounds, key: tuple[int, int, int]) -> float:
+    """Return material thickness along the active setup tool axis."""
+    return abs(key[0]) * bounds.size.x + abs(key[1]) * bounds.size.y + abs(key[2]) * bounds.size.z
+
+
+def _tool_for_hole(diameter: float) -> Tool:
+    if diameter <= 20:
+        return Tool(id=f"DRILL-{diameter:.1f}", name=f"Ø{diameter:.1f} 麻花钻", kind="drill", diameter_mm=diameter)
+    return Tool(id="EM-12", name="Ø12 平底立铣刀", kind="end_mill", diameter_mm=12)
+
+
+def _tool_for_prismatic(width: float) -> Tool:
+    candidates = [2, 3, 4, 6, 8, 10, 12, 16]
+    maximum = max(2, width * 0.45)
+    diameter = max((item for item in candidates if item <= maximum), default=2)
+    return Tool(id=f"EM-{diameter}", name=f"Ø{diameter} 平底立铣刀", kind="end_mill", diameter_mm=diameter)
+
+
+def _datum_for_axis(analysis: GeometryAnalysis, axis: Vec3):
+    matching = [plane for plane in analysis.planar_features if abs(_dot(plane.normal, axis)) >= 0.98]
+    return max(matching, key=lambda plane: plane.area, default=None)
+
+
+def build_process_plan(
+    analysis: GeometryAnalysis,
+    material: str,
+    machine: str,
+    safety: SafetyConfiguration | None = None,
+) -> ProcessPlan:
+    material_profile = resolve_material(material)
+    machine_profile = resolve_machine(machine)
+    bounds = analysis.measurements["bounding_box"]
+    assert not isinstance(bounds, float)
+
+    usable_holes = [
+        feature for feature in analysis.cylindrical_features
+        if feature.kind == "hole" and feature.review_state != "excluded" and feature.confidence >= 0.5
+    ]
+    holes_by_direction: dict[tuple[int, int, int], list] = defaultdict(list)
+    for hole in usable_holes:
+        holes_by_direction[_axis_key(hole.access_direction or hole.axis)].append(hole)
+
+    usable_prismatic = [
+        feature for feature in analysis.prismatic_features
+        if feature.review_state != "excluded" and feature.confidence >= 0.5
+    ]
+    prismatic_by_direction: dict[tuple[int, int, int], list] = defaultdict(list)
+    for feature in usable_prismatic:
+        prismatic_by_direction[_axis_key(feature.access_direction)].append(feature)
+
+    direction_keys = set(holes_by_direction) | set(prismatic_by_direction)
+
+    rejected_open_cylinders = [
+        feature for feature in analysis.cylindrical_features
+        if feature.kind == "hole" and feature.angular_span_degrees < 355
+    ]
+    bbox_volume = max(bounds.size.x * bounds.size.y * bounds.size.z, 1e-6)
+    part_volume = float(analysis.measurements.get("volume", bbox_volume))
+    fill_ratio = max(0.0, min(part_volume / bbox_volume, 1.0))
+    ordered_sizes = sorted((bounds.size.x, bounds.size.y, bounds.size.z))
+    thin_plate = ordered_sizes[0] <= max(3.5, ordered_sizes[1] * 0.12)
+    thin_axis_index = min(range(3), key=lambda index: (bounds.size.x, bounds.size.y, bounds.size.z)[index])
+    profile_planes = [
+        plane for plane in analysis.planar_features
+        if abs((plane.normal.x, plane.normal.y, plane.normal.z)[thin_axis_index]) >= 0.98
+    ]
+    profile_plane = max(
+        profile_planes,
+        key=lambda plane: (
+            (plane.normal.x, plane.normal.y, plane.normal.z)[thin_axis_index] > 0,
+            plane.area,
+        ),
+        default=None,
+    )
+    profile_axis = _axis_key(profile_plane.normal) if profile_plane else (0, 0, 1)
+    needs_outer_profile = thin_plate and fill_ratio < 0.98 and profile_plane is not None
+    internal_wire_count = max(0, (profile_plane.wire_count if profile_plane else 1) - 1)
+    recognized_profile_holes = len(holes_by_direction[profile_axis])
+    uncovered_internal_profiles = max(0, internal_wire_count - recognized_profile_holes)
+    blocking_reasons: list[str] = []
+    if needs_outer_profile and uncovered_internal_profiles:
+        blocking_reasons = [
+            f"顶面包含 {internal_wire_count} 个内部轮廓，仅有 {recognized_profile_holes} 个可确认为标准孔。",
+            "剩余异形内部轮廓尚未覆盖，已阻止生成不完整 CAM。",
+        ]
+    automation_status = "unsupported" if blocking_reasons else "review" if needs_outer_profile else "ready"
+
+    if needs_outer_profile and not blocking_reasons:
+        direction_keys.add(profile_axis)
+
+    if not direction_keys and automation_status != "unsupported":
+        primary_plane = max(analysis.planar_features, key=lambda plane: plane.area, default=None)
+        primary_axis = _axis_key(primary_plane.normal) if primary_plane else (0, 0, 1)
+        direction_keys.add(primary_axis)
+
+    direction_groups = sorted(
+        direction_keys,
+        key=lambda key: (-(len(holes_by_direction[key]) + len(prismatic_by_direction[key])), key),
+    )
+    setups: list[Setup] = []
+    sequence = 0
+    cutting_distance = 0.0
+
+    for setup_index, axis_key in enumerate(direction_groups, start=1):
+        holes = holes_by_direction[axis_key]
+        prismatic_features = prismatic_by_direction[axis_key]
+        work_axis = _vec_from_key(axis_key)
+        datum = _datum_for_axis(analysis, work_axis)
+        operations: list[Operation] = []
+
+        if not (thin_plate and axis_key == profile_axis):
+            sequence += 10
+            operations.append(
+                create_operation_instance(
+                    id=f"OP{sequence}",
+                    sequence=sequence,
+                    type="face_milling",
+                    name="建立装夹基准面" if setup_index == 1 else "复核并精加工定位面",
+                    feature_ids=[datum.id] if datum else [],
+                    tool=Tool(id="FM-50", name="Ø50 面铣刀", kind="face_mill", diameter_mm=50),
+                    parameters={"stock_allowance_mm": 0.2, "step_down_mm": 0.5},
+                    rationale=[f"选择与 {_axis_label(axis_key)} 加工方向平行的最大平面作为定位候选"],
+                    confidence=0.9 if datum else 0.5,
+                    status="proposed" if datum else "warning",
+                )
+            )
+
+        for feature in sorted(prismatic_features, key=lambda item: (-item.depth, item.id)):
+            tool = _tool_for_prismatic(feature.width)
+            feature_name = "型腔" if feature.kind == "pocket" else "贯通槽"
+            needs_review = feature.review_state == "review"
+            sequence += 10
+            operations.append(
+                create_operation_instance(
+                    id=f"OP{sequence}",
+                    sequence=sequence,
+                    type="pocket_roughing" if feature.kind == "pocket" else "slot_roughing",
+                    name=f"粗铣 {feature_name} {feature.length:.1f}×{feature.width:.1f}",
+                    feature_ids=[feature.id],
+                    tool=tool,
+                    parameters={
+                        "depth_mm": round(feature.depth, 3),
+                        "step_down_mm": round(min(tool.diameter_mm * 0.4, 3.0), 2),
+                        "step_over_percent": 45,
+                        "wall_allowance_mm": 0.2,
+                        "floor_allowance_mm": 0.1,
+                    },
+                    rationale=[
+                        f"底面几何判定为{feature_name}，从 {_axis_label(axis_key)} 方向可达",
+                        "刀具直径按特征最小宽度的 45% 上限选择，保留侧壁和底面精加工余量",
+                    ],
+                    confidence=feature.confidence,
+                    status="warning" if needs_review else "proposed",
+                )
+            )
+            sequence += 10
+            operations.append(
+                create_operation_instance(
+                    id=f"OP{sequence}",
+                    sequence=sequence,
+                    type="pocket_finishing" if feature.kind == "pocket" else "slot_finishing",
+                    name=f"精铣 {feature_name} 侧壁与底面",
+                    feature_ids=[feature.id],
+                    tool=tool,
+                    parameters={
+                        "depth_mm": round(feature.depth, 3),
+                        "wall_allowance_mm": 0.0,
+                        "floor_allowance_mm": 0.0,
+                        "spring_pass": True,
+                    },
+                    rationale=["粗加工后独立精加工侧壁与底面，便于控制尺寸和表面质量"],
+                    confidence=max(0.5, feature.confidence - 0.03),
+                    status="warning" if needs_review else "proposed",
+                )
+            )
+            cutting_distance += feature.length * feature.width * max(feature.depth, 0.1) / max(tool.diameter_mm**2, 1)
+
+        grouped: dict[tuple[float, str], list] = defaultdict(list)
+        for hole in holes:
+            grouped[(round(hole.diameter, 2), hole.end_type)].append(hole)
+
+        for (diameter, end_type), features in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1])):
+            sequence += 10
+            tool = _tool_for_hole(diameter)
+            operation_type = "drilling" if tool.kind == "drill" else "helical_boring"
+            end_name = {"through": "通孔", "blind": "盲孔", "unknown": "孔候选"}[end_type]
+            confidence = min(feature.confidence for feature in features)
+            needs_review = any(feature.review_state == "review" for feature in features)
+            feature_depth = max(feature.length for feature in features)
+            drill_point_angle = 118.0
+            breakthrough = 0.5 if end_type == "through" else 0.0
+            drill_tip_length = diameter / 2 / tan(radians(drill_point_angle / 2)) if tool.kind == "drill" else 0.0
+            programmed_depth = feature_depth + drill_tip_length + breakthrough if end_type == "through" else feature_depth
+            operations.append(
+                create_operation_instance(
+                    id=f"OP{sequence}",
+                    sequence=sequence,
+                    type=operation_type,
+                    name=f"加工 {len(features)}×Ø{diameter:.2f} {end_name}",
+                    feature_ids=[feature.id for feature in features],
+                    tool=tool,
+                    parameters={
+                        "feature_depth_mm": round(feature_depth, 3),
+                        "depth_mm": round(programmed_depth, 3),
+                        "drill_point_angle_deg": drill_point_angle if tool.kind == "drill" else 0.0,
+                        "drill_tip_length_mm": round(drill_tip_length, 3),
+                        "breakthrough_mm": breakthrough,
+                        "coolant": "flood",
+                        "peck": end_type == "blind" and max(feature.length for feature in features) > diameter * 3,
+                        "finishing_allowance_mm": 0.0 if tool.kind == "drill" else 0.15,
+                    },
+                    rationale=[
+                        f"特征按 {_axis_label(axis_key)} 方向、同直径和同孔端类型归组",
+                        "同轴同径的 OCCT 圆柱面已经合并为单一制造特征",
+                        *([f"通孔深度已加入 {drill_tip_length:.2f} mm 钻尖长度和 {breakthrough:.1f} mm 穿透余量"] if end_type == "through" and tool.kind == "drill" else []),
+                    ],
+                    confidence=confidence,
+                    status="warning" if needs_review else "proposed",
+                )
+            )
+            cutting_distance += sum(
+                sqrt(feature.length**2 + (2 * 3.14159 * feature.radius) ** 2)
+                for feature in features
+            )
+
+        if needs_outer_profile and axis_key == profile_axis and automation_status != "unsupported":
+            profile_thickness = _extent_along_axis(bounds, axis_key)
+            profile_tool = Tool(
+                id="EM-3", name="Ø3 平底立铣刀", kind="end_mill", diameter_mm=3,
+                flute_length_mm=max(12, profile_thickness * 2), stickout_mm=max(20, profile_thickness * 3),
+                holder_diameter_mm=20,
+            )
+            profile_feature_ids = [profile_plane.id] if profile_plane else []
+            tab_parameters = {"tab_count": 4, "tab_width_mm": 4.0, "tab_height_mm": 0.6}
+            sequence += 10
+            operations.append(create_operation_instance(
+                id=f"OP{sequence}", sequence=sequence, type="profile_roughing",
+                name="外轮廓分层粗铣并保留桥位", feature_ids=profile_feature_ids,
+                tool=profile_tool.model_copy(deep=True),
+                parameters={
+                    "depth_mm": round(profile_thickness + 0.2, 3),
+                    "step_down_mm": round(min(1.0, max(0.4, profile_thickness / 3)), 2),
+                    "radial_allowance_mm": 0.2,
+                    **tab_parameters,
+                },
+                rationale=[
+                    f"薄板目标实体占包围盒 {fill_ratio:.1%}，需要加工异形外轮廓",
+                    "粗加工保留 0.20 mm 径向余量和 4 个桥位，避免提前释放工件",
+                ], confidence=0.78, status="warning",
+            ))
+            sequence += 10
+            operations.append(create_operation_instance(
+                id=f"OP{sequence}", sequence=sequence, type="profile_finishing",
+                name="外轮廓精铣并保留桥位", feature_ids=profile_feature_ids,
+                tool=profile_tool.model_copy(deep=True),
+                parameters={
+                    "depth_mm": round(profile_thickness + 0.2, 3), "step_down_mm": 0.8,
+                    "radial_allowance_mm": 0.0, "spring_pass": True, **tab_parameters,
+                },
+                rationale=["清除粗加工径向余量，桥位区域继续抬刀以保持零件固定"],
+                confidence=0.75, status="warning",
+            ))
+            sequence += 10
+            operations.append(create_operation_instance(
+                id=f"OP{sequence}", sequence=sequence, type="tab_removal",
+                name="桥位切除与残根清理", feature_ids=profile_feature_ids,
+                tool=profile_tool.model_copy(deep=True),
+                parameters={
+                    "depth_mm": round(profile_thickness + 0.2, 3), "step_down_mm": 0.3,
+                    "radial_allowance_mm": 0.0,
+                    "start_depth_from_bottom_mm": 0.9,
+                    "requires_secondary_retention": True,
+                },
+                rationale=["胶粘/压板二次固定后，仅加工底部 0.9 mm 区域以切除 0.6 mm 桥位"],
+                confidence=0.68, status="warning",
+            ))
+            sequence += 10
+            chamfer_tool = Tool(
+                id="CM-6-90", name="Ø6 90°倒角刀", kind="chamfer_mill", diameter_mm=6,
+                flute_length_mm=8, stickout_mm=20, holder_diameter_mm=20,
+            )
+            operations.append(create_operation_instance(
+                id=f"OP{sequence}", sequence=sequence, type="edge_chamfer",
+                name="上表面轮廓及孔口倒角去毛刺", feature_ids=profile_feature_ids,
+                tool=chamfer_tool,
+                parameters={"chamfer_width_mm": 0.3, "extra_depth_mm": 0.05, "included_angle_deg": 90.0},
+                rationale=["使用 90°倒角刀加工顶面外轮廓及可达孔口，目标倒角宽度 0.30 mm"],
+                confidence=0.72, status="warning",
+            ))
+            cutting_distance += 4 * (bounds.size.x + bounds.size.y) * max(1, bounds.size.z)
+
+        setups.append(
+            Setup(
+                id=f"SETUP-{setup_index}",
+                name=f"第 {setup_index} 次装夹：{_axis_label(axis_key)} 方向加工",
+                work_axis=work_axis,
+                datum_feature_id=datum.id if datum else None,
+                fixture="牺牲垫板 + 胶粘/压板固定（薄板外轮廓候选）" if thin_plate else "平口钳 + 平行垫铁（候选，需校核可达性）",
+                operations=operations,
+            )
+        )
+
+    if needs_outer_profile and automation_status != "unsupported":
+        reverse_profile_key = tuple(-value for value in profile_axis)
+        reverse_axis = _vec_from_key(reverse_profile_key)
+        reverse_setup = next(
+            (setup for setup in setups if _axis_key(setup.work_axis) == reverse_profile_key),
+            None,
+        )
+        if reverse_setup is None:
+            reverse_setup = Setup(
+                id=f"SETUP-{len(setups) + 1}",
+                name=f"第 {len(setups) + 1} 次装夹：翻面后 {_axis_label(reverse_profile_key)} 方向加工",
+                work_axis=reverse_axis,
+                datum_feature_id=profile_plane.id if profile_plane else None,
+                fixture="翻面定位 + 牺牲垫板 + 胶粘/软爪固定（候选，需校核）",
+                operations=[],
+            )
+            setups.append(reverse_setup)
+        sequence += 10
+        reverse_setup.operations.append(create_operation_instance(
+            id=f"OP{sequence}", sequence=sequence, type="edge_chamfer",
+            name="翻面后底边倒角及桥位残根去毛刺",
+            feature_ids=[profile_plane.id] if profile_plane else [],
+            tool=Tool(
+                id="CM-6-90", name="Ø6 90°倒角刀", kind="chamfer_mill", diameter_mm=6,
+                flute_length_mm=8, stickout_mm=20, holder_diameter_mm=20,
+            ),
+            parameters={"chamfer_width_mm": 0.3, "extra_depth_mm": 0.05, "included_angle_deg": 90.0},
+            rationale=["翻面重新找正后清理底边、桥位残根及底侧锐边"],
+            confidence=0.65, status="warning",
+        ))
+
+    all_operations = [operation for setup in setups for operation in setup.operations]
+    parameter_warnings = [
+        warning
+        for operation in all_operations
+        for warning in apply_cutting_parameters(operation, material_profile, machine_profile)
+    ]
+    estimated_minutes = 0.0 if automation_status == "unsupported" else round(4.0 + len(all_operations) * 1.8 + cutting_distance / 450.0, 1)
+    excluded = sum(feature.review_state == "excluded" for feature in analysis.cylindrical_features if feature.kind == "hole")
+    review = sum(feature.review_state == "review" for feature in analysis.cylindrical_features if feature.kind == "hole")
+    prismatic_review = sum(feature.review_state == "review" for feature in analysis.prismatic_features)
+    prismatic_excluded = sum(feature.review_state == "excluded" for feature in analysis.prismatic_features)
+    warnings = [
+        *blocking_reasons,
+        "碰撞预检采用刀具/刀柄圆柱包络与平口钳禁入区，结果仍需制造工程师复核。",
+        "转速与进给已按内置材料/刀具/机床参数计算，仍需结合真实刀具伸出和机床刚性复核。",
+        *parameter_warnings,
+    ]
+    source_solids = int(analysis.topology.get("source_solids", 1))
+    if source_solids > 1:
+        warnings.append(f"STEP 中包含 {source_solids} 个实体，当前自动选择体积最大的实体作为目标零件，请人工确认主体选择。")
+    if review:
+        warnings.append(f"有 {review} 个孔特征处于待复核状态，相关工序已标记警告。")
+    if excluded:
+        warnings.append(f"已从自动规划中排除 {excluded} 个非闭合或短圆柱伪特征候选。")
+    if prismatic_review:
+        warnings.append(f"有 {prismatic_review} 个型腔/槽特征处于待复核状态，需确认开放边界和刀具可达性。")
+    if prismatic_excluded:
+        warnings.append(f"已从自动规划中排除 {prismatic_excluded} 个型腔/槽候选。")
+    if needs_outer_profile and automation_status == "review":
+        warnings.append("薄板已规划外轮廓粗精加工、桥位切除和双面倒角；二次固定、翻面基准及切断顺序必须由制造工程师复核。")
+    if len(setups) > 3:
+        warnings.append("检测到超过三个主要加工方向，三轴机床可能需要专用夹具或改用四/五轴设备。")
+
+    resolved_safety = safety
+    expected_fixture_strategy = "sacrificial_plate" if thin_plate else "vise"
+    if resolved_safety is None or resolved_safety.fixture_strategy != expected_fixture_strategy:
+        resolved_safety = build_safety_configuration(
+            analysis,
+            clearance_mm=resolved_safety.clearance_mm if resolved_safety else 3,
+            vise_grip_height_mm=resolved_safety.vise_grip_height_mm if resolved_safety else 1.5,
+            support_thickness_mm=resolved_safety.support_thickness_mm if resolved_safety else 3.0,
+            setup_axes=[(setup.id, setup.work_axis) for setup in setups],
+        )
+
+    return ProcessPlan(
+        title=f"{analysis.source_file} 工艺方案",
+        material=material,
+        machine=machine,
+        material_profile=material_profile,
+        machine_profile=machine_profile,
+        stock={
+            "type": "sheet" if thin_plate else "box",
+            "size_mm": [
+                round(bounds.size.x + (8 if thin_plate and automation_status != "unsupported" else 0 if automation_status == "unsupported" else 6), 3),
+                round(bounds.size.y + (8 if thin_plate and automation_status != "unsupported" else 0 if automation_status == "unsupported" else 6), 3),
+                round(bounds.size.z if thin_plate else bounds.size.z + 4, 3),
+            ],
+            "allowance_mm": {
+                "xy": 4.0 if thin_plate and automation_status != "unsupported" else 0.0 if automation_status == "unsupported" else 3.0,
+                "z": 0.0 if thin_plate else 0.0 if automation_status == "unsupported" else 2.0,
+            },
+        },
+        setups=setups,
+        warnings=warnings,
+        assumptions=[
+            "零件按三轴立式加工中心规划，每个主加工方向对应一次候选装夹。",
+            "STEP 模型单位为毫米。",
+            "完整薄板工艺包含外轮廓粗/精加工、桥位切除、顶面倒角和翻面底边去毛刺。",
+            "高度场仅计算 +Z 平底刀材料去除；倒角及翻面工序保留完整原生刀路并单独回放。",
+        ],
+        safety=resolved_safety,
+        estimated_minutes=estimated_minutes,
+        automation_status=automation_status,
+        blocking_reasons=blocking_reasons,
+    )
