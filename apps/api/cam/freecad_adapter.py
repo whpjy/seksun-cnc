@@ -29,13 +29,16 @@ try:
     import Path.Op.MillFace as PathMillFace
     import Path.Op.PocketShape as PathPocketShape
     import Path.Op.Profile as PathProfile
+    import Path.Op.Surface as PathSurface
+    import Path.Op.Waterline as PathWaterline
     import Path.Tool.Controller as PathToolController
+    import Path.Post.scripts.fanuc_post as fanuc_post
     import Path.Post.scripts.grbl_post as grbl_post
     from Path.Tool.toolbit import ToolBit as NativeToolBit
 except ImportError:
     from PathScripts import PathDeburr, PathDrilling, PathDressupHoldingTags, PathJob, PathMillFace
-    from PathScripts import PathPocketShape, PathProfile, PathToolController
-    from PathScripts.post import grbl_post
+    from PathScripts import PathPocketShape, PathProfile, PathSurface, PathToolController, PathWaterline
+    from PathScripts.post import fanuc_post, grbl_post
     NativeToolBit = None
 
 
@@ -88,6 +91,9 @@ def transform_features(features, frame):
         feature["center"] = world_to_local(feature["center"], frame)
         if feature.get("bounds"):
             feature["bounds"] = transform_bounds(feature["bounds"], frame)
+        for direction_key in ("normal", "axis", "access_direction"):
+            if feature.get(direction_key):
+                feature[direction_key] = world_to_local(feature[direction_key], frame)
     return transformed
 
 
@@ -136,6 +142,8 @@ def make_tool_controller(job, operation):
         shape_id = {
             "drill": "drill.fcstd",
             "chamfer_mill": "chamfer.fcstd",
+            "ball_end_mill": "ballend.fcstd",
+            "bull_end_mill": "bullnose.fcstd",
         }.get(spec.get("kind"), "endmill.fcstd")
         bit = NativeToolBit.from_shape_id(shape_id, label=spec.get("name") or spec["id"])
         tool = bit.attach_to_doc(App.ActiveDocument, label=spec.get("name") or spec["id"])
@@ -212,9 +220,56 @@ def face_reference(model, face_number):
     return [(model, ["Face%d" % face_number])]
 
 
+def referenced_planar_feature(operation, features):
+    """Resolve an operation feature to the planar STEP face it came from."""
+    feature_ids = operation.get("feature_ids", [])
+    feature = features.get(feature_ids[0]) if feature_ids else None
+    if feature and feature.get("source_face_id"):
+        feature = features.get(feature["source_face_id"])
+    return feature if feature and feature.get("normal") else None
+
+
+def planar_face_number(model, feature):
+    """Match an analysis plane to a FreeCAD face by geometry, not PF-N text.
+
+    PF identifiers enumerate planar analysis features, while Shape.Faces also
+    contains cylinders and fillets.  Those two indices are therefore not
+    interchangeable.  New analyses carry the original face index; old stored
+    jobs remain supported through geometric matching.
+    """
+    normal = feature.get("normal") or {}
+    center = feature.get("center") or {}
+    expected_normal = normalize(tuple(float(normal[axis]) for axis in "xyz"))
+    expected_center = tuple(float(center[axis]) for axis in "xyz")
+    expected_area = max(float(feature.get("area", 0.0)), 1e-9)
+    diagonal = max(float(model.Shape.BoundBox.DiagonalLength), 1.0)
+    candidates = []
+    for index, face in enumerate(model.Shape.Faces, 1):
+        if type(face.Surface).__name__ != "Plane":
+            continue
+        u0, u1, v0, v1 = face.ParameterRange
+        candidate_normal = face.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+        face_normal = normalize((candidate_normal.x, candidate_normal.y, candidate_normal.z))
+        alignment = sum(face_normal[i] * expected_normal[i] for i in range(3))
+        face_center = face.CenterOfMass
+        center_error = math.sqrt(sum((value - expected_center[i]) ** 2 for i, value in enumerate(
+            (face_center.x, face_center.y, face_center.z)))) / diagonal
+        area_error = abs(math.log(max(float(face.Area), 1e-9) / expected_area))
+        score = center_error * 8.0 + area_error + (1.0 - alignment) * 4.0
+        candidates.append((score, alignment, index))
+    if not candidates:
+        raise RuntimeError("No planar FreeCAD face is available for the referenced feature")
+    score, alignment, matched_index = min(candidates)
+    if alignment < 0.9 or score > 1.0:
+        raise RuntimeError(
+            "Referenced planar feature does not match a STEP face "
+            "(best Face%d, score %.3f, normal %.3f)" % (matched_index, score, alignment)
+        )
+    return matched_index
+
+
 def create_profile(document, job, operation, controller, model, bounds, clearance_z):
     params = operation.get("parameters", {})
-    face_number = top_face(model)[2]
     obj = PathProfile.Create(operation["id"] + "_PROFILE", parentJob=job)
     prepare_proxy(obj, job)
     top_z = float(bounds["maximum"]["z"])
@@ -223,7 +278,8 @@ def create_profile(document, job, operation, controller, model, bounds, clearanc
     if "start_depth_from_bottom_mm" in params:
         start_z = min(top_z, float(bounds["minimum"]["z"]) + float(params["start_depth_from_bottom_mm"]))
     common_parameters(obj, controller, params, start_z, top_z - depth, clearance_z)
-    obj.Base = face_reference(model, face_number)
+    outline = silhouette_face(document, model.Shape, top_z, operation["id"])
+    obj.Base = face_reference(outline, 1)
     obj.Side, obj.Direction = "Outside", "CW"
     obj.processHoles, obj.processPerimeter = False, True
     set_if_present(obj, "UseComp", False)
@@ -253,14 +309,18 @@ def create_pocket(document, job, operation, controller, model, features, bounds,
     feature = features.get(feature_ids[0]) if feature_ids else None
     if not feature:
         return None
-    try:
-        face_number = int(feature.get("source_face_id", "").rsplit("-", 1)[1])
-    except (IndexError, ValueError):
-        face_number = top_face(model)[2]
+    planar_feature = referenced_planar_feature(operation, features)
+    if not planar_feature:
+        raise RuntimeError("Pocket feature has no planar source face")
+    face_number = planar_face_number(model, planar_feature)
     obj = PathPocketShape.Create(operation["id"] + "_POCKET", parentJob=job)
     prepare_proxy(obj, job)
-    params, feature_bounds = operation.get("parameters", {}), feature.get("bounds") or bounds
-    top_z, final_z = float(feature_bounds["maximum"]["z"]), float(feature_bounds["minimum"]["z"])
+    params = operation.get("parameters", {})
+    final_z = float(planar_feature["center"]["z"])
+    requested_depth = max(float(params.get("depth_mm", feature.get("depth", 0.0))), 0.05)
+    top_z = min(float(bounds["maximum"]["z"]), final_z + requested_depth)
+    if top_z - final_z < 0.05:
+        raise RuntimeError("Pocket depth is outside the current setup stock bounds")
     common_parameters(obj, controller, params, top_z, final_z, clearance_z)
     obj.Base = face_reference(model, face_number)
     set_if_present(obj, "UseOutline", True)
@@ -268,13 +328,100 @@ def create_pocket(document, job, operation, controller, model, features, bounds,
     return obj
 
 
-def create_facing(document, job, operation, controller, model, bounds, clearance_z):
+def create_facing(document, job, operation, controller, model, features, bounds, clearance_z):
     obj = PathMillFace.Create(operation["id"] + "_MILLFACE", parentJob=job)
     prepare_proxy(obj, job)
     params, top_z = operation.get("parameters", {}), float(bounds["maximum"]["z"])
     common_parameters(obj, controller, params, top_z,
         top_z - max(float(params.get("depth_mm", 0.2)), 0.01), clearance_z)
-    obj.Base = face_reference(model, top_face(model)[2])
+    planar_feature = referenced_planar_feature(operation, features)
+    face_number = planar_face_number(model, planar_feature) if planar_feature else top_face(model)[2]
+    obj.Base = face_reference(model, face_number)
+    obj.Proxy.execute(obj)
+    return obj
+
+
+def create_surface(document, job, operation, controller, model, bounds, stock_bounds, clearance_z):
+    """Create a native OpenCAMLib drop-cutter surface operation."""
+    obj = PathSurface.Create(operation["id"] + "_SURFACE", parentJob=job)
+    prepare_proxy(obj, job)
+    params = operation.get("parameters", {})
+    top_z = (float(stock_bounds["maximum"]["z"])
+             if operation["type"] == "surface_roughing" else float(bounds["maximum"]["z"]))
+    bottom_z = float(bounds["minimum"]["z"])
+    common_parameters(obj, controller, params, top_z, bottom_z, clearance_z)
+    visible_faces = []
+    for index, face in enumerate(model.Shape.Faces, 1):
+        u0, u1, v0, v1 = face.ParameterRange
+        try:
+            normal = face.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+        except Exception:
+            continue
+        # A three-axis drop-cutter operation can only reach the upper envelope
+        # in setup-local +Z.  Back-facing surfaces belong to the flipped setup.
+        if normal.z >= -0.05:
+            visible_faces.append("Face%d" % index)
+    if not visible_faces:
+        raise RuntimeError("No setup-visible faces are available for 3D surface machining")
+    obj.Base = [(model, visible_faces)]
+    set_if_present(obj, "ScanType", "Planar")
+    set_if_present(obj, "BoundBox", "BaseBoundBox")
+    set_if_present(obj, "BoundaryEnforcement", True)
+    set_if_present(obj, "InternalFeaturesCut", True)
+    set_if_present(obj, "CutPattern", "ZigZag")
+    set_if_present(obj, "CutMode", "Climb")
+    set_if_present(obj, "LinearDeflection", 0.05)
+    set_if_present(obj, "AngularDeflection", 0.25)
+    set_if_present(obj, "SampleInterval", max(float(params.get("sample_interval_mm", 0.8)), 0.05))
+    set_if_present(obj, "DepthOffset", max(float(params.get("depth_offset_mm", 0.0)), 0.0))
+    if operation["type"] == "surface_roughing":
+        set_if_present(obj, "LayerMode", "Multi-pass")
+        set_if_present(obj, "StepDown", max(float(params.get("step_down_mm", 1.0)), 0.05))
+        set_if_present(obj, "StepOver", min(90.0, max(5.0, float(params.get("step_over_percent", 45.0)))))
+    else:
+        set_if_present(obj, "LayerMode", "Single-pass")
+        diameter = max(float(operation["tool"].get("diameter_mm", 1.0)), 0.1)
+        step_over_mm = max(float(params.get("step_over_mm", 0.5)), 0.01)
+        set_if_present(obj, "StepOver", min(90.0, max(1.0, step_over_mm / diameter * 100.0)))
+    obj.Proxy.execute(obj)
+    return obj
+
+
+def create_waterline(document, job, operation, controller, model, bounds, clearance_z):
+    """Finish steep setup-visible faces with native OCL waterline paths."""
+    obj = PathWaterline.Create(operation["id"] + "_WATERLINE", parentJob=job)
+    prepare_proxy(obj, job)
+    params = operation.get("parameters", {})
+    top_z = float(bounds["maximum"]["z"])
+    bottom_z = float(bounds["minimum"]["z"])
+    common_parameters(obj, controller, params, top_z, bottom_z, clearance_z)
+    visible_faces = []
+    for index, face in enumerate(model.Shape.Faces, 1):
+        u0, u1, v0, v1 = face.ParameterRange
+        try:
+            normal = face.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+        except Exception:
+            continue
+        if normal.z >= -0.05:
+            visible_faces.append("Face%d" % index)
+    if not visible_faces:
+        raise RuntimeError("No setup-visible faces are available for waterline finishing")
+    obj.Base = [(model, visible_faces)]
+    set_if_present(obj, "Algorithm", "OCL Dropcutter")
+    set_if_present(obj, "BoundBox", "BaseBoundBox")
+    set_if_present(obj, "BoundaryEnforcement", True)
+    set_if_present(obj, "InternalFeaturesCut", True)
+    set_if_present(obj, "HandleMultipleFeatures", "Collectively")
+    set_if_present(obj, "LayerMode", "Multi-pass")
+    set_if_present(obj, "CutPattern", "None")
+    set_if_present(obj, "CutMode", "Climb")
+    set_if_present(obj, "ClearLastLayer", "Off")
+    set_if_present(obj, "LinearDeflection", 0.05)
+    set_if_present(obj, "AngularDeflection", 0.25)
+    set_if_present(obj, "SampleInterval", max(float(params.get("sample_interval_mm", 0.5)), 0.05))
+    set_if_present(obj, "DepthOffset", max(float(params.get("depth_offset_mm", 0.0)), 0.0))
+    set_if_present(obj, "StepDown", max(float(params.get("step_down_mm", 0.4)), 0.05))
+    set_if_present(obj, "StepOver", min(90.0, max(1.0, float(params.get("step_over_percent", 20.0)))))
     obj.Proxy.execute(obj)
     return obj
 
@@ -292,7 +439,7 @@ def add_holding_tags(document, job, profile, operation):
     return dressup
 
 
-def linear_preview(path_object, frame, setup_id, work_axis):
+def linear_preview(path_object, frame, setup_id, work_axis, local_stock_top_z):
     position, preview = {"x": 0.0, "y": 0.0, "z": 0.0}, []
 
     def append_segment(start, end, motion):
@@ -301,6 +448,7 @@ def linear_preview(path_object, frame, setup_id, work_axis):
             "x1": world_start["x"], "y1": world_start["y"], "z1": world_start["z"],
             "x2": world_end["x"], "y2": world_end["y"], "z2": world_end["z"],
             "local_z1": start["z"], "local_z2": end["z"],
+            "local_stock_top_z": local_stock_top_z,
             "setup_id": setup_id, "work_axis": work_axis})
 
     for item in path_object.Path.Commands:
@@ -366,22 +514,130 @@ def has_cutting_motion(path_object):
     return any(command.Name.upper() in cutting_commands for command in path_object.Path.Commands)
 
 
+def enforce_rapid_clearance(path_object, clearance_z):
+    """Rewrite unsafe lateral G0 moves into lift, traverse, and descend moves.
+
+    FreeCAD Surface may connect disconnected drop-cutter scan lines with a G0
+    at cutting depth.  Such a move is not safe against uncut stock.  Keep the
+    native operation object, but normalize its command stream before preview,
+    postprocessing, collision checking, and export.
+    """
+    position = {"X": 0.0, "Y": 0.0, "Z": float(clearance_z)}
+    rewritten = []
+    for command in path_object.Path.Commands:
+        name = command.Name.upper()
+        parameters = dict(command.Parameters)
+        target = dict(position)
+        for axis in ("X", "Y", "Z"):
+            if axis in parameters:
+                target[axis] = float(parameters[axis])
+        lateral = abs(target["X"] - position["X"]) > 1e-7 or abs(target["Y"] - position["Y"]) > 1e-7
+        if name in {"G0", "G00"} and lateral and min(position["Z"], target["Z"]) < clearance_z - 1e-7:
+            if position["Z"] < clearance_z - 1e-7:
+                rewritten.append(Path.Command("G0", {"Z": float(clearance_z)}))
+            traverse = {key: value for key, value in parameters.items() if key != "Z"}
+            traverse["Z"] = float(clearance_z)
+            rewritten.append(Path.Command("G0", traverse))
+            if target["Z"] < clearance_z - 1e-7:
+                rewritten.append(Path.Command("G0", {"Z": target["Z"]}))
+        else:
+            rewritten.append(command)
+        position = target
+    path_object.Path = Path.Path(rewritten)
+
+
 def target_profile_points(shape, work_axis):
-    axis, candidates = normalize(tuple(float(work_axis[a]) for a in "xyz")), []
-    for face in shape.Faces:
-        if type(face.Surface).__name__ != "Plane":
+    """Return the whole solid silhouette, not one planar face's outer wire."""
+    frame = setup_frame(work_axis)
+    local_shape = transform_shape(shape, frame)
+    local_points = silhouette_polygon(local_shape)
+    points = []
+    for point in local_points:
+        world = local_to_world({"x": point[0], "y": point[1], "z": local_shape.BoundBox.ZMax}, frame)
+        points.append(world)
+    return points
+
+
+def silhouette_polygon(shape, resolution=0.6):
+    """Rasterize the tessellated solid projection and trace its outside loop."""
+    vertices, facets = shape.tessellate(max(resolution * 0.35, 0.12))
+    if not facets:
+        raise RuntimeError("STEP solid cannot be tessellated for profile machining")
+    box = shape.BoundBox
+    x_origin, y_origin = box.XMin - resolution, box.YMin - resolution
+    occupied = set()
+
+    def signed_area(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    for facet in facets:
+        triangle = [(vertices[index].x, vertices[index].y) for index in facet]
+        area = signed_area(triangle[0], triangle[1], triangle[2])
+        if abs(area) < 1e-10:
             continue
-        u0, u1, v0, v1 = face.ParameterRange
-        normal = face.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
-        if normal.x * axis[0] + normal.y * axis[1] + normal.z * axis[2] > 0.98:
-            candidates.append(face)
-    if not candidates:
-        return []
-    return [{"x": p.x, "y": p.y, "z": p.z}
-            for p in max(candidates, key=lambda face: face.Area).OuterWire.discretize(Distance=0.6)]
+        min_i = int(math.floor((min(point[0] for point in triangle) - x_origin) / resolution))
+        max_i = int(math.ceil((max(point[0] for point in triangle) - x_origin) / resolution))
+        min_j = int(math.floor((min(point[1] for point in triangle) - y_origin) / resolution))
+        max_j = int(math.ceil((max(point[1] for point in triangle) - y_origin) / resolution))
+        for j in range(min_j, max_j):
+            y = y_origin + (j + 0.5) * resolution
+            for i in range(min_i, max_i):
+                x = x_origin + (i + 0.5) * resolution
+                point = (x, y)
+                signs = [signed_area(triangle[k], triangle[(k + 1) % 3], point) for k in range(3)]
+                if all(value >= -1e-9 for value in signs) or all(value <= 1e-9 for value in signs):
+                    occupied.add((i, j))
+    if not occupied:
+        raise RuntimeError("STEP projection did not contain any occupied profile cells")
+
+    edges = set()
+    for i, j in occupied:
+        for edge in (((i, j), (i + 1, j)), ((i + 1, j), (i + 1, j + 1)),
+                     ((i + 1, j + 1), (i, j + 1)), ((i, j + 1), (i, j))):
+            reverse = (edge[1], edge[0])
+            if reverse in edges:
+                edges.remove(reverse)
+            else:
+                edges.add(edge)
+    outgoing = {}
+    for start, end in edges:
+        outgoing.setdefault(start, []).append(end)
+    loops = []
+    unused = set(edges)
+    while unused:
+        start, current = next(iter(unused))
+        loop = [start]
+        edge = (start, current)
+        while edge in unused:
+            unused.remove(edge)
+            loop.append(edge[1])
+            choices = [candidate for candidate in outgoing.get(edge[1], []) if (edge[1], candidate) in unused]
+            if not choices:
+                break
+            edge = (edge[1], choices[0])
+        if len(loop) >= 4 and loop[-1] == loop[0]:
+            loops.append(loop)
+    if not loops:
+        raise RuntimeError("STEP projection did not produce a closed outside profile")
+    loop = max(loops, key=lambda points: abs(sum(
+        points[index][0] * points[index + 1][1] - points[index + 1][0] * points[index][1]
+        for index in range(len(points) - 1)
+    )))
+    return [(x_origin + i * resolution, y_origin + j * resolution) for i, j in loop]
 
 
-def create_native_operation(document, job, operation, controller, model, features, bounds, clearance_z):
+def silhouette_face(document, shape, z_value, operation_id):
+    points = silhouette_polygon(shape)
+    vectors = [App.Vector(x, y, z_value) for x, y in points]
+    if vectors[0].distanceToPoint(vectors[-1]) > 1e-7:
+        vectors.append(vectors[0])
+    outline = document.addObject("Part::Feature", operation_id + "_SILHOUETTE")
+    outline.Label = operation_id + " STEP projected outside profile"
+    outline.Shape = Part.Face(Part.makePolygon(vectors))
+    return outline
+
+
+def create_native_operation(document, job, operation, controller, model, features, bounds, stock_bounds, clearance_z):
     kind = operation["type"]
     if kind == "drilling":
         return create_drilling(document, job, operation, controller, features, bounds, clearance_z)
@@ -393,7 +649,11 @@ def create_native_operation(document, job, operation, controller, model, feature
     if kind in {"pocket_roughing", "slot_roughing", "pocket_finishing", "slot_finishing"}:
         return create_pocket(document, job, operation, controller, model, features, bounds, clearance_z)
     if kind == "face_milling":
-        return create_facing(document, job, operation, controller, model, bounds, clearance_z)
+        return create_facing(document, job, operation, controller, model, features, bounds, clearance_z)
+    if kind in {"surface_roughing", "surface_3d"}:
+        return create_surface(document, job, operation, controller, model, bounds, stock_bounds, clearance_z)
+    if kind == "waterline":
+        return create_waterline(document, job, operation, controller, model, bounds, clearance_z)
     return None
 
 
@@ -422,9 +682,27 @@ def main():
         # reference components are visible in the source model but never become
         # accidental CAM stock/model geometry.
         source_shape = max(source_solids, key=lambda solid: abs(float(solid.Volume)))
-    features = {item["id"]: item for item in
-        [*analysis.get("cylindrical_features", []), *analysis.get("prismatic_features", [])]}
+    features = {item["id"]: item for item in [
+        *analysis.get("planar_features", []),
+        *analysis.get("cylindrical_features", []),
+        *analysis.get("prismatic_features", []),
+    ]}
     bounds = analysis["measurements"]["bounding_box"]
+    configured_postprocessor = str((plan.get("machine_profile") or {}).get("postprocessor") or "grbl").lower()
+    postprocessor_name = "fanuc" if configured_postprocessor == "fanuc" else "grbl"
+    postprocessor = fanuc_post if postprocessor_name == "fanuc" else grbl_post
+    postprocessor_args = "--no-show-editor --precision=3" if postprocessor_name == "fanuc" else "--comments --no-line-numbers --no-show-editor --tool-change --precision=3"
+    stock_size = [float(value) for value in plan.get("stock", {}).get("size_mm", [])]
+    if len(stock_size) != 3:
+        stock_size = [float(bounds["maximum"][axis]) - float(bounds["minimum"][axis]) for axis in "xyz"]
+    stock_center = {axis: (float(bounds["minimum"][axis]) + float(bounds["maximum"][axis])) / 2.0
+                    for axis in "xyz"}
+    stock_bounds = {
+        "minimum": {axis: stock_center[axis] - stock_size[index] / 2.0
+                    for index, axis in enumerate("xyz")},
+        "maximum": {axis: stock_center[axis] + stock_size[index] / 2.0
+                    for index, axis in enumerate("xyz")},
+    }
     clearance = float((plan.get("safety") or {}).get("clearance_mm", 3.0))
     outputs, post_outputs, preview, generated, skipped, setup_results, profile_boundaries = [], [], [], [], [], [], []
     native_types = {}
@@ -432,22 +710,31 @@ def main():
     for setup_index, setup in enumerate(plan["setups"], 1):
         frame, local_features = setup_frame(setup["work_axis"]), transform_features(features, setup_frame(setup["work_axis"]))
         local_bounds = transform_bounds(bounds, frame)
+        local_stock_bounds = transform_bounds(stock_bounds, frame)
         local_model = document.addObject("Part::Feature", "Setup%d_Model" % setup_index)
         local_model.Label, local_model.Shape = setup["name"] + " Workpiece", transform_shape(source_shape, frame)
         job = PathJob.Create("Setup%d_Job" % setup_index, [local_model])
-        job.Label, job.PostProcessor = setup["name"] + " · Native CAM Job", "grbl"
-        job.PostProcessorArgs = "--comments --no-line-numbers --precision=3"
+        job.Label, job.PostProcessor = setup["name"] + " · Native CAM Job", postprocessor_name
+        job.PostProcessorArgs = postprocessor_args
         remove_default_tools(document, job)
-        model, clearance_z, setup_generated = job.Model.Group[0], float(local_bounds["maximum"]["z"]) + clearance, []
+        model, clearance_z, setup_generated = job.Model.Group[0], float(local_stock_bounds["maximum"]["z"]) + clearance, []
         setup_outputs = []
         for operation in setup["operations"]:
             if not operation.get("enabled", True):
                 continue
-            controller = make_tool_controller(job, operation)
+            objects_before_operation = {item.Name for item in document.Objects}
             try:
+                controller = make_tool_controller(job, operation)
                 native = create_native_operation(document, job, operation, controller, model,
-                    local_features, local_bounds, clearance_z)
+                    local_features, local_bounds, local_stock_bounds, clearance_z)
             except Exception as error:
+                # Some native CAM proxies create document objects before their
+                # geometry calculation fails. Remove the entire partial group;
+                # otherwise a later recompute/postprocess fails the whole job.
+                for item in reversed(list(document.Objects)):
+                    if item.Name not in objects_before_operation:
+                        document.removeObject(item.Name)
+                document.recompute()
                 skipped.append("%s (%s) FreeCAD 原生工序生成失败: %s" %
                                (operation["id"], operation["type"], error))
                 continue
@@ -455,6 +742,7 @@ def main():
                 skipped.append("%s (%s) 未生成 FreeCAD 原生刀路" %
                                (operation["id"], operation["type"]))
                 continue
+            enforce_rapid_clearance(native, clearance_z)
             if not has_cutting_motion(native):
                 skipped.append("%s (%s) FreeCAD 仅返回定位快移，没有有效切削运动" %
                                (operation["id"], operation["type"]))
@@ -468,7 +756,8 @@ def main():
             post_outputs.extend((controller, native))
             setup_outputs.extend((controller, native))
             preview.extend({"operation_id": operation["id"], **segment}
-                           for segment in linear_preview(native, frame, setup["id"], setup["work_axis"]))
+                           for segment in linear_preview(native, frame, setup["id"], setup["work_axis"],
+                                                         float(local_stock_bounds["maximum"]["z"])))
             generated.append(operation["id"])
             setup_generated.append(operation["id"])
             native_types[operation["id"]] = native.Proxy.__class__.__name__
@@ -484,12 +773,12 @@ def main():
             document.recompute()
             safe_setup_id = re.sub(r"[^A-Za-z0-9_-]+", "_", setup["id"])
             setup_program = "program-%s.nc" % safe_setup_id
-            grbl_post.export(setup_outputs, str(FilePath(nc_path).with_name(setup_program)),
-                             "--comments --no-line-numbers --no-show-editor --tool-change --precision=3")
+            postprocessor.export(setup_outputs, str(FilePath(nc_path).with_name(setup_program)),
+                                 postprocessor_args)
         setup_results.append({"setup_id": setup["id"], "work_axis": setup["work_axis"],
             "clearance_z": clearance_z, "generated_operations": setup_generated, "native_job": job.Name,
             "program": setup_program,
-            "local_bounds": local_bounds,
+            "local_bounds": local_stock_bounds,
             "frame": {name: {axis: frame[name][index] for index, axis in enumerate("xyz")}
                       for name in ("x", "y", "z")},
             "work_coordinate_note": "Local +Z follows the setup work axis; reset work offset after re-fixturing."})
@@ -498,10 +787,9 @@ def main():
         raise RuntimeError("No supported native FreeCAD CAM operations were generated")
     document.recompute()
     document.saveAs(fcstd_path)
-    grbl_post.export(post_outputs, nc_path,
-                     "--comments --no-line-numbers --no-show-editor --tool-change --precision=3")
+    postprocessor.export(post_outputs, nc_path, postprocessor_args)
     result = {"engine": "FreeCAD Path (native operations)", "engine_version": ".".join(App.Version()[:3]),
-        "operation_backend": "native", "postprocessor": "grbl", "generated_operations": generated,
+        "operation_backend": "native", "postprocessor": postprocessor_name, "generated_operations": generated,
         "native_operation_types": native_types, "setups": setup_results, "skipped": skipped,
         "path_command_count": sum(len(item.Path.Commands) for item in outputs), "preview_segments": preview,
         "profile_boundaries": profile_boundaries, "gcode_bytes": FilePath(nc_path).stat().st_size}

@@ -1,4 +1,4 @@
-from app.models import Bounds, GeometryAnalysis, Vec3
+from app.models import Bounds, GeometryAnalysis, PrismaticFeature, Vec3
 from app.planner import _extent_along_axis, build_process_plan
 from app.recognizer import normalize_manufacturing_features
 
@@ -72,6 +72,7 @@ def test_groups_equal_holes_into_one_operation() -> None:
     assert drilling.parameters["feed_rate_mm_min"] == 477
     assert drilling.tool.catalog_match is True
     assert plan.machine_profile.id == "vmc-850"
+    assert plan.machine_profile.postprocessor == "fanuc"
     assert plan.material_profile.id == "al-6061-t6"
 
 
@@ -154,12 +155,16 @@ def test_excludes_partial_cylinders_from_hole_planning() -> None:
     )
     operation_types = [operation.type for setup in plan.setups for operation in setup.operations]
     assert operation_types == [
-        "profile_roughing", "profile_finishing", "tab_removal", "edge_chamfer", "edge_chamfer",
+        "surface_roughing", "surface_3d", "waterline",
+        "profile_roughing", "profile_finishing", "tab_removal", "edge_chamfer",
+        "surface_roughing", "surface_3d", "waterline", "edge_chamfer",
     ]
     assert len(plan.setups) == 2
     assert plan.setups[1].work_axis.z == -1
-    assert plan.setups[0].operations[0].parameters["radial_allowance_mm"] == 0.2
-    assert plan.setups[0].operations[2].parameters["requires_secondary_retention"] is True
+    profile_roughing = next(operation for operation in plan.setups[0].operations if operation.type == "profile_roughing")
+    tab_removal = next(operation for operation in plan.setups[0].operations if operation.type == "tab_removal")
+    assert profile_roughing.parameters["radial_allowance_mm"] == 0.2
+    assert tab_removal.parameters["requires_secondary_retention"] is True
     assert all(
         operation.type != "drilling"
         for setup in plan.setups
@@ -219,6 +224,37 @@ def test_recognizes_rectangular_pocket_and_generates_rough_finish_operations() -
     assert [operation.type for operation in pocket_operations] == [
         "pocket_roughing", "pocket_finishing",
     ]
+
+
+def test_review_pocket_is_not_planned_until_operator_accepts_it() -> None:
+    analysis = sample_analysis()
+    analysis.prismatic_features = [
+        PrismaticFeature.model_validate({
+            "id": "MF-REVIEW", "kind": "pocket", "source_face_id": "PF-1",
+            "center": {"x": 50, "y": 30, "z": 10},
+            "bounds": {
+                "minimum": {"x": 20, "y": 20, "z": 10},
+                "maximum": {"x": 80, "y": 40, "z": 10},
+                "size": {"x": 60, "y": 20, "z": 0},
+            },
+            "access_direction": {"x": 0, "y": 0, "z": 1},
+            "length": 60, "width": 20, "depth": 10,
+            "confidence": 0.72, "review_state": "review",
+        })
+    ]
+
+    review_plan = build_process_plan(analysis, "6061-T6", "VMC")
+    assert all(
+        "MF-REVIEW" not in operation.feature_ids
+        for setup in review_plan.setups for operation in setup.operations
+    )
+
+    analysis.prismatic_features[0].review_state = "accepted"
+    accepted_plan = build_process_plan(analysis, "6061-T6", "VMC")
+    assert [
+        operation.type for setup in accepted_plan.setups for operation in setup.operations
+        if "MF-REVIEW" in operation.feature_ids
+    ] == ["pocket_roughing", "pocket_finishing"]
 
 
 def test_recognizes_slot_only_when_floor_crosses_opposite_part_edges() -> None:

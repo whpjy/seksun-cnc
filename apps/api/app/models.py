@@ -19,6 +19,7 @@ class Bounds(BaseModel):
 
 class PlanarFeature(BaseModel):
     id: str
+    source_face_index: int | None = None
     area: float
     center: Vec3
     normal: Vec3

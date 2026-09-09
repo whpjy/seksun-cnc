@@ -11,18 +11,21 @@ type Props = {
   features: ManufacturingFeature[];
   selectedFeatureIds: string[];
   onSelectFeature: (id: string) => void;
-  onActiveOperationChange?: (id: string) => void;
   toolpathSegments?: ToolpathSegment[];
+  initialToolpathSegments?: ToolpathSegment[];
   profileBoundaries?: { operation_id: string; setup_id: string; work_axis: { x: number; y: number; z: number }; points: { x: number; y: number; z: number }[] }[];
   simulation?: SimulationResult | null;
   camoticsSurface?: { url: string; frame: { x: Vec3; y: Vec3; z: Vec3 } } | null;
   fixtureComponents?: FixtureComponent[];
   animateToolpath?: boolean;
   initialProgress?: number;
-  operationTools?: Record<string, { diameter_mm: number; stickout_mm: number; holder_diameter_mm: number; kind: string; drill_point_angle_deg: number }>;
+  operationTools?: Record<string, { name: string; tool_name: string; diameter_mm: number; stickout_mm: number; holder_diameter_mm: number; kind: string; drill_point_angle_deg: number; spindle_rpm: number; feed_rate_mm_min: number }>;
   topologyEdges?: Vec3[][];
   activeOperationId?: string;
+  isFinalOperation?: boolean;
   toolpathLoaded?: boolean;
+  playbackMode?: "single" | "cumulative";
+  onPlaybackModeChange?: (mode: "single" | "cumulative") => void;
 };
 
 // Siemens NX/UG-style neutral blue-gray: dark enough to preserve the part's
@@ -31,19 +34,19 @@ const UG_PART_COLOR = 0x6f7b7d;
 const UG_TARGET_COLOR = 0x788689;
 const UG_EDGE_COLOR = 0x303a3d;
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, onActiveOperationChange, toolpathSegments = [], profileBoundaries = [], simulation = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, toolpathLoaded = true }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
   const onSelectRef = useRef(onSelectFeature);
-  const onActiveOperationRef = useRef(onActiveOperationChange);
   const selectedIdsRef = useRef(selectedFeatureIds);
   const playbackRef = useRef({ playing: false, progress: initialProgress, speed: 1 });
   const cameraStateRef = useRef<{ position: THREE.Vector3; target: THREE.Vector3; zoom: number } | null>(null);
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(initialProgress);
   const [speed, setSpeed] = useState(1);
-  const [activeMotion, setActiveMotion] = useState<{ operation: string; motion: string; removesMaterial: boolean } | null>(null);
-  const [targetVisible, setTargetVisible] = useState(true);
+  const [activeMotion, setActiveMotion] = useState<{ operation: string; setup?: string; motion: string; removesMaterial: boolean } | null>(null);
+  const [targetVisible, setTargetVisible] = useState(false);
+  const targetVisibleRef = useRef(false);
   const [toolVisible, setToolVisible] = useState(true);
   const [trailVisible, setTrailVisible] = useState(true);
   const viewApiRef = useRef<{
@@ -79,10 +82,6 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   }, [onSelectFeature]);
 
   useEffect(() => {
-    onActiveOperationRef.current = onActiveOperationChange;
-  }, [onActiveOperationChange]);
-
-  useEffect(() => {
     playbackRef.current.playing = false;
     playbackRef.current.progress = 0;
     const reset = window.setTimeout(() => {
@@ -91,7 +90,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       setActiveMotion(null);
     }, 0);
     return () => window.clearTimeout(reset);
-  }, [activeOperationId]);
+  }, [activeOperationId, playbackMode]);
 
   useEffect(() => {
     selectedIdsRef.current = selectedFeatureIds;
@@ -151,6 +150,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
 
     let model: THREE.Mesh | null = null;
     let simulationMesh: THREE.Mesh | null = null;
+    let simulationLowerMesh: THREE.Mesh | null = null;
     let simulationWalls: THREE.Mesh | null = null;
     let camoticsMesh: THREE.Mesh | null = null;
     let playbackTool: THREE.Group | null = null;
@@ -165,7 +165,9 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     let viewHeight = 200;
     let viewAspect = 1;
     let dynamicHeights: Float32Array | null = null;
+    let dynamicLowerHeights: Float32Array | null = null;
     let surfacePositions: THREE.BufferAttribute | null = null;
+    let lowerSurfacePositions: THREE.BufferAttribute | null = null;
     let materialProgress = 0;
     let lastNormalsProgress = 0;
     let processedRatios: number[] = [];
@@ -247,9 +249,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           polygonOffsetUnits: simulation ? -2 : 1,
         }),
       );
-      // NX-style translucent target body shows the intended geometry while the
-      // opaque IPW changes beneath it, without coplanar depth flicker.
-      model.visible = true;
+      // Keep the target optional during simulation. The target and final IPW
+      // are often nearly coplanar, so drawing both produces white shimmer that
+      // looks like a rough machined surface even when the height field is clean.
+      model.visible = !simulation || targetVisibleRef.current;
       model.castShadow = true;
       model.receiveShadow = true;
       scene.add(model);
@@ -281,6 +284,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         }),
       );
       cadEdges.renderOrder = 2;
+      cadEdges.visible = !simulation || targetVisibleRef.current;
       scene.add(cadEdges);
       if (renderGeometry !== geometry) geometry.dispose();
 
@@ -340,12 +344,17 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           segment.x1 - modelCenter.x, segment.y1 - modelCenter.y, segment.z1 - modelCenter.z,
           segment.x2 - modelCenter.x, segment.y2 - modelCenter.y, segment.z2 - modelCenter.z,
         ]);
+        const trailColors = toolpathSegments.flatMap((segment) => {
+          const color = new THREE.Color(segment.motion === "cut" ? 0x20c997 : 0x55a9e0);
+          return [color.r, color.g, color.b, color.r, color.g, color.b];
+        });
         const trailGeometry = new THREE.BufferGeometry();
         trailGeometry.setAttribute("position", new THREE.Float32BufferAttribute(trailCoordinates, 3));
+        trailGeometry.setAttribute("color", new THREE.Float32BufferAttribute(trailColors, 3));
         trailGeometry.setDrawRange(0, 0);
         trailPath = new THREE.LineSegments(
           trailGeometry,
-          new THREE.LineBasicMaterial({ color: 0x168fc0, transparent: true, opacity: 0.42, depthTest: false }),
+          new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.34, depthTest: false }),
         );
         trailPath.renderOrder = 10;
         trailPath.visible = true;
@@ -380,16 +389,27 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       if (simulation && !camoticsSurface) {
         const surface = simulation.surface;
         const positions: number[] = [];
+        const lowerPositions: number[] = [];
         const indices: number[] = [];
+        const finalLowerHeights = surface.lower_heights
+          ?? new Array(surface.columns * surface.rows).fill(surface.bottom_z);
         for (let row = 0; row < surface.rows; row += 1) {
           for (let column = 0; column < surface.columns; column += 1) {
             const index = row * surface.columns + column;
+            const x = surface.origin.x + column * surface.resolution_mm;
+            const y = surface.origin.y + row * surface.resolution_mm;
             const point = localToScene(
-              surface.origin.x + column * surface.resolution_mm,
-              surface.origin.y + row * surface.resolution_mm,
+              x,
+              y,
               animateToolpath ? surface.top_z : surface.heights[index],
             );
+            const lowerPoint = localToScene(
+              x,
+              y,
+              animateToolpath ? surface.bottom_z : finalLowerHeights[index],
+            );
             positions.push(point.x, point.y, point.z);
+            lowerPositions.push(lowerPoint.x, lowerPoint.y, lowerPoint.z);
           }
         }
         for (let row = 0; row < surface.rows - 1; row += 1) {
@@ -404,19 +424,33 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         surfacePositions = surfaceGeometry.getAttribute("position") as THREE.BufferAttribute;
         surfaceGeometry.setIndex(indices);
         surfaceGeometry.computeVertexNormals();
+        const lowerGeometry = new THREE.BufferGeometry();
+        lowerGeometry.setAttribute("position", new THREE.Float32BufferAttribute(lowerPositions, 3));
+        lowerSurfacePositions = lowerGeometry.getAttribute("position") as THREE.BufferAttribute;
+        lowerGeometry.setIndex(indices);
+        lowerGeometry.computeVertexNormals();
         dynamicHeights = new Float32Array(surface.columns * surface.rows);
+        dynamicLowerHeights = new Float32Array(surface.columns * surface.rows);
         dynamicHeights.fill(animateToolpath ? surface.top_z : 0);
+        dynamicLowerHeights.fill(surface.bottom_z);
         if (!animateToolpath) dynamicHeights.set(surface.heights);
+        if (!animateToolpath) dynamicLowerHeights.set(finalLowerHeights);
         processedRatios = new Array(toolpathSegments.length).fill(0);
         simulationMesh = new THREE.Mesh(
           surfaceGeometry,
-          new THREE.MeshStandardMaterial({ color: 0xbfc8cd, roughness: 0.38, metalness: 0.56, side: THREE.DoubleSide }),
+          new THREE.MeshStandardMaterial({ color: 0xbfc8cd, roughness: 0.68, metalness: 0.18, side: THREE.DoubleSide }),
         );
         simulationMesh.renderOrder = 4;
         scene.add(simulationMesh);
+        simulationLowerMesh = new THREE.Mesh(
+          lowerGeometry,
+          new THREE.MeshStandardMaterial({ color: 0xa9b5bb, roughness: 0.72, metalness: 0.14, side: THREE.DoubleSide }),
+        );
+        simulationLowerMesh.renderOrder = 4;
+        scene.add(simulationLowerMesh);
         simulationWalls = new THREE.Mesh(
           new THREE.BufferGeometry(),
-          new THREE.MeshStandardMaterial({ color: 0x8f9ca4, roughness: 0.46, metalness: 0.48, side: THREE.DoubleSide }),
+          new THREE.MeshStandardMaterial({ color: 0x8f9ca4, roughness: 0.74, metalness: 0.12, side: THREE.DoubleSide }),
         );
         simulationWalls.renderOrder = 5;
         scene.add(simulationWalls);
@@ -560,7 +594,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       };
       viewApiRef.current = {
         setView,
-        setTargetVisible: (visible) => { if (model) model.visible = !simulation || visible; },
+        setTargetVisible: (visible) => {
+          if (model) model.visible = !simulation || visible;
+          if (cadEdges) cadEdges.visible = !simulation || visible;
+        },
         setToolVisible: (visible) => { if (playbackTool) playbackTool.visible = visible; },
         setTrailVisible: (visible) => { if (trailPath) trailPath.visible = visible; },
       };
@@ -631,13 +668,13 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     const isMaterialCut = (segment: ToolpathSegment) => {
       if (!simulation) return false;
       const tool = operationTools[segment.operation_id];
-      return segment.motion === "cut" && tool?.kind !== "chamfer_mill"
-        && (!simulation.surface.setup_id || !segment.setup_id || segment.setup_id === simulation.surface.setup_id);
+      return segment.motion === "cut" && tool?.kind !== "chamfer_mill";
     };
 
     const resetMaterial = () => {
-      if (!simulation || !dynamicHeights || !surfacePositions) return;
+      if (!simulation || !dynamicHeights || !dynamicLowerHeights || !surfacePositions || !lowerSurfacePositions) return;
       dynamicHeights.fill(simulation.surface.top_z);
+      dynamicLowerHeights.fill(simulation.surface.bottom_z);
       for (let index = 0; index < dynamicHeights.length; index += 1) {
         const column = index % simulation.surface.columns;
         const row = Math.floor(index / simulation.surface.columns);
@@ -646,17 +683,26 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           simulation.surface.origin.y + row * simulation.surface.resolution_mm,
           simulation.surface.top_z,
         );
+        const lowerPoint = localToScene(
+          simulation.surface.origin.x + column * simulation.surface.resolution_mm,
+          simulation.surface.origin.y + row * simulation.surface.resolution_mm,
+          simulation.surface.bottom_z,
+        );
         surfacePositions.setXYZ(index, point.x, point.y, point.z);
+        lowerSurfacePositions.setXYZ(index, lowerPoint.x, lowerPoint.y, lowerPoint.z);
       }
       surfacePositions.needsUpdate = true;
+      lowerSurfacePositions.needsUpdate = true;
       processedRatios.fill(0);
       materialProgress = 0;
+      applyBaselineMaterial();
     };
 
     const rebuildMaterialWalls = () => {
-      if (!simulation || !simulationMesh || !simulationWalls || !dynamicHeights) return;
+      if (!simulation || !simulationMesh || !simulationLowerMesh || !simulationWalls || !dynamicHeights || !dynamicLowerHeights) return;
       const surface = simulation.surface;
       const heights = dynamicHeights;
+      const lowerHeights = dynamicLowerHeights;
       const positions: number[] = [];
       const indices: number[] = [];
       const addQuad = (a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, d: THREE.Vector3) => {
@@ -665,7 +711,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
       };
       const half = surface.resolution_mm / 2;
-      const bottomThreshold = surface.bottom_z + 0.02;
+      const materialThreshold = 0.02;
 
       // A through-cut is empty space, not a sheet of material collapsed onto Z-bottom.
       // Rebuild the top triangles so completed holes and detached outside scrap are
@@ -677,21 +723,24 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           const b = a + 1;
           const c = a + surface.columns;
           const d = c + 1;
-          if (dynamicHeights[a] > bottomThreshold && dynamicHeights[b] > bottomThreshold && dynamicHeights[c] > bottomThreshold) {
+          if (dynamicHeights[a] - lowerHeights[a] > materialThreshold && dynamicHeights[b] - lowerHeights[b] > materialThreshold && dynamicHeights[c] - lowerHeights[c] > materialThreshold) {
             surfaceIndices.push(a, b, c);
           }
-          if (dynamicHeights[b] > bottomThreshold && dynamicHeights[d] > bottomThreshold && dynamicHeights[c] > bottomThreshold) {
+          if (dynamicHeights[b] - lowerHeights[b] > materialThreshold && dynamicHeights[d] - lowerHeights[d] > materialThreshold && dynamicHeights[c] - lowerHeights[c] > materialThreshold) {
             surfaceIndices.push(b, d, c);
           }
         }
       }
       simulationMesh.geometry.setIndex(surfaceIndices);
       simulationMesh.geometry.computeVertexNormals();
+      simulationLowerMesh.geometry.setIndex(surfaceIndices);
+      simulationLowerMesh.geometry.computeVertexNormals();
 
       for (let row = 0; row < surface.rows; row += 1) {
         for (let column = 0; column < surface.columns; column += 1) {
           const index = row * surface.columns + column;
           const height = dynamicHeights[index];
+          const lowerHeight = lowerHeights[index];
           const x = surface.origin.x + column * surface.resolution_mm;
           const y = surface.origin.y + row * surface.resolution_mm;
           if (column + 1 < surface.columns) {
@@ -699,6 +748,16 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
             if (Math.abs(height - neighbor) > 0.02) {
               const low = Math.min(height, neighbor);
               const high = Math.max(height, neighbor);
+              const wallX = x + half;
+              addQuad(
+                localToScene(wallX, y - half, low), localToScene(wallX, y + half, low),
+                localToScene(wallX, y + half, high), localToScene(wallX, y - half, high),
+              );
+            }
+            const lowerNeighbor = lowerHeights[index + 1];
+            if (Math.abs(lowerHeight - lowerNeighbor) > 0.02) {
+              const low = Math.min(lowerHeight, lowerNeighbor);
+              const high = Math.max(lowerHeight, lowerNeighbor);
               const wallX = x + half;
               addQuad(
                 localToScene(wallX, y - half, low), localToScene(wallX, y + half, low),
@@ -717,6 +776,16 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
                 localToScene(x + half, wallY, high), localToScene(x - half, wallY, high),
               );
             }
+            const lowerNeighbor = lowerHeights[index + surface.columns];
+            if (Math.abs(lowerHeight - lowerNeighbor) > 0.02) {
+              const low = Math.min(lowerHeight, lowerNeighbor);
+              const high = Math.max(lowerHeight, lowerNeighbor);
+              const wallY = y + half;
+              addQuad(
+                localToScene(x - half, wallY, low), localToScene(x + half, wallY, low),
+                localToScene(x + half, wallY, high), localToScene(x - half, wallY, high),
+              );
+            }
           }
         }
       }
@@ -726,14 +795,16 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       const addOutsideWall = (indexA: number, indexB: number) => {
         const heightA = heights[indexA];
         const heightB = heights[indexB];
-        if (heightA <= bottomThreshold && heightB <= bottomThreshold) return;
+        const lowerA = lowerHeights[indexA];
+        const lowerB = lowerHeights[indexB];
+        if (heightA - lowerA <= materialThreshold && heightB - lowerB <= materialThreshold) return;
         const ax = surface.origin.x + (indexA % surface.columns) * surface.resolution_mm;
         const ay = surface.origin.y + Math.floor(indexA / surface.columns) * surface.resolution_mm;
         const bx = surface.origin.x + (indexB % surface.columns) * surface.resolution_mm;
         const by = surface.origin.y + Math.floor(indexB / surface.columns) * surface.resolution_mm;
         addQuad(
-          localToScene(ax, ay, surface.bottom_z),
-          localToScene(bx, by, surface.bottom_z),
+          localToScene(ax, ay, lowerA),
+          localToScene(bx, by, lowerB),
           localToScene(bx, by, heightB),
           localToScene(ax, ay, heightA),
         );
@@ -754,9 +825,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     };
 
     const detachOutsideScrap = () => {
-      if (!simulation || !dynamicHeights || !surfacePositions) return;
+      if (!simulation || !dynamicHeights || !dynamicLowerHeights || !surfacePositions || !lowerSurfacePositions) return;
       for (const index of outsideProfileIndices) {
         dynamicHeights[index] = simulation.surface.bottom_z;
+        dynamicLowerHeights[index] = simulation.surface.bottom_z;
         const column = index % simulation.surface.columns;
         const row = Math.floor(index / simulation.surface.columns);
         const point = localToScene(
@@ -765,14 +837,17 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           simulation.surface.bottom_z,
         );
         surfacePositions.setXYZ(index, point.x, point.y, point.z);
+        lowerSurfacePositions.setXYZ(index, point.x, point.y, point.z);
       }
     };
 
-    const removeDisk = (x: number, y: number, cuttingZ: number, radius: number) => {
-      if (!simulation || !dynamicHeights || !surfacePositions) return;
+    const removeDisk = (x: number, y: number, cuttingZ: number, radius: number, workAxis: Vec3, toolKind: string) => {
+      if (!simulation || !dynamicHeights || !dynamicLowerHeights || !surfacePositions || !lowerSurfacePositions) return;
       const surface = simulation.surface;
       const local = worldToLocal(x, y, cuttingZ);
       const clampedZ = Math.max(surface.bottom_z, Math.min(surface.top_z, local.z));
+      const alignment = workAxis.x * surfaceFrame.z.x + workAxis.y * surfaceFrame.z.y + workAxis.z * surfaceFrame.z.z;
+      if (Math.abs(alignment) < 0.9) return;
       const columnMin = Math.max(0, Math.floor((local.x - radius - surface.origin.x) / surface.resolution_mm));
       const columnMax = Math.min(surface.columns - 1, Math.ceil((local.x + radius - surface.origin.x) / surface.resolution_mm));
       const rowMin = Math.max(0, Math.floor((local.y - radius - surface.origin.y) / surface.resolution_mm));
@@ -782,12 +857,21 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         const cellY = surface.origin.y + row * surface.resolution_mm;
         for (let column = columnMin; column <= columnMax; column += 1) {
           const cellX = surface.origin.x + column * surface.resolution_mm;
-          if ((cellX - local.x) ** 2 + (cellY - local.y) ** 2 > radiusSquared) continue;
+          const radialSquared = (cellX - local.x) ** 2 + (cellY - local.y) ** 2;
+          if (radialSquared > radiusSquared) continue;
+          const ballOffset = toolKind === "ball_end_mill"
+            ? radius - Math.sqrt(Math.max(radiusSquared - radialSquared, 0))
+            : 0;
+          const effectiveZ = alignment > 0 ? clampedZ + ballOffset : clampedZ - ballOffset;
           const index = row * surface.columns + column;
-          if (clampedZ < dynamicHeights[index]) {
-            dynamicHeights[index] = clampedZ;
-            const point = localToScene(cellX, cellY, clampedZ);
+          if (alignment > 0 && effectiveZ < dynamicHeights[index]) {
+            dynamicHeights[index] = Math.max(dynamicLowerHeights[index], effectiveZ);
+            const point = localToScene(cellX, cellY, dynamicHeights[index]);
             surfacePositions.setXYZ(index, point.x, point.y, point.z);
+          } else if (alignment < 0 && effectiveZ > dynamicLowerHeights[index]) {
+            dynamicLowerHeights[index] = Math.min(dynamicHeights[index], effectiveZ);
+            const point = localToScene(cellX, cellY, dynamicLowerHeights[index]);
+            lowerSurfacePositions.setXYZ(index, point.x, point.y, point.z);
           }
         }
       }
@@ -799,19 +883,55 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       const span = distance * (toRatio - fromRatio);
       const sampleCount = Math.max(1, Math.ceil(span / Math.max(simulation.surface.resolution_mm * 0.5, 0.1)));
       const tool = operationTools[segment.operation_id] ?? { diameter_mm: 6, stickout_mm: 25 };
+      const workAxis = segment.work_axis ?? { x: 0, y: 0, z: 1 };
       for (let sample = 1; sample <= sampleCount; sample += 1) {
         const ratio = THREE.MathUtils.lerp(fromRatio, toRatio, sample / sampleCount);
+        const localCuttingZ = segment.local_z1 !== undefined && segment.local_z2 !== undefined
+          ? THREE.MathUtils.lerp(segment.local_z1, segment.local_z2, ratio)
+          : Number.NEGATIVE_INFINITY;
+        if (segment.local_stock_top_z !== undefined && localCuttingZ > segment.local_stock_top_z + 1e-6) continue;
         removeDisk(
           THREE.MathUtils.lerp(segment.x1, segment.x2, ratio),
           THREE.MathUtils.lerp(segment.y1, segment.y2, ratio),
           THREE.MathUtils.lerp(segment.z1, segment.z2, ratio),
           tool.diameter_mm / 2,
+          workAxis,
+          tool.kind,
         );
       }
     };
 
+    function applyBaselineMaterial() {
+      if (!simulation || !initialToolpathSegments.length || !dynamicHeights || !dynamicLowerHeights || !surfacePositions || !lowerSurfacePositions) return;
+      for (const segment of initialToolpathSegments) applyMaterialSegment(segment, 0, 1);
+      const baselineOperationIds = new Set(initialToolpathSegments.map((segment) => segment.operation_id));
+      if (profileBoundaries.some((boundary) => baselineOperationIds.has(boundary.operation_id))) detachOutsideScrap();
+      surfacePositions.needsUpdate = true;
+      lowerSurfacePositions.needsUpdate = true;
+    }
+
+    const applyFinalSurface = () => {
+      if (!simulation || !dynamicHeights || !dynamicLowerHeights || !surfacePositions || !lowerSurfacePositions) return;
+      const surface = simulation.surface;
+      const finalLowerHeights = surface.lower_heights
+        ?? new Array(surface.columns * surface.rows).fill(surface.bottom_z);
+      dynamicHeights.set(surface.heights);
+      dynamicLowerHeights.set(finalLowerHeights);
+      for (let row = 0; row < surface.rows; row += 1) {
+        for (let column = 0; column < surface.columns; column += 1) {
+          const index = row * surface.columns + column;
+          const x = surface.origin.x + column * surface.resolution_mm;
+          const y = surface.origin.y + row * surface.resolution_mm;
+          const upperPoint = localToScene(x, y, dynamicHeights[index]);
+          const lowerPoint = localToScene(x, y, dynamicLowerHeights[index]);
+          surfacePositions.setXYZ(index, upperPoint.x, upperPoint.y, upperPoint.z);
+          lowerSurfacePositions.setXYZ(index, lowerPoint.x, lowerPoint.y, lowerPoint.z);
+        }
+      }
+    };
+
     const updateMaterial = (currentProgress: number, targetWeight: number) => {
-      if (!simulation || !dynamicHeights || !surfacePositions || !animateToolpath) return;
+      if (!simulation || !dynamicHeights || !dynamicLowerHeights || !surfacePositions || !lowerSurfacePositions || !animateToolpath) return;
       if (Math.abs(currentProgress - materialProgress) < 1e-6) return;
       if (currentProgress + 1e-6 < materialProgress) resetMaterial();
       for (let index = 0; index < toolpathSegments.length; index += 1) {
@@ -826,7 +946,12 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         }
       }
       if (targetWeight >= profileDetachWeight) detachOutsideScrap();
+      // The browser replay is intentionally incremental and can accumulate
+      // sampling stripes. At the end of the last operation, use the backend's
+      // authoritative cumulative snapshot so the final result is deterministic.
+      if (isFinalOperation && currentProgress >= 0.999) applyFinalSurface();
       surfacePositions.needsUpdate = true;
+      lowerSurfacePositions.needsUpdate = true;
       if (Math.abs(currentProgress - lastNormalsProgress) >= 0.015 || currentProgress >= 0.999 || currentProgress === 0) {
         rebuildMaterialWalls();
         lastNormalsProgress = currentProgress;
@@ -884,10 +1009,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       (activePath.material as THREE.LineBasicMaterial).color.set(segment.motion === "cut" ? 0x8affda : 0x78bde9);
       trailPath?.geometry.setDrawRange(0, Math.min(toolpathSegments.length * 2, (segmentIndex + 1) * 2));
       if (simulationMesh) simulationMesh.visible = true;
+      if (simulationLowerMesh) simulationLowerMesh.visible = true;
       if (lastReportedSegment !== segmentIndex) {
         lastReportedSegment = segmentIndex;
-        setActiveMotion({ operation: segment.operation_id, motion: segment.motion, removesMaterial: isMaterialCut(segment) });
-        onActiveOperationRef.current?.(segment.operation_id);
+        setActiveMotion({ operation: segment.operation_id, setup: segment.setup_id, motion: segment.motion, removesMaterial: isMaterialCut(segment) });
       }
     };
 
@@ -909,6 +1034,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       renderer.render(scene, camera);
       animation = requestAnimationFrame(animate);
     };
+    resetMaterial();
     rebuildMaterialWalls();
     animate(performance.now());
     return () => {
@@ -924,6 +1050,8 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       (model?.material as THREE.Material | undefined)?.dispose();
       simulationMesh?.geometry.dispose();
       (simulationMesh?.material as THREE.Material | undefined)?.dispose();
+      simulationLowerMesh?.geometry.dispose();
+      (simulationLowerMesh?.material as THREE.Material | undefined)?.dispose();
       simulationWalls?.geometry.dispose();
       (simulationWalls?.material as THREE.Material | undefined)?.dispose();
       camoticsMesh?.geometry.dispose();
@@ -960,16 +1088,25 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       viewApiRef.current = null;
       host.removeChild(renderer.domElement);
     };
-  }, [animateToolpath, camoticsSurface, features, fixtureComponents, modelUrl, operationTools, profileBoundaries, simulation, toolpathSegments, topologyEdges]);
+  }, [animateToolpath, camoticsSurface, features, fixtureComponents, initialToolpathSegments, isFinalOperation, modelUrl, operationTools, profileBoundaries, simulation, toolpathSegments, topologyEdges]);
+
+  const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
+  const playbackChapters = Array.from(new Set(toolpathSegments.map((segment) => segment.operation_id)));
 
   return (
     <div className="model-viewer" ref={hostRef}>
-      <div className="viewer-badge">{camoticsSurface ? progress >= 0.999 ? "CAMOTICS · 装夹最终去除结果" : "CAMOTICS 刀路 · 最终结果在 100% 显示" : simulation ? progress >= 0.999 ? "HEIGHT-FIELD · 加工后毛坯" : progress > 0 ? "HEIGHT-FIELD · 动态材料去除" : "HEIGHT-FIELD · 完整毛坯" : "OCCT MODEL · 空间特征可点击"}</div>
-      <div className="viewer-legend"><i />制造特征候选 <i className="selected" />{toolpathSegments.length ? "切削刀路 / 绿色牺牲垫板 / 红色禁入区" : "当前工序"}</div>
+      <div className="viewer-badge">{camoticsSurface ? progress >= 0.999 ? "CAMOTICS · 装夹最终去除结果" : "CAMOTICS 刀路 · 最终结果在 100% 显示" : simulation ? progress >= 0.999 ? simulation.surface.is_cumulative ? "CUMULATIVE · 多装夹累计余料" : "HEIGHT-FIELD · 加工后毛坯" : progress > 0 ? simulation.surface.is_cumulative ? "CUMULATIVE · 累计材料去除" : "HEIGHT-FIELD · 动态材料去除" : playbackMode === "single" && initialToolpathSegments.length ? "SINGLE STEP · 前序余料已就绪" : "HEIGHT-FIELD · 完整毛坯" : "OCCT MODEL · 空间特征可点击"}</div>
+      <div className="viewer-legend"><i />快速移动 <i className="selected" />切削轨迹 · 已完成轨迹自动淡化</div>
+      {animateToolpath && activeMotion && <div className="simulation-stage-card">
+        <span>{activeMotion.setup} · {activeMotion.operation}</span>
+        <strong>{activeTool?.name ?? "加工工序"}</strong>
+        <small>{activeTool?.tool_name ?? "刀具"}{activeTool?.spindle_rpm ? ` · ${activeTool.spindle_rpm} RPM` : ""}{activeTool?.feed_rate_mm_min ? ` · F${activeTool.feed_rate_mm_min}` : ""}</small>
+        <em className={activeMotion.motion}>{activeMotion.motion === "cut" ? activeMotion.removesMaterial ? "● 正在切削" : "● 成形轨迹" : "→ 快速移动"}</em>
+      </div>}
       {simulation && <div className="cad-view-controls" aria-label="三维视图控制">
         <div><button onClick={() => viewApiRef.current?.setView("iso")}>轴测</button><button onClick={() => viewApiRef.current?.setView("top")}>俯视</button><button onClick={() => viewApiRef.current?.setView("front")}>前视</button><button onClick={() => viewApiRef.current?.setView("fit")}>适应</button></div>
         <div>
-          <button className={targetVisible ? "active" : ""} onClick={() => { const value = !targetVisible; setTargetVisible(value); viewApiRef.current?.setTargetVisible(value); }}>目标件</button>
+          <button className={targetVisible ? "active" : ""} onClick={() => { const value = !targetVisible; targetVisibleRef.current = value; setTargetVisible(value); viewApiRef.current?.setTargetVisible(value); }}>目标件</button>
           <button className={toolVisible ? "active" : ""} onClick={() => { const value = !toolVisible; setToolVisible(value); viewApiRef.current?.setToolVisible(value); }}>刀具</button>
           <button className={trailVisible ? "active" : ""} onClick={() => { const value = !trailVisible; setTrailVisible(value); viewApiRef.current?.setTrailVisible(value); }}>轨迹</button>
         </div>
@@ -978,6 +1115,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         当前任务没有可播放的有效 FreeCAD 切削刀路
       </div>}
       {animateToolpath && toolpathSegments.length > 0 && <div className="playback-controls">
+        <div className="playback-mode-toggle" aria-label="播放模式">
+          <button className={playbackMode === "single" ? "active" : ""} onClick={() => onPlaybackModeChange?.("single")}>单工序</button>
+          <button className={playbackMode === "cumulative" ? "active" : ""} onClick={() => onPlaybackModeChange?.("cumulative")}>累计</button>
+        </div>
         <button onClick={() => updatePlaying(!playing)}>{playing ? "❚❚ 暂停" : "▶ 播放"}</button>
         <button onClick={() => updateProgress(0)}>↺ 重播</button>
         <input aria-label="仿真进度" type="range" min="0" max="1000" value={Math.round(progress * 1000)} onChange={(event) => updateProgress(Number(event.target.value) / 1000)} />
@@ -985,7 +1126,8 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         <select aria-label="播放速度" value={speed} onChange={(event) => updateSpeed(Number(event.target.value))}>
           <option value="1">1×</option><option value="5">5×</option><option value="20">20×</option>
         </select>
-        <em>{activeMotion ? `${activeMotion.operation} · ${activeMotion.motion === "cut" ? activeMotion.removesMaterial ? "切削 · 正在去除材料" : "翻面/成形刀路 · 轨迹回放" : "快移 · 不去除材料"}` : "准备播放 · 完整毛坯"}</em>
+        <div className="playback-chapters">{playbackChapters.map((operationId) => <i key={operationId} className={activeMotion?.operation === operationId ? "active" : ""} title={operationId} />)}</div>
+        <em>{activeMotion ? `${activeMotion.operation} · ${activeMotion.motion === "cut" ? activeMotion.removesMaterial ? "切削 · 正在去除材料" : "翻面/成形刀路 · 轨迹回放" : "快移 · 不去除材料"}` : playbackMode === "single" && initialToolpathSegments.length ? "准备播放 · 前置工序余料已加载" : "准备播放 · 完整毛坯"}</em>
       </div>}
     </div>
   );

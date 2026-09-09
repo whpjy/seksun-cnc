@@ -1,4 +1,6 @@
-from app.models import GeometryAnalysis
+from copy import deepcopy
+
+from app.models import GeometryAnalysis, Setup, Vec3
 from app.planner import build_process_plan
 from app.simulation import simulate_material_removal
 
@@ -54,6 +56,59 @@ def test_height_field_reports_warning_without_cutting_segments() -> None:
 
     assert result["status"] == "warning"
     assert result["metrics"]["removed_volume_mm3"] == 0
+
+
+def test_cumulative_height_field_ignores_feed_motion_above_stock() -> None:
+    analysis = simple_analysis()
+    plan = build_process_plan(analysis, "6061-T6", "VMC-850")
+    operation = plan.setups[0].operations[0]
+    result = simulate_material_removal(analysis, plan, {
+        "setups": [{
+            "setup_id": plan.setups[0].id,
+            "local_bounds": {"minimum": {"z": -2}, "maximum": {"z": 12}},
+        }],
+        "preview_segments": [{
+            "operation_id": operation.id, "setup_id": plan.setups[0].id, "motion": "cut",
+            "x1": 0, "y1": 5, "z1": 20, "x2": 10, "y2": 5, "z2": 20,
+            "local_z1": 20, "local_z2": 20,
+            "work_axis": {"x": 0, "y": 0, "z": 1},
+        }],
+    }, maximum_grid_size=40)
+
+    assert result["metrics"]["removed_volume_mm3"] == 0
+
+
+def test_cumulative_height_field_inherits_stock_across_flipped_setup() -> None:
+    analysis = simple_analysis()
+    plan = build_process_plan(analysis, "6061-T6", "VMC-850")
+    front_operation = plan.setups[0].operations[0]
+    front_operation.tool.diameter_mm = 2
+    back_operation = deepcopy(front_operation)
+    back_operation.id = "OP20"
+    back_operation.sequence = 20
+    plan.setups.append(Setup(
+        id="SETUP-2", name="back", work_axis=Vec3(x=0, y=0, z=-1),
+        datum_feature_id=None, fixture="vise", operations=[back_operation],
+    ))
+    result = simulate_material_removal(analysis, plan, {"preview_segments": [
+        {
+            "operation_id": front_operation.id, "setup_id": "SETUP-1", "motion": "cut",
+            "x1": 0, "y1": 5, "z1": 9, "x2": 10, "y2": 5, "z2": 9,
+            "work_axis": {"x": 0, "y": 0, "z": 1},
+        },
+        {
+            "operation_id": back_operation.id, "setup_id": "SETUP-2", "motion": "cut",
+            "x1": 0, "y1": 5, "z1": 1, "x2": 10, "y2": 5, "z2": 1,
+            "work_axis": {"x": 0, "y": 0, "z": -1},
+        },
+    ]}, maximum_grid_size=40)
+
+    surface = result["surface"]
+    assert surface["is_cumulative"] is True
+    assert surface["included_setup_ids"] == ["SETUP-1", "SETUP-2"]
+    assert min(surface["heights"]) == 9
+    assert max(surface["lower_heights"]) == 1
+    assert result["metrics"]["removed_volume_mm3"] > result["setup_surfaces"][0]["removed_volume_mm3"]
 
 
 def test_height_field_simulates_side_setup_in_its_local_frame() -> None:

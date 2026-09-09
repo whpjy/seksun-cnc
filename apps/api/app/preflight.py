@@ -94,6 +94,38 @@ def verify_cam(plan: ProcessPlan, cam_result: dict) -> dict[str, object]:
     if not coverage_ok:
         warnings.append("部分已批准工序未生成刀路")
 
+    surface_strategies: dict[str, set[str]] = {}
+    surface_rest_sets: set[str] = set()
+    for operation in operations.values():
+        for feature_id in operation.feature_ids:
+            if feature_id.startswith("SURFACE-SET-"):
+                surface_strategies.setdefault(feature_id, set()).add(operation.type)
+                if operation.parameters.get("rest_machining") is True:
+                    surface_rest_sets.add(feature_id)
+    required_surface_strategies = {"surface_roughing", "surface_3d", "waterline"}
+    incomplete_surface_sets = {}
+    for feature_id, strategies in surface_strategies.items():
+        missing = sorted(required_surface_strategies - strategies)
+        if feature_id not in surface_rest_sets:
+            missing.append("small_ball_rest_finishing")
+        if missing:
+            incomplete_surface_sets[feature_id] = missing
+    surface_strategy_ok = not incomplete_surface_sets
+    checks.append({
+        "id": "surface_strategy_coverage",
+        "status": "passed" if surface_strategy_ok else "failed",
+        "message": (
+            f"{len(surface_strategies)} 个三维曲面方向均包含粗加工、平行精加工、小球刀清根和陡壁等高线精加工"
+            if surface_strategy_ok
+            else "三维曲面策略不完整：" + "; ".join(
+                f"{feature_id} 缺少 {', '.join(missing)}"
+                for feature_id, missing in incomplete_surface_sets.items()
+            )
+        ),
+    })
+    if not surface_strategy_ok:
+        errors.append("三维曲面缺少粗加工、浅坡精加工、小球刀清根或陡壁等高线精加工工序")
+
     cycle_seconds = len(generated) * 20.0
     for segment in segments:
         length = dist(

@@ -40,7 +40,7 @@ function UploadScreen({ onCreated }: { onCreated: (job: Job) => void }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [material, setMaterial] = useState("6061-T6 铝合金");
-  const [machine, setMachine] = useState("三轴立式加工中心");
+  const [machine, setMachine] = useState("VMC850 三轴立式加工中心（FANUC 0i-MF Plus）");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
@@ -96,7 +96,7 @@ function UploadScreen({ onCreated }: { onCreated: (job: Job) => void }) {
         </button>
         <div className="form-row">
           <label>材料<select value={material} onChange={(event) => setMaterial(event.target.value)}>{(catalogs?.materials.map((item) => item.name) ?? ["6061-T6 铝合金", "7075-T6 铝合金", "S45C", "SUS304"]).map((name) => <option key={name}>{name}</option>)}</select></label>
-          <label>目标设备<select value={machine} onChange={(event) => setMachine(event.target.value)}>{(catalogs?.machines.map((item) => item.name) ?? ["三轴立式加工中心", "四轴加工中心", "五轴加工中心"]).map((name) => <option key={name}>{name}</option>)}</select></label>
+          <label>目标设备<select value={machine} onChange={(event) => setMachine(event.target.value)}>{(catalogs?.machines.map((item) => item.name) ?? ["VMC850 三轴立式加工中心（FANUC 0i-MF Plus）", "四轴加工中心", "五轴加工中心"]).map((name) => <option key={name}>{name}</option>)}</select></label>
         </div>
         {error && <div className="inline-error"><AlertTriangle size={15} />{error}</div>}
         <button className="primary-action" disabled={!file || busy} onClick={submit}>
@@ -133,17 +133,24 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
   const [operationMessage, setOperationMessage] = useState("");
   const [operationBusy, setOperationBusy] = useState(false);
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
+  const [structureExpanded, setStructureExpanded] = useState(true);
+  const [rationaleExpanded, setRationaleExpanded] = useState(true);
+  const [playbackMode, setPlaybackMode] = useState<"single" | "cumulative">("single");
   const operations = useMemo(
     () => job.plan?.setups.flatMap((setup) => setup.operations) ?? [],
     [job.plan?.setups],
   );
   const operationTools = useMemo(
     () => Object.fromEntries(operations.map((operation) => [operation.id, {
+      name: operation.name,
+      tool_name: operation.tool.name,
       diameter_mm: operation.tool.diameter_mm,
       stickout_mm: operation.tool.stickout_mm,
       holder_diameter_mm: operation.tool.holder_diameter_mm,
       kind: operation.tool.kind,
       drill_point_angle_deg: Number(operation.parameters.drill_point_angle_deg ?? 118),
+      spindle_rpm: Number(operation.parameters.spindle_rpm ?? 0),
+      feed_rate_mm_min: Number(operation.parameters.feed_rate_mm_min ?? 0),
     }])),
     [operations],
   );
@@ -211,33 +218,55 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
   const visibleToolpathSegments = useMemo(() => {
     if (activeMode === "刀路") return camResult?.preview_segments ?? [];
     if (activeMode !== "仿真" || !selectedOperation) return EMPTY_TOOLPATH_SEGMENTS;
-    const operationSegments = camResult?.preview_segments.filter(
-      (segment) => segment.operation_id === selectedOperation.id,
+    const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
+    const visibleOperationIds = new Set(
+      (playbackMode === "single"
+        ? operations.slice(Math.max(selectedIndex, 0), Math.max(selectedIndex, 0) + 1)
+        : operations.slice(0, Math.max(selectedIndex, 0) + 1)
+      ).map((operation) => operation.id),
+    );
+    const visibleSegments = camResult?.preview_segments.filter(
+      (segment) => visibleOperationIds.has(segment.operation_id),
     ) ?? EMPTY_TOOLPATH_SEGMENTS;
-    return operationSegments.some((segment) => segment.motion === "cut") ? operationSegments : EMPTY_TOOLPATH_SEGMENTS;
+    return visibleSegments.some((segment) => segment.motion === "cut") ? visibleSegments : EMPTY_TOOLPATH_SEGMENTS;
   },
-    [activeMode, camResult?.preview_segments, selectedOperation],
+    [activeMode, camResult?.preview_segments, operations, playbackMode, selectedOperation],
   );
+  const initialToolpathSegments = useMemo(() => {
+    if (activeMode !== "仿真" || playbackMode !== "single" || !selectedOperation) return EMPTY_TOOLPATH_SEGMENTS;
+    const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
+    const precedingIds = new Set(operations.slice(0, Math.max(selectedIndex, 0)).map((operation) => operation.id));
+    return camResult?.preview_segments.filter((segment) => precedingIds.has(segment.operation_id))
+      ?? EMPTY_TOOLPATH_SEGMENTS;
+  }, [activeMode, camResult?.preview_segments, operations, playbackMode, selectedOperation]);
   const visibleProfileBoundaries = useMemo(
-    () => activeMode === "仿真" && selectedOperation
-      ? camResult?.profile_boundaries.filter((boundary) => boundary.operation_id === selectedOperation.id) ?? EMPTY_PROFILE_BOUNDARIES
-      : EMPTY_PROFILE_BOUNDARIES,
-    [activeMode, camResult?.profile_boundaries, selectedOperation],
+    () => {
+      if (activeMode !== "仿真" || !selectedOperation) return EMPTY_PROFILE_BOUNDARIES;
+      const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
+      const cumulativeOperationIds = new Set(
+        operations.slice(0, Math.max(selectedIndex, 0) + 1).map((operation) => operation.id),
+      );
+      return camResult?.profile_boundaries.filter((boundary) => cumulativeOperationIds.has(boundary.operation_id))
+        ?? EMPTY_PROFILE_BOUNDARIES;
+    },
+    [activeMode, camResult?.profile_boundaries, operations, selectedOperation],
   );
   const selectedSetupId = useMemo(
     () => job.plan?.setups.find((setup) => setup.operations.some((operation) => operation.id === selectedOperation?.id))?.id,
     [job.plan?.setups, selectedOperation?.id],
   );
   const simulationResult = camResult?.simulation;
+  const usesCumulativeStock = Boolean(simulationResult?.surface.is_cumulative && (job.plan?.setups.length ?? 0) > 1);
   const visibleCamoticsSurface = useMemo(() => {
-    if (activeMode !== "仿真" || !selectedSetupId) return null;
+    if (activeMode !== "仿真" || !selectedSetupId || usesCumulativeStock) return null;
     const surface = camResult?.camotics_surfaces?.find((item) => item.setup_id === selectedSetupId);
     return surface ? { url: apiUrl(`/api/v1/jobs/${job.id}/files/${surface.file}`), frame: surface.frame } : null;
-  }, [activeMode, camResult?.camotics_surfaces, job.id, selectedSetupId]);
+  }, [activeMode, camResult?.camotics_surfaces, job.id, selectedSetupId, usesCumulativeStock]);
   const visibleSimulation = useMemo(() => {
     if (activeMode !== "仿真" || !simulationResult) return null;
-    const surface = simulationResult.setup_surfaces?.find((item) => item.setup_id === selectedSetupId)
-      ?? simulationResult.surface;
+    const surface = usesCumulativeStock
+      ? simulationResult.surface
+      : simulationResult.setup_surfaces?.find((item) => item.setup_id === selectedSetupId) ?? simulationResult.surface;
     const stockVolume = surface.stock_volume_mm3 ?? simulationResult.metrics.initial_stock_volume_mm3;
     const removedVolume = surface.removed_volume_mm3 ?? simulationResult.metrics.removed_volume_mm3;
     return {
@@ -251,7 +280,7 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
         removed_percent: stockVolume ? Math.round(removedVolume / stockVolume * 10000) / 100 : 0,
       },
     };
-  }, [activeMode, selectedSetupId, simulationResult]);
+  }, [activeMode, selectedSetupId, simulationResult, usesCumulativeStock]);
   const visibleFixtureComponents = useMemo(
     () => activeMode === "仿真" ? job.plan?.safety?.fixture_components ?? [] : [],
     [activeMode, job.plan?.safety?.fixture_components],
@@ -330,11 +359,6 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
     setSelectedFeatureIds([id]);
     const relatedOperation = operations.find((operation) => operation.feature_ids.includes(id));
     if (relatedOperation) setSelectedOperation(relatedOperation);
-  };
-
-  const followPlaybackOperation = (operationId: string) => {
-    const operation = operations.find((item) => item.id === operationId);
-    if (operation && operation.id !== selectedOperation?.id) setSelectedOperation(operation);
   };
 
   const approve = async () => {
@@ -556,32 +580,26 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
 
   return (
     <main className="workbench">
-      <header className="topbar nx-menubar">
+      <header className="topbar app-header">
         <div className="brand compact"><span>S</span> SEKSUN CNC</div>
-        <nav className="nx-menu" aria-label="主菜单">
-          {["文件", "首页", "几何", "工艺", "刀路", "仿真", "分析", "工具"].map((item) => (
-            <button key={item} className={item === "工艺" ? "active" : ""}>{item}</button>
-          ))}
-        </nav>
         <div className="project-title"><small>当前零件</small><strong>{job.filename}</strong></div>
-        <div className="top-meta"><span>{job.material}</span><span>V0.9 NATIVE CAM</span>{readOnly && <span className="readonly-badge">只读分享</span>}</div>
-        <button className="ghost share-button" onClick={copyShareLink}><Link2 size={14} />复制分享链接</button>
-        {!readOnly && <button className="ghost reanalyze-button" onClick={reanalyze} disabled={reanalyzing}><RefreshCw className={reanalyzing ? "spin" : ""} size={14} />{reanalyzing ? "分析中" : "重新分析"}</button>}
-        <button className="ghost" onClick={onReset}>新建任务</button>
-        {!readOnly && <button className={`approve ${automationBlocked ? "blocked" : ""}`} onClick={approve} disabled={approving || automationBlocked}>{automationBlocked ? <AlertTriangle size={15} /> : <Check size={15} />}{automationBlocked ? "超出自动规划范围" : approving ? "确认中" : "批准方案"}</button>}
-      </header>
-      <nav className="mode-tabs nx-ribbon">
-        <div className="ribbon-tools">
-          <button title="导入零件"><FileUp size={17} /><span>导入</span></button>
-          <button title="制造特征"><CircleDot size={17} /><span>特征</span></button>
-          <button title="打开工序库" disabled={readOnly} onClick={() => { setLibraryFeatureIds(selectedFeatureIds); setShowOperationLibrary(true); }}><Library size={17} /><span>工序库</span></button>
-          <button title="生成刀轨" disabled={automationBlocked || !planApproved || generatingCam} onClick={generateCam}><Play size={17} /><span>生成</span></button>
-          <button title="安全检查" onClick={() => chooseMode("仿真")}><ShieldCheck size={17} /><span>检查</span></button>
+        <div className="top-meta"><span>{job.material}</span>{readOnly && <span className="readonly-badge">只读分享</span>}</div>
+        <div className="header-actions">
+          <button className="ghost share-button" onClick={copyShareLink}><Link2 size={14} />分享</button>
+          {!readOnly && <button className="ghost reanalyze-button" onClick={reanalyze} disabled={reanalyzing}><RefreshCw className={reanalyzing ? "spin" : ""} size={14} />{reanalyzing ? "分析中" : "重新分析"}</button>}
+          <button className="ghost" onClick={onReset}>新建</button>
+          {!readOnly && <button className={`approve ${automationBlocked ? "blocked" : ""}`} onClick={approve} disabled={approving || automationBlocked}>{automationBlocked ? <AlertTriangle size={15} /> : <Check size={15} />}{automationBlocked ? "无法自动规划" : approving ? "确认中" : planApproved ? "已批准" : "批准方案"}</button>}
         </div>
+      </header>
+      <nav className="mode-tabs workspace-toolbar">
         <div className="mode-switcher">
           {["特征", "工艺", "刀路", "仿真"].map((mode) => <button key={mode} className={activeMode === mode ? "active" : ""} onClick={() => chooseMode(mode)}>{mode}</button>)}
         </div>
         <div className="plan-state"><i /> {sourceSolids > 1 ? `${sourceSolids} 实体 / 主体已筛选 · ` : ""}{job.plan.setups.length} 次装夹 · {operations.length} 道候选工序</div>
+        <div className="context-actions">
+          {!readOnly && <button onClick={() => { setLibraryFeatureIds(selectedFeatureIds); setShowOperationLibrary(true); }}><Library size={15} />工序库</button>}
+          {!readOnly && <button className="primary" disabled={automationBlocked || !planApproved || generatingCam} onClick={generateCam}><Play size={15} />{generatingCam ? "生成中…" : "生成刀路"}</button>}
+        </div>
       </nav>
 
       {showOperationLibrary && <div className="operation-library-backdrop" onMouseDown={() => setShowOperationLibrary(false)}>
@@ -607,20 +625,79 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
       </div>}
 
       <section className="workspace">
-        <aside className="feature-tree panel">
-          <div className="panel-heading"><Layers3 size={16} /> 制造结构</div>
-          <div className="tree-section"><strong><Box size={15} /> 毛坯</strong><small>{String((job.plan.stock.size_mm as number[])?.join(" × "))} mm</small></div>
-          {job.plan.setups.map((setup) => (
-            <div key={setup.id} className="setup-tree">
-              <div className="tree-section"><strong><Rotate3D size={15} /> {setup.name}</strong><small>{setup.fixture}</small></div>
-              {setup.operations.map((operation) => (
-                <button key={operation.id} disabled={activeMode === "仿真" && Boolean(camResult) && !cutOperationIds.has(operation.id)} className={`${selectedOperation?.id === operation.id ? "selected" : ""} ${operation.enabled === false ? "suppressed" : ""} ${activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? "unavailable" : ""}`} onClick={() => chooseOperation(operation)}>
-                  <span>{operation.id}</span><div><strong>{operation.name}</strong><small>{operation.tool.name}{activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? " · 无有效刀路" : ""}</small></div>
-                </button>
+        <aside className="workbench-sidebar">
+          <section className={`feature-tree panel accordion-panel ${structureExpanded ? "expanded" : "collapsed"}`}>
+            <button className="panel-heading accordion-trigger" aria-expanded={structureExpanded} onClick={() => setStructureExpanded((value) => !value)}><Layers3 size={16} /><span>制造结构</span><small>{job.plan.setups.length} 装夹 · {operations.length} 工序</small><ChevronRight className="accordion-chevron" size={16} /></button>
+            {structureExpanded && <div className="panel-content">
+              <div className="tree-section"><strong><Box size={15} /> 毛坯</strong><small>{String((job.plan.stock.size_mm as number[])?.join(" × "))} mm</small></div>
+              {job.plan.setups.map((setup) => (
+                <div key={setup.id} className="setup-tree">
+                  <div className="tree-section"><strong><Rotate3D size={15} /> {setup.name}</strong><small>{setup.fixture}</small></div>
+                  {setup.operations.map((operation) => (
+                    <button key={operation.id} disabled={activeMode === "仿真" && Boolean(camResult) && !cutOperationIds.has(operation.id)} className={`${selectedOperation?.id === operation.id ? "selected" : ""} ${operation.enabled === false ? "suppressed" : ""} ${activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? "unavailable" : ""}`} onClick={() => chooseOperation(operation)}>
+                      <span>{operation.id}</span><div><strong>{operation.name}</strong><small>{operation.tool.name}{activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? " · 无有效刀路" : ""}</small></div>
+                    </button>
+                  ))}
+                </div>
               ))}
-            </div>
-          ))}
-          <div className="tree-summary"><CircleDot size={14} /> {holes.length} 孔 · {prismaticFeatures.length} 型腔/槽 · {reviewCount} 待复核 · 排除 {excludedCount + prismaticExcludedCount}</div>
+              <div className="tree-summary"><CircleDot size={14} /> {holes.length} 孔 · {prismaticFeatures.length} 型腔/槽 · {reviewCount} 待复核 · 排除 {excludedCount + prismaticExcludedCount}</div>
+            </div>}
+          </section>
+
+          <section className={`inspector panel accordion-panel ${rationaleExpanded ? "expanded" : "collapsed"}`}>
+            <button className="panel-heading accordion-trigger" aria-expanded={rationaleExpanded} onClick={() => setRationaleExpanded((value) => !value)}><Bot size={16} /><span>工艺依据</span><small>{selectedOperation?.id ?? "未选工序"}</small><ChevronRight className="accordion-chevron" size={16} /></button>
+            {rationaleExpanded && <div className="panel-content">
+              {selectedOperation ? (
+                <>
+                  <div className="confidence"><span>建议置信度</span><strong>{Math.round(selectedOperation.confidence * 100)}%</strong><div><i style={{ width: `${selectedOperation.confidence * 100}%` }} /></div></div>
+                  <div className="inspector-block"><label>工序</label><h3>{selectedOperation.name}</h3><p>{selectedOperation.id} · {selectedOperation.type}</p></div>
+                  <div className="inspector-block"><label>刀具</label><div className="tool-card"><Wrench size={18} /><div><strong>{selectedOperation.tool.name}</strong><small>{selectedOperation.tool.kind} · 伸出 {selectedOperation.tool.stickout_mm} mm · 刀柄 Ø{selectedOperation.tool.holder_diameter_mm}</small></div></div>
+                    {selectedDefinition && !readOnly && <select className="tool-selector" disabled={operationBusy} value={selectedOperation.tool.id} onChange={(event) => updateOperationTool(event.target.value)}>{(catalogs?.tools ?? []).filter((tool) => selectedDefinition.tool.accepts.includes(tool.kind)).map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select>}
+                  </div>
+                  <div className="inspector-block safety-editor">
+                    <label>安全与夹具</label>
+                    <div><span>安全间隙 mm</span><input disabled={readOnly} type="number" min="0.5" max="50" step="0.5" value={clearance} onChange={(event) => setClearance(Number(event.target.value))} /></div>
+                    {job.plan.safety?.fixture_strategy === "sacrificial_plate"
+                      ? <div><span>牺牲垫板厚度 mm</span><input disabled={readOnly} type="number" min="0.5" max="50" step="0.5" value={supportThickness} onChange={(event) => setSupportThickness(Number(event.target.value))} /></div>
+                      : <div><span>平口钳夹持高度 mm</span><input disabled={readOnly} type="number" min="0.5" max="50" step="0.5" value={viseGripHeight} onChange={(event) => setViseGripHeight(Number(event.target.value))} /></div>}
+                    {!readOnly && <button onClick={saveSafety} disabled={savingSafety}>{savingSafety ? "保存中…" : "保存并重新校核"}</button>}
+                    {safetyMessage && <small>{safetyMessage}</small>}
+                  </div>
+                  <div className="inspector-block"><label>推理依据</label><ul>{selectedOperation.rationale.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                  <div className="inspector-block operation-parameters"><label>工序参数</label>
+                    {selectedDefinition ? <>
+                      <p>{selectedDefinition.description} · {selectedDefinition.engine.operation} · {selectedDefinition.maturity}</p>
+                      <div className="parameter-fields">{selectedDefinition.parameters.map((parameter) => {
+                        const value = parameterDraft[parameter.key] ?? parameter.default ?? "";
+                        return <label key={parameter.key}><span>{parameter.label}{parameter.unit ? ` (${parameter.unit})` : ""}</span>
+                          {parameter.type === "boolean"
+                            ? <input disabled={readOnly} type="checkbox" checked={Boolean(value)} onChange={(event) => selectedOperation && setParameterEdits((current) => ({ ...current, [selectedOperation.id]: { ...parameterDraft, [parameter.key]: event.target.checked } }))} />
+                            : parameter.type === "enum"
+                              ? <select disabled={readOnly} value={String(value)} onChange={(event) => selectedOperation && setParameterEdits((current) => ({ ...current, [selectedOperation.id]: { ...parameterDraft, [parameter.key]: event.target.value } }))}>{parameter.choices.map((choice) => <option key={choice}>{choice}</option>)}</select>
+                              : <input disabled={readOnly} type="number" min={parameter.minimum ?? undefined} max={parameter.maximum ?? undefined} step={parameter.type === "integer" ? 1 : "any"} value={Number(value)} onChange={(event) => selectedOperation && setParameterEdits((current) => ({ ...current, [selectedOperation.id]: { ...parameterDraft, [parameter.key]: Number(event.target.value) } }))} />}
+                        </label>;
+                      })}</div>
+                      {!readOnly && <div className="operation-editor-actions"><button disabled={operationBusy} onClick={saveOperationParameters}><Check size={13} />保存参数</button><button disabled={operationBusy} onClick={() => moveOperation(-1)} title="上移"><ArrowUp size={13} /></button><button disabled={operationBusy} onClick={() => moveOperation(1)} title="下移"><ArrowDown size={13} /></button><button disabled={operationBusy} onClick={toggleOperationEnabled}>{selectedOperation.enabled === false ? "启用" : "抑制"}</button><button disabled={operationBusy} className="danger" onClick={deleteOperation}><Trash2 size={13} />删除</button></div>}
+                    </> : <dl>{Object.entries(selectedOperation.parameters).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value)}</dd></div>)}</dl>}
+                    {operationMessage && <small className="operation-message">{operationMessage}</small>}
+                  </div>
+                  {selectedFeatures.map((feature: ManufacturingFeature) => (
+                    <div className={`feature-card ${feature.review_state}`} key={feature.id}>
+                      {"depth" in feature ? <>
+                        <div><span>{feature.id}</span><small>{feature.kind === "pocket" ? "封闭型腔" : "贯通槽"}</small></div>
+                        <div><strong>{feature.length.toFixed(2)} × {feature.width.toFixed(2)}</strong><small>深 {feature.depth.toFixed(2)} · {Math.round(feature.confidence * 100)}%</small></div>
+                      </> : <>
+                        <div><span>{feature.id}</span><small>{feature.end_type === "through" ? "通孔" : feature.end_type === "blind" ? "盲孔" : "孔端待确认"}</small></div>
+                        <div><strong>Ø{feature.diameter.toFixed(2)} × {feature.length.toFixed(2)}</strong><small>{feature.segment_count} 个圆柱面 · {Math.round(feature.confidence * 100)}%</small></div>
+                      </>}
+                      {feature.review_reasons.map((reason) => <p key={reason}>{reason}</p>)}
+                      {!readOnly && <div className="feature-actions"><button onClick={() => reviewFeature(feature.id, "accepted")}><Check size={12} />确认特征</button><button onClick={() => reviewFeature(feature.id, "excluded")}><AlertTriangle size={12} />排除</button></div>}
+                    </div>
+                  ))}
+                </>
+              ) : <p className="empty-panel">选择一道工序查看规划依据。</p>}
+            </div>}
+          </section>
         </aside>
 
         <section className="viewport panel">
@@ -633,8 +710,8 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
             features={manufacturingFeatures}
             selectedFeatureIds={selectedFeatureIds}
             onSelectFeature={chooseFeature}
-            onActiveOperationChange={followPlaybackOperation}
             toolpathSegments={visibleToolpathSegments}
+            initialToolpathSegments={initialToolpathSegments}
             profileBoundaries={visibleProfileBoundaries}
             simulation={visibleSimulation}
             camoticsSurface={visibleCamoticsSurface}
@@ -644,6 +721,9 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
             operationTools={operationTools}
             topologyEdges={visibleTopologyEdges}
             activeOperationId={selectedOperation?.id}
+            isFinalOperation={selectedOperation?.id === operations[operations.length - 1]?.id}
+            playbackMode={playbackMode}
+            onPlaybackModeChange={setPlaybackMode}
             toolpathLoaded={!loadingCam}
           />
           {activeMode === "仿真" && <button className={`simulation-check-toggle ${validationStatus ?? ""}`} onClick={() => setShowSimulationChecks(!showSimulationChecks)}><ShieldCheck size={15} /> 检查结果 <span>{validationStatus ? validationStatus.toUpperCase() : "WAIT"}</span></button>}
@@ -658,58 +738,6 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
           </div>}
         </section>
 
-        <aside className="inspector panel">
-          <div className="panel-heading"><Bot size={16} /> 工艺依据</div>
-          {selectedOperation ? (
-            <>
-              <div className="confidence"><span>建议置信度</span><strong>{Math.round(selectedOperation.confidence * 100)}%</strong><div><i style={{ width: `${selectedOperation.confidence * 100}%` }} /></div></div>
-              <div className="inspector-block"><label>工序</label><h3>{selectedOperation.name}</h3><p>{selectedOperation.id} · {selectedOperation.type}</p></div>
-              <div className="inspector-block"><label>刀具</label><div className="tool-card"><Wrench size={18} /><div><strong>{selectedOperation.tool.name}</strong><small>{selectedOperation.tool.kind} · 伸出 {selectedOperation.tool.stickout_mm} mm · 刀柄 Ø{selectedOperation.tool.holder_diameter_mm}</small></div></div>
-                {selectedDefinition && !readOnly && <select className="tool-selector" disabled={operationBusy} value={selectedOperation.tool.id} onChange={(event) => updateOperationTool(event.target.value)}>{(catalogs?.tools ?? []).filter((tool) => selectedDefinition.tool.accepts.includes(tool.kind)).map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select>}
-              </div>
-              <div className="inspector-block safety-editor">
-                <label>安全与夹具</label>
-                <div><span>安全间隙 mm</span><input disabled={readOnly} type="number" min="0.5" max="50" step="0.5" value={clearance} onChange={(event) => setClearance(Number(event.target.value))} /></div>
-                {job.plan.safety?.fixture_strategy === "sacrificial_plate"
-                  ? <div><span>牺牲垫板厚度 mm</span><input disabled={readOnly} type="number" min="0.5" max="50" step="0.5" value={supportThickness} onChange={(event) => setSupportThickness(Number(event.target.value))} /></div>
-                  : <div><span>平口钳夹持高度 mm</span><input disabled={readOnly} type="number" min="0.5" max="50" step="0.5" value={viseGripHeight} onChange={(event) => setViseGripHeight(Number(event.target.value))} /></div>}
-                {!readOnly && <button onClick={saveSafety} disabled={savingSafety}>{savingSafety ? "保存中…" : "保存并重新校核"}</button>}
-                {safetyMessage && <small>{safetyMessage}</small>}
-              </div>
-              <div className="inspector-block"><label>推理依据</label><ul>{selectedOperation.rationale.map((item) => <li key={item}>{item}</li>)}</ul></div>
-              <div className="inspector-block operation-parameters"><label>工序参数</label>
-                {selectedDefinition ? <>
-                  <p>{selectedDefinition.description} · {selectedDefinition.engine.operation} · {selectedDefinition.maturity}</p>
-                  <div className="parameter-fields">{selectedDefinition.parameters.map((parameter) => {
-                    const value = parameterDraft[parameter.key] ?? parameter.default ?? "";
-                    return <label key={parameter.key}><span>{parameter.label}{parameter.unit ? ` (${parameter.unit})` : ""}</span>
-                      {parameter.type === "boolean"
-                        ? <input disabled={readOnly} type="checkbox" checked={Boolean(value)} onChange={(event) => selectedOperation && setParameterEdits((current) => ({ ...current, [selectedOperation.id]: { ...parameterDraft, [parameter.key]: event.target.checked } }))} />
-                        : parameter.type === "enum"
-                          ? <select disabled={readOnly} value={String(value)} onChange={(event) => selectedOperation && setParameterEdits((current) => ({ ...current, [selectedOperation.id]: { ...parameterDraft, [parameter.key]: event.target.value } }))}>{parameter.choices.map((choice) => <option key={choice}>{choice}</option>)}</select>
-                          : <input disabled={readOnly} type="number" min={parameter.minimum ?? undefined} max={parameter.maximum ?? undefined} step={parameter.type === "integer" ? 1 : "any"} value={Number(value)} onChange={(event) => selectedOperation && setParameterEdits((current) => ({ ...current, [selectedOperation.id]: { ...parameterDraft, [parameter.key]: Number(event.target.value) } }))} />}
-                    </label>;
-                  })}</div>
-                  {!readOnly && <div className="operation-editor-actions"><button disabled={operationBusy} onClick={saveOperationParameters}><Check size={13} />保存参数</button><button disabled={operationBusy} onClick={() => moveOperation(-1)} title="上移"><ArrowUp size={13} /></button><button disabled={operationBusy} onClick={() => moveOperation(1)} title="下移"><ArrowDown size={13} /></button><button disabled={operationBusy} onClick={toggleOperationEnabled}>{selectedOperation.enabled === false ? "启用" : "抑制"}</button><button disabled={operationBusy} className="danger" onClick={deleteOperation}><Trash2 size={13} />删除</button></div>}
-                </> : <dl>{Object.entries(selectedOperation.parameters).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value)}</dd></div>)}</dl>}
-                {operationMessage && <small className="operation-message">{operationMessage}</small>}
-              </div>
-              {selectedFeatures.map((feature: ManufacturingFeature) => (
-                <div className={`feature-card ${feature.review_state}`} key={feature.id}>
-                  {"depth" in feature ? <>
-                    <div><span>{feature.id}</span><small>{feature.kind === "pocket" ? "封闭型腔" : "贯通槽"}</small></div>
-                    <div><strong>{feature.length.toFixed(2)} × {feature.width.toFixed(2)}</strong><small>深 {feature.depth.toFixed(2)} · {Math.round(feature.confidence * 100)}%</small></div>
-                  </> : <>
-                    <div><span>{feature.id}</span><small>{feature.end_type === "through" ? "通孔" : feature.end_type === "blind" ? "盲孔" : "孔端待确认"}</small></div>
-                    <div><strong>Ø{feature.diameter.toFixed(2)} × {feature.length.toFixed(2)}</strong><small>{feature.segment_count} 个圆柱面 · {Math.round(feature.confidence * 100)}%</small></div>
-                  </>}
-                  {feature.review_reasons.map((reason) => <p key={reason}>{reason}</p>)}
-                  {!readOnly && <div className="feature-actions"><button onClick={() => reviewFeature(feature.id, "accepted")}><Check size={12} />确认特征</button><button onClick={() => reviewFeature(feature.id, "excluded")}><AlertTriangle size={12} />排除</button></div>}
-                </div>
-              ))}
-            </>
-          ) : <p>选择一道工序查看规划依据。</p>}
-        </aside>
       </section>
 
       <section className="operation-deck panel">
@@ -733,7 +761,6 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
           {camResult && <button onClick={() => window.open(apiUrl(camResult.files.verification))}><ShieldCheck size={14} />预检报告</button>}
           {camResult && <button onClick={() => window.open(apiUrl(camResult.files.collision))}><AlertTriangle size={14} />碰撞报告</button>}
           {camResult && <button onClick={() => window.open(apiUrl(camResult.files.simulation))}><Box size={14} />仿真数据</button>}
-          {!readOnly && <button disabled={automationBlocked || !planApproved || generatingCam} onClick={generateCam}><Play size={14} />{automationBlocked ? "刀路已阻止" : generatingCam ? "生成中…" : "生成刀路"}</button>}
         </div>
       </section>
     </main>

@@ -14,7 +14,7 @@ MATERIALS = [
 ]
 
 MACHINES = [
-    MachineProfile(id="vmc-850", name="三轴立式加工中心", axes=3, travel_mm=[800, 500, 500], max_spindle_rpm=10000, max_feed_mm_min=10000, max_tool_diameter_mm=80, postprocessor=None),
+    MachineProfile(id="vmc-850", name="VMC850 三轴立式加工中心（FANUC 0i-MF Plus）", axes=3, travel_mm=[800, 500, 500], max_spindle_rpm=10000, max_feed_mm_min=10000, max_tool_diameter_mm=80, postprocessor="fanuc"),
     MachineProfile(id="vmc-850-4a", name="四轴加工中心", axes=4, travel_mm=[800, 500, 500], max_spindle_rpm=12000, max_feed_mm_min=12000, max_tool_diameter_mm=80, postprocessor=None),
     MachineProfile(id="u500-5x", name="五轴加工中心", axes=5, travel_mm=[600, 500, 450], max_spindle_rpm=18000, max_feed_mm_min=15000, max_tool_diameter_mm=63, postprocessor=None),
 ]
@@ -29,6 +29,10 @@ TOOL_DEFINITIONS = [
     *[
         {"id": f"EM-{diameter}", "name": f"Ø{diameter} 平底立铣刀", "kind": "end_mill", "diameter_mm": float(diameter), "flute_count": 3, "max_rpm": 16000, "flute_length_mm": max(12, diameter * 2.5), "stickout_mm": max(25, diameter * 3), "holder_diameter_mm": 32}
         for diameter in (2, 3, 4, 6, 8, 10, 12, 16)
+    ],
+    *[
+        {"id": f"BM-{diameter:g}", "name": f"Ø{diameter:g} 球头立铣刀", "kind": "ball_end_mill", "diameter_mm": float(diameter), "flute_count": 2, "max_rpm": 16000, "flute_length_mm": max(8, diameter * 4), "stickout_mm": max(18, diameter * 6), "holder_diameter_mm": 10 if diameter <= 2.5 else 16}
+        for diameter in (1.5, 2.0, 2.5, 3.0, 4.0)
     ],
 ]
 

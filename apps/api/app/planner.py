@@ -49,6 +49,65 @@ def _tool_for_prismatic(width: float) -> Tool:
     return Tool(id=f"EM-{diameter}", name=f"Ø{diameter} 平底立铣刀", kind="end_mill", diameter_mm=diameter)
 
 
+def _surface_operations(sequence: int, axis_key: tuple[int, int, int], nonplanar_faces: int) -> tuple[int, list[Operation]]:
+    """Plan roughing plus shallow- and steep-surface finishing for one side."""
+    rough_tool = Tool(
+        id="EM-6-SURFACE", name="Ø6 平底立铣刀", kind="end_mill", diameter_mm=6,
+        flute_length_mm=18, stickout_mm=25, holder_diameter_mm=20,
+    )
+    finish_tool = Tool(
+        id="BM-4", name="Ø4 球头立铣刀", kind="ball_end_mill", diameter_mm=4,
+        flute_length_mm=16, stickout_mm=25, holder_diameter_mm=16,
+    )
+    rest_tool = Tool(
+        id="BM-2.5", name="Ø2.5 球头立铣刀", kind="ball_end_mill", diameter_mm=2.5,
+        flute_length_mm=10, stickout_mm=18, holder_diameter_mm=10,
+    )
+    direction = _axis_label(axis_key)
+    sequence += 10
+    roughing = create_operation_instance(
+        id=f"OP{sequence}", sequence=sequence, type="surface_roughing",
+        name=f"{direction} 三维曲面分层粗加工", feature_ids=[f"SURFACE-SET-{direction}"],
+        tool=rough_tool,
+        parameters={"step_down_mm": 1.2, "step_over_percent": 50,
+                    "depth_offset_mm": 0.3, "sample_interval_mm": 2.0},
+        rationale=[f"目标包含约 {nonplanar_faces} 个非平面，2.5D 工序不能覆盖其表面包络",
+                   "使用平底刀分层去除曲面上方毛坯并保留 0.30 mm 精加工余量"],
+        confidence=0.68, status="warning",
+    )
+    sequence += 10
+    finishing = create_operation_instance(
+        id=f"OP{sequence}", sequence=sequence, type="surface_3d",
+        name=f"{direction} 球刀三维曲面精加工", feature_ids=[f"SURFACE-SET-{direction}"],
+        tool=finish_tool,
+        parameters={"step_over_mm": 0.8, "sample_interval_mm": 1.0, "depth_offset_mm": 0.0},
+        rationale=["球头刀沿目标表面执行交错扫描，覆盖圆角、加强筋与自由曲面",
+                   "当前为三轴可见面加工；倒扣和遮挡区域仍需可达性校核"],
+        confidence=0.62, status="warning",
+    )
+    sequence += 10
+    waterline = create_operation_instance(
+        id=f"OP{sequence}", sequence=sequence, type="waterline",
+        name=f"{direction} 小球刀陡壁等高线与圆角清根", feature_ids=[f"SURFACE-SET-{direction}"],
+        tool=rest_tool.model_copy(deep=True),
+        parameters={
+            "depth_mm": 0.3,
+            "step_down_mm": 0.3,
+            "step_over_percent": 15,
+            "sample_interval_mm": 0.4,
+            "depth_offset_mm": 0.0,
+            "rest_machining": True,
+        },
+        rationale=[
+            "平行球刀扫描主要覆盖缓坡曲面，陡峭侧壁需要等高线刀路清根并控制残留刀纹",
+            "使用经当前 FreeCAD/STEP 实跑验证稳定的 Ø2.5 球刀按 0.30 mm 层高精加工，覆盖 R1.25 及以上圆角过渡",
+            "小于 R1.25 的局部过渡需使用更高阶残料识别 CAM 或由制造工程师复核",
+        ],
+        confidence=0.66, status="warning",
+    )
+    return sequence, [roughing, finishing, waterline]
+
+
 def _datum_for_axis(analysis: GeometryAnalysis, axis: Vec3):
     matching = [plane for plane in analysis.planar_features if abs(_dot(plane.normal, axis)) >= 0.98]
     return max(matching, key=lambda plane: plane.area, default=None)
@@ -75,7 +134,11 @@ def build_process_plan(
 
     usable_prismatic = [
         feature for feature in analysis.prismatic_features
-        if feature.review_state != "excluded" and feature.confidence >= 0.5
+        # A review candidate is not yet trusted machining geometry.  Planning
+        # it eagerly creates misleading setups and CAM failures for thin walls
+        # that merely resemble deep rectangular pockets.  The review endpoint
+        # rebuilds the plan as soon as an operator accepts the feature.
+        if feature.review_state == "accepted" and feature.confidence >= 0.5
     ]
     prismatic_by_direction: dict[tuple[int, int, int], list] = defaultdict(list)
     for feature in usable_prismatic:
@@ -107,6 +170,8 @@ def build_process_plan(
     )
     profile_axis = _axis_key(profile_plane.normal) if profile_plane else (0, 0, 1)
     needs_outer_profile = thin_plate and fill_ratio < 0.98 and profile_plane is not None
+    cylindrical_source_faces = sum(max(len(feature.source_face_ids), 1) for feature in analysis.cylindrical_features)
+    nonplanar_face_count = max(0, int(analysis.topology.get("faces", 0)) - len(analysis.planar_features) - cylindrical_source_faces)
     internal_wire_count = max(0, (profile_plane.wire_count if profile_plane else 1) - 1)
     recognized_profile_holes = len(holes_by_direction[profile_axis])
     uncovered_internal_profiles = max(0, internal_wire_count - recognized_profile_holes)
@@ -256,6 +321,10 @@ def build_process_plan(
                 for feature in features
             )
 
+        if thin_plate and axis_key == profile_axis and nonplanar_face_count:
+            sequence, surface_operations = _surface_operations(sequence, axis_key, nonplanar_face_count)
+            operations.extend(surface_operations)
+
         if needs_outer_profile and axis_key == profile_axis and automation_status != "unsupported":
             profile_thickness = _extent_along_axis(bounds, axis_key)
             profile_tool = Tool(
@@ -350,6 +419,9 @@ def build_process_plan(
                 operations=[],
             )
             setups.append(reverse_setup)
+        if nonplanar_face_count:
+            sequence, surface_operations = _surface_operations(sequence, reverse_profile_key, nonplanar_face_count)
+            reverse_setup.operations.extend(surface_operations)
         sequence += 10
         reverse_setup.operations.append(create_operation_instance(
             id=f"OP{sequence}", sequence=sequence, type="edge_chamfer",

@@ -95,9 +95,6 @@ def write_camotics_project(
     minimum, maximum = bounds.get("minimum"), bounds.get("maximum")
     if not isinstance(minimum, dict) or not isinstance(maximum, dict):
         raise ValueError("FreeCAD setup result contained invalid local stock bounds")
-    allowance = 0.0
-    if setup_plan and hasattr(setup_plan, "operations"):
-        allowance = 2.0
     project = {
         "units": "metric",
         "resolution-mode": "manual",
@@ -107,8 +104,8 @@ def write_camotics_project(
             "automatic": False,
             "margin": 0,
             "bounds": {
-                "min": [float(minimum[axis]) - (allowance if axis != "z" else 0.0) for axis in "xyz"],
-                "max": [float(maximum[axis]) + (allowance if axis != "z" else 0.0) for axis in "xyz"],
+                "min": [float(minimum[axis]) for axis in "xyz"],
+                "max": [float(maximum[axis]) for axis in "xyz"],
             },
         },
         "files": [program_name],
@@ -226,7 +223,7 @@ def get_config() -> dict[str, object]:
 async def create_job(
     step: UploadFile = File(...),
     material: str = Form("6061-T6 铝合金"),
-    machine: str = Form("三轴立式加工中心"),
+    machine: str = Form("VMC850 三轴立式加工中心（FANUC 0i-MF Plus）"),
 ) -> JobResponse:
     filename = Path(step.filename or "part.step").name
     if Path(filename).suffix.lower() not in {".step", ".stp"}:
@@ -675,7 +672,10 @@ def create_cam_artifact(job_id: str) -> dict[str, object]:
                 setup["camotics_error"] = "CAMotics returned an empty stock-removal surface"
                 surface_path.unlink(missing_ok=True)
     result["camotics_surfaces"] = camotics_surfaces
-    result["simulation_backend"] = "camotics-per-setup" if camotics_surfaces else "height-field-fallback"
+    result["simulation_backend"] = (
+        "cumulative-height-field-with-camotics-per-setup"
+        if camotics_surfaces else "cumulative-height-field"
+    )
     write_json(result_path, result)
     generated_operation_ids = set(result.get("generated_operations", []))
     for operation in operations:
@@ -686,7 +686,9 @@ def create_cam_artifact(job_id: str) -> dict[str, object]:
     simulation = simulate_material_removal(job.analysis, job.plan, result)
     simulation_path = directory / "simulation.json"
     write_json(simulation_path, simulation)
-    if result.get("profile_boundaries") and len(simulation.get("setup_surfaces", [])) <= 1:
+    cumulative_surface = simulation.get("surface", {})
+    has_cumulative_stock = isinstance(cumulative_surface, dict) and cumulative_surface.get("is_cumulative") is True
+    if result.get("profile_boundaries") and has_cumulative_stock:
         target_volume = float(job.analysis.measurements.get("volume", 0))
         remaining_volume = float(simulation.get("metrics", {}).get("remaining_volume_mm3", 0))
         deviation = abs(remaining_volume - target_volume) / max(target_volume, 1e-6) * 100
@@ -694,22 +696,22 @@ def create_cam_artifact(job_id: str) -> dict[str, object]:
         verification["checks"].append({
             "id": "target_volume_conformance",
             "status": conformance_status,
-            "message": f"轮廓仿真剩余体积与 STEP 目标偏差 {deviation:.1f}%（高度场网格近似）",
+            "message": f"累计装夹仿真剩余体积与 STEP 目标偏差 {deviation:.1f}%（双面高度场网格近似）",
         })
         verification["metrics"]["target_volume_mm3"] = round(target_volume, 2)
         verification["metrics"]["remaining_volume_mm3"] = round(remaining_volume, 2)
         verification["metrics"]["target_volume_deviation_percent"] = round(deviation, 2)
         if conformance_status == "failed":
-            verification["errors"].append("轮廓加工后的材料体积与 STEP 目标差异过大")
+            verification["errors"].append("全部装夹累计加工后的材料体积与 STEP 目标差异过大")
             verification["status"] = "failed"
         elif conformance_status == "warning" and verification["status"] == "passed":
-            verification["warnings"].append("轮廓仿真与目标体积存在明显偏差")
+            verification["warnings"].append("累计装夹仿真与目标体积存在明显偏差")
             verification["status"] = "warning"
     elif result.get("profile_boundaries"):
         verification["checks"].append({
             "id": "target_volume_conformance",
             "status": "warning",
-            "message": "多装夹局部高度场用于逐装夹回放，不把单个方向的剩余体积冒充最终零件总体积",
+            "message": "当前装夹方向无法汇入累计余料，未进行最终成品体积判定",
         })
         verification["warnings"].append("最终成品体积需要体素或实体布尔仿真复核")
         if verification["status"] == "passed":

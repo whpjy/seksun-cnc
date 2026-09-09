@@ -53,6 +53,7 @@ struct Vec3 {
 
 struct PlanarFeature {
     std::string id;
+    int source_face_index{};
     double area{};
     Vec3 center;
     Vec3 normal;
@@ -217,8 +218,10 @@ std::vector<PlanarFeature> collect_planar_features(const TopoDS_Shape& shape) {
     std::vector<PlanarFeature> features;
     TopTools_IndexedDataMapOfShapeListOfShape edge_faces;
     TopExp::MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_faces);
-    int index = 1;
+    int planar_index = 1;
+    int source_face_index = 0;
     for (TopExp_Explorer explorer(shape, TopAbs_FACE); explorer.More(); explorer.Next()) {
+        ++source_face_index;
         const TopoDS_Face face = TopoDS::Face(explorer.Current());
         const BRepAdaptor_Surface surface(face, Standard_True);
         if (surface.GetType() != GeomAbs_Plane) continue;
@@ -256,7 +259,8 @@ std::vector<PlanarFeature> collect_planar_features(const TopoDS_Shape& shape) {
             if (!has_other_face) ++free_edges;
         }
         features.push_back({
-            "PF-" + std::to_string(index++),
+            "PF-" + std::to_string(planar_index++),
+            source_face_index,
             face_area(face),
             center,
             normal_vector,
@@ -370,7 +374,8 @@ std::string make_json(
     for (std::size_t index = 0; index < planes.size(); ++index) {
         const auto& feature = planes[index];
         if (index == 0) json << '\n';
-        json << "    {\"id\":\"" << feature.id << "\",\"area\":" << feature.area
+        json << "    {\"id\":\"" << feature.id << "\",\"source_face_index\":"
+             << feature.source_face_index << ",\"area\":" << feature.area
              << ",\"center\":";
         append_vec(json, feature.center);
         json << ",\"normal\":";

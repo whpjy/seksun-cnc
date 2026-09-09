@@ -58,6 +58,7 @@ export type ToolpathSegment = {
   x1: number; y1: number; z1: number;
   x2: number; y2: number; z2: number;
   local_z1?: number; local_z2?: number;
+  local_stock_top_z?: number;
   setup_id?: string;
   work_axis?: Vec3;
 };
@@ -74,7 +75,7 @@ export type CamResult = {
   path_command_count: number;
   preview_segments: ToolpathSegment[];
   profile_boundaries: { operation_id: string; setup_id: string; work_axis: Vec3; points: Vec3[] }[];
-  simulation_backend?: "camotics-per-setup" | "height-field-fallback";
+  simulation_backend?: "cumulative-height-field-with-camotics-per-setup" | "cumulative-height-field" | "camotics-per-setup" | "height-field-fallback";
   camotics_surfaces?: { setup_id: string; file: string; engine: "CAMotics"; resolution_mm: number; frame: { x: Vec3; y: Vec3; z: Vec3 } }[];
   files: { freecad: string; gcode: string; preview: string; verification: string; simulation: string; collision: string; camotics?: string[] };
   verification: VerificationResult;
@@ -132,6 +133,8 @@ export type SimulationResult = {
 
 export type SimulationSurface = {
     setup_id?: string;
+    is_cumulative?: boolean;
+    included_setup_ids?: string[];
     work_axis?: Vec3;
     frame?: { x: Vec3; y: Vec3; z: Vec3 };
     origin: { x: number; y: number };
@@ -141,9 +144,11 @@ export type SimulationSurface = {
     columns: number;
     rows: number;
     heights: number[];
+    lower_heights?: number[];
     cut_segment_count?: number;
     removed_volume_mm3?: number;
     stock_volume_mm3?: number;
+    remaining_volume_mm3?: number;
 };
 
 export type VerificationResult = {
