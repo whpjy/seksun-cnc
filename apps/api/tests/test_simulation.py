@@ -2,7 +2,7 @@ from copy import deepcopy
 
 from app.models import GeometryAnalysis, Setup, Vec3
 from app.planner import build_process_plan
-from app.simulation import simulate_material_removal
+from app.simulation import _adaptive_grid_size, simulate_material_removal
 
 
 def simple_analysis() -> GeometryAnalysis:
@@ -26,6 +26,13 @@ def simple_analysis() -> GeometryAnalysis:
         "cylindrical_features": [],
         "prismatic_features": [],
     })
+
+
+def test_dense_toolpaths_use_bounded_adaptive_grid() -> None:
+    assert _adaptive_grid_size(49_999, 640) == 640
+    assert _adaptive_grid_size(50_000, 640) == 420
+    assert _adaptive_grid_size(100_000, 640) == 318
+    assert _adaptive_grid_size(100_000, 200) == 200
 
 
 def test_height_field_removes_stock_along_flat_tool_sweep() -> None:

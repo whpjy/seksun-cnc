@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 
 @dataclass(frozen=True)
@@ -72,6 +72,7 @@ def run_freecad_adapter(
     adapter_script: Path,
     arguments: Sequence[Path],
     timeout_seconds: int = 600,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     executable = resolve_executable(command)
     if not executable:
@@ -83,14 +84,51 @@ def run_freecad_adapter(
     }
     script = str(adapter_script)
     python_command = f"exec(compile(open({script!r}, encoding='utf-8').read(), {script!r}, 'exec'))"
-    return subprocess.run(
-        [executable, "-c", python_command],
-        check=True,
-        capture_output=True,
+    invocation = [executable, "-c", python_command]
+    if progress_callback is None:
+        return subprocess.run(
+            invocation,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=environment,
+        )
+
+    process = subprocess.Popen(
+        invocation,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=timeout_seconds,
         env=environment,
     )
+    output_lines: list[str] = []
+    assert process.stdout is not None
+    try:
+        for line in process.stdout:
+            output_lines.append(line)
+            marker = "CNC_PROGRESS "
+            if marker not in line:
+                continue
+            try:
+                # FreeCAD occasionally writes diagnostics without a trailing
+                # newline, so its text can be attached ahead of our marker.
+                payload, _ = json.JSONDecoder().raw_decode(
+                    line.split(marker, 1)[1].lstrip(),
+                )
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                progress_callback(payload)
+        return_code = process.wait(timeout=timeout_seconds)
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    output = "".join(output_lines)
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, invocation, output=output, stderr=output)
+    return subprocess.CompletedProcess(invocation, return_code, stdout=output, stderr="")
 
 
 def run_camotics(

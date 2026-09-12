@@ -1,6 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -10,6 +11,74 @@ from app.models import GeometryAnalysis, JobResponse
 
 
 client = TestClient(app)
+
+
+def test_volume_conformance_is_based_on_finished_part_not_oversized_stock() -> None:
+    status, target_error, stock_error = main.volume_conformance(243.74, 196.72, 11496.49)
+
+    assert target_error > 19
+    assert stock_error < 0.5
+    assert status == "failed"
+    assert main.volume_conformance(243.74, 218, 11496.49)[0] == "warning"
+    assert main.volume_conformance(243.74, 230, 11496.49)[0] == "passed"
+    assert main.volume_conformance(243.74, 5000, 11496.49)[0] == "failed"
+
+
+def test_browser_preview_compaction_preserves_operation_boundaries() -> None:
+    segments = [
+        {"operation_id": "OP10", "motion": "cut", "x1": index}
+        for index in range(60)
+    ] + [
+        {"operation_id": "OP20", "motion": "cut", "x1": index}
+        for index in range(60, 120)
+    ]
+
+    compacted = main.compact_preview_segments(segments, maximum=20)
+
+    assert len(compacted) < len(segments)
+    assert compacted[0] == segments[0]
+    assert compacted[-1] == segments[-1]
+    assert segments[59] in compacted
+    assert segments[60] in compacted
+
+
+def test_cam_stream_emits_incremental_progress(monkeypatch) -> None:
+    monkeypatch.setattr(main, "load_job", lambda _job_id: SimpleNamespace(plan=object()))
+
+    def fake_create(_job_id, progress_callback=None):
+        assert progress_callback is not None
+        progress_callback({
+            "stage": "operation", "message": "正在生成 OP10",
+            "percent": 25, "operation_id": "OP10", "current": 0, "total": 2,
+        })
+        progress_callback({
+            "stage": "completed", "message": "CAM 刀路与仿真已完成", "percent": 100,
+        })
+        return {}
+
+    monkeypatch.setattr(main, "_create_cam_artifact", fake_create)
+    response = client.get(f"/api/v1/jobs/{'f' * 32}/cam/stream")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert '"operation_id": "OP10"' in response.text
+    assert '"stage": "completed"' in response.text
+
+
+def test_failed_spatial_verification_blocks_gcode_download(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "e" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    (directory / "program.nc").write_text("G1 X1", encoding="utf-8")
+    (directory / "verification.json").write_text(
+        json.dumps({"status": "failed"}), encoding="utf-8",
+    )
+
+    response = client.get(f"/api/v1/jobs/{job_id}/files/program.nc")
+
+    assert response.status_code == 409
+    assert "G-code" in response.json()["detail"]
 
 
 def test_health_reports_adapter_state() -> None:
@@ -361,7 +430,13 @@ def test_cam_requires_approval_and_returns_artifact_links(tmp_path, monkeypatch)
     payload = response.json()
     assert payload["status"] == "completed"
     assert payload["files"]["gcode"].endswith("program.nc")
-    assert payload["verification"]["status"] in {"passed", "warning"}
+    # A CAM response may still carry downloadable diagnostics when the new
+    # target-volume gate proves that the generated toolpath is incomplete.
+    assert payload["verification"]["status"] == "failed"
+    assert any(
+        check["id"] == "target_volume_conformance"
+        for check in payload["verification"]["checks"]
+    )
     assert payload["files"]["verification"].endswith("verification.json")
     assert payload["simulation"]["status"] == "completed"
     assert payload["files"]["simulation"].endswith("simulation.json")

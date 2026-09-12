@@ -48,7 +48,9 @@ def build_safety_configuration(
         stock_max = [maximum[0] + 3, maximum[1] + 3, maximum[2] + 2]
         jaw_top = min(maximum[2], minimum[2] + vise_grip_height_mm)
         setup_size = [maximum[index] - minimum[index] for index in range(3)]
-        thin_setup = setup_size[2] <= max(3.5, min(setup_size[0], setup_size[1]) * 0.12)
+        # Low-fill profile parts up to roughly 6 mm thick need backing support
+        # even when they fall just outside the former strict sheet threshold.
+        thin_setup = setup_size[2] <= max(6.0, min(setup_size[0], setup_size[1]) * 0.25)
 
         def local_box(local_minimum: tuple[float, float, float], local_maximum: tuple[float, float, float]) -> Bounds:
             world_corners = [
@@ -173,12 +175,24 @@ def detect_collisions(analysis: GeometryAnalysis, plan: ProcessPlan, cam_result:
     part = analysis.measurements["bounding_box"]
     assert not isinstance(part, float)
     safety = plan.safety or build_safety_configuration(analysis)
-    stock_allowance = plan.stock.get("allowance_mm", {})
-    stock_xy = float(stock_allowance.get("xy", 3))
-    stock_z = float(stock_allowance.get("z", 2))
+    stock_size = [float(value) for value in plan.stock.get("size_mm", [])]
+    if len(stock_size) != 3:
+        stock_allowance = plan.stock.get("allowance_mm", {})
+        stock_xy = float(stock_allowance.get("xy", 3))
+        stock_z = float(stock_allowance.get("z", 2))
+        stock_size = [
+            part.size.x + stock_xy * 2,
+            part.size.y + stock_xy * 2,
+            part.size.z + stock_z * 2,
+        ]
+    center = (
+        (part.minimum.x + part.maximum.x) / 2,
+        (part.minimum.y + part.maximum.y) / 2,
+        (part.minimum.z + part.maximum.z) / 2,
+    )
     stock_bounds = _bounds(
-        (part.minimum.x - stock_xy, part.minimum.y - stock_xy, part.minimum.z - stock_z),
-        (part.maximum.x + stock_xy, part.maximum.y + stock_xy, part.maximum.z + stock_z),
+        tuple(center[index] - stock_size[index] / 2 for index in range(3)),
+        tuple(center[index] + stock_size[index] / 2 for index in range(3)),
     )
     operations = {operation.id: operation for setup in plan.setups for operation in setup.operations}
     collisions: list[dict[str, object]] = []

@@ -154,8 +154,33 @@ class Setup(BaseModel):
     operations: list[Operation]
 
 
+class CoverageTarget(BaseModel):
+    id: str
+    kind: Literal["hole", "pocket", "slot", "surface", "outer_profile", "internal_profile"]
+    label: str
+    state: Literal["covered", "uncovered", "review", "unresolved"]
+    required_operation_types: list[str] = Field(default_factory=list)
+    covered_by: list[str] = Field(default_factory=list)
+    source_feature_ids: list[str] = Field(default_factory=list)
+
+
+class ManufacturingCoverage(BaseModel):
+    schema_version: str = "1.0.0"
+    status: Literal["complete", "review", "incomplete"]
+    score: float = Field(ge=0, le=1)
+    target_count: int = 0
+    covered_count: int = 0
+    unresolved_count: int = 0
+    review_count: int = 0
+    production_ready: bool = False
+    targets: list[CoverageTarget] = Field(default_factory=list)
+    issues: list[str] = Field(default_factory=list)
+    capability_gaps: list[str] = Field(default_factory=list)
+
+
 class ProcessPlan(BaseModel):
     schema_version: str = "0.8.0"
+    process_kind: Literal["subtractive", "sheet_forming"] = "subtractive"
     title: str
     material: str
     machine: str
@@ -169,6 +194,7 @@ class ProcessPlan(BaseModel):
     estimated_minutes: float
     automation_status: Literal["ready", "review", "unsupported"] = "ready"
     blocking_reasons: list[str] = Field(default_factory=list)
+    coverage: ManufacturingCoverage | None = None
 
 
 class JobResponse(BaseModel):

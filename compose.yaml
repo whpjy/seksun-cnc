@@ -13,8 +13,15 @@ services:
       CNC_MAX_UPLOAD_MB: "200"
       CNC_CORS_ORIGINS: http://localhost:5174,http://localhost:3001
       CNC_PUBLIC_BASE_URL: ${CNC_PUBLIC_BASE_URL:-}
+      CNC_EXAMPLE_ROOT: /var/lib/seksun-cnc/examples
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      QWEN_BASE_URL: ${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      QWEN_MODEL: ${QWEN_MODEL:-qwen3.8-max-0902}
+      QWEN_TIMEOUT_SECONDS: ${QWEN_TIMEOUT_SECONDS:-120}
+      QWEN_PLANNING_THINKING: ${QWEN_PLANNING_THINKING:-false}
     volumes:
       - ./.seksun-cnc:/var/lib/seksun-cnc
+      - "../example/用于2d图纸识别_ 10份对应2d和3d:/var/lib/seksun-cnc/examples:ro"
     ports:
       - "8090:8090"
     restart: unless-stopped

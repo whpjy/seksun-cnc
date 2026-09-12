@@ -67,7 +67,8 @@ export type CamResult = {
   status: "completed";
   engine: string;
   engine_version: string;
-  operation_backend: "native";
+  process_kind?: "subtractive" | "sheet_forming";
+  operation_backend: "native" | "forming_preview";
   native_operation_types: Record<string, string>;
   postprocessor: string;
   generated_operations: string[];
@@ -82,6 +83,23 @@ export type CamResult = {
   simulation: SimulationResult;
   collision: CollisionResult;
   safety: string;
+  forming_preview?: FormingPreview;
+};
+
+export type FormingPreview = {
+  method: "target-mesh-depth-morph";
+  validation_level: "concept";
+  nominal_thickness_mm: number;
+  formed_depth_mm: number;
+  production_output_available: false;
+  stages: {
+    operation_id: string;
+    name: string;
+    process: string;
+    start_factor: number;
+    end_factor: number;
+    status: "concept_preview";
+  }[];
 };
 
 export type FixtureComponent = {
@@ -105,7 +123,7 @@ export type CollisionResult = {
   schema_version: string;
   engine: string;
   status: "passed" | "failed";
-  configuration: SafetyConfiguration;
+  configuration: SafetyConfiguration | null;
   checks: { id: string; status: "passed" | "failed"; message: string }[];
   collisions: { kind: string; operation_id: string; target_id: string; position: Vec3 }[];
   low_rapids: { operation_id: string; minimum_z: number; required_z: number }[];
@@ -162,6 +180,12 @@ export type VerificationResult = {
     extent_mm: Vec3;
     estimated_cycle_minutes: number;
     generated_operation_count: number;
+    target_volume_mm3?: number;
+    remaining_volume_mm3?: number;
+    target_volume_deviation_percent?: number;
+    target_overlap_percent?: number;
+    missing_target_volume_mm3?: number;
+    excess_stock_volume_mm3?: number;
   };
   limitations: string[];
 };
@@ -235,6 +259,55 @@ export type Operation = {
   generation_state: "dirty" | "generating" | "generated" | "failed";
 };
 
+export type AIProcessReviewResult = {
+  schema_version: "1.0.0";
+  provider: "alibaba-model-studio";
+  model: string;
+  request_id: string | null;
+  created_at: string;
+  latency_ms: number;
+  thinking_enabled: boolean;
+  usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | null;
+  input_summary: {
+    source_file: string;
+    setup_count: number;
+    operation_count: number;
+    has_verification: boolean;
+    has_collision: boolean;
+    has_simulation: boolean;
+  };
+  review: {
+    schema_version: "1.0.0";
+    manufacturing_intent: string;
+    part_family: string;
+    recommended_process_kind: string;
+    deterministic_plan_assessment: "acceptable" | "revise" | "unsupported";
+    confidence: number;
+    summary: string;
+    setup_strategy: string[];
+    operation_recommendations: {
+      action: "keep" | "add" | "modify" | "remove" | "reorder" | "review";
+      setup_id: string;
+      operation_id: string;
+      operation_type: string;
+      feature_ids: string[];
+      priority: number;
+      reason: string;
+    }[];
+    risks: {
+      severity: "low" | "medium" | "high" | "critical";
+      code: string;
+      description: string;
+      evidence: string[];
+      recommended_action: string;
+    }[];
+    missing_information: string[];
+    requires_engineer_review: boolean;
+    approval_blocked: boolean;
+  };
+  safety: string;
+};
+
 export type Setup = {
   id: string;
   name: string;
@@ -242,6 +315,28 @@ export type Setup = {
   datum_feature_id: string | null;
   fixture: string;
   operations: Operation[];
+};
+
+export type ManufacturingCoverage = {
+  schema_version: string;
+  status: "complete" | "review" | "incomplete";
+  score: number;
+  target_count: number;
+  covered_count: number;
+  unresolved_count: number;
+  review_count: number;
+  production_ready: boolean;
+  targets: {
+    id: string;
+    kind: "hole" | "pocket" | "slot" | "surface" | "outer_profile" | "internal_profile";
+    label: string;
+    state: "covered" | "uncovered" | "review" | "unresolved";
+    required_operation_types: string[];
+    covered_by: string[];
+    source_feature_ids: string[];
+  }[];
+  issues: string[];
+  capability_gaps: string[];
 };
 
 export type Job = {
@@ -262,6 +357,7 @@ export type Job = {
     visual_edges: Vec3[][];
   } | null;
   plan: {
+    process_kind?: "subtractive" | "sheet_forming";
     title: string;
     material: string;
     machine: string;
@@ -275,5 +371,6 @@ export type Job = {
     estimated_minutes: number;
     automation_status: "ready" | "review" | "unsupported";
     blocking_reasons: string[];
+    coverage?: ManufacturingCoverage | null;
   } | null;
 };

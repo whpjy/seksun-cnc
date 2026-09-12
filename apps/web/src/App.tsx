@@ -6,6 +6,7 @@ import {
   Bot,
   Box,
   Check,
+  ChevronLeft,
   ChevronRight,
   CircleDot,
   Clock3,
@@ -20,13 +21,12 @@ import {
   Rotate3D,
   Settings2,
   ShieldCheck,
-  Sparkles,
   Trash2,
   Wrench,
   X,
 } from "lucide-react";
 import { ModelViewer } from "./ModelViewer";
-import type { CamResult, Catalogs, Job, ManufacturingFeature, Operation, OperationDefinition, ToolpathSegment, Vec3 } from "./types";
+import type { AIProcessReviewResult, CamResult, Catalogs, Job, ManufacturingFeature, Operation, OperationDefinition, ToolpathSegment, Vec3 } from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
@@ -36,7 +36,12 @@ function apiUrl(path: string) {
   return `${API_BASE}${path}`;
 }
 
-function UploadScreen({ onCreated }: { onCreated: (job: Job) => void }) {
+function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: (job: Job) => void;
+  canClose?: boolean;
+}) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [material, setMaterial] = useState("6061-T6 铝合金");
@@ -52,6 +57,15 @@ function UploadScreen({ onCreated }: { onCreated: (job: Job) => void }) {
       .catch(() => setError("参数库暂不可用，已保留默认选项"));
   }, []);
 
+  useEffect(() => {
+    if (!open || !canClose) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [busy, canClose, onClose, open]);
+
   const submit = async () => {
     if (!file) return;
     setBusy(true);
@@ -65,6 +79,7 @@ function UploadScreen({ onCreated }: { onCreated: (job: Job) => void }) {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "分析失败");
       onCreated(payload as Job);
+      setFile(null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法连接分析服务");
     } finally {
@@ -72,27 +87,41 @@ function UploadScreen({ onCreated }: { onCreated: (job: Job) => void }) {
     }
   };
 
+  if (!open) return null;
+
   return (
-    <main className="landing">
-      <header className="landing-header">
-        <div className="brand"><span>S</span> SEKSUN CNC</div>
-        <div className="system-state"><i /> Geometry engine ready</div>
-      </header>
-      <section className="hero">
-        <div className="eyebrow"><Sparkles size={14} /> INTELLIGENT PROCESS PLANNING</div>
-        <h1>从几何事实到<br /><em>可审查的加工工艺</em></h1>
-        <p>上传 STEP，自动识别制造特征、规划装夹与工序。每一步都有依据，每一个结果都由工程师确认。</p>
-      </section>
-      <section className="upload-card">
-        <button className={`drop-zone ${file ? "has-file" : ""}`} onClick={() => inputRef.current?.click()}>
+    <div className="new-job-backdrop" onMouseDown={() => canClose && !busy && onClose()}>
+      <section className="new-job-dialog" role="dialog" aria-modal="true" aria-labelledby="new-job-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header>
+          <div><span className="dialog-icon"><FileUp size={18} /></span><div><strong id="new-job-title">新建工艺任务</strong><small>上传三维模型，自动识别特征并规划工序</small></div></div>
+          {canClose && <button aria-label="关闭新建任务" disabled={busy} onClick={onClose}><X size={17} /></button>}
+        </header>
+        <button
+          className={`drop-zone ${file ? "has-file" : ""}`}
+          onClick={() => inputRef.current?.click()}
+          onDragOver={(event) => { event.preventDefault(); event.currentTarget.classList.add("is-dragging"); }}
+          onDragLeave={(event) => event.currentTarget.classList.remove("is-dragging")}
+          onDrop={(event) => {
+            event.preventDefault();
+            event.currentTarget.classList.remove("is-dragging");
+            const candidate = event.dataTransfer.files?.[0];
+            if (!candidate) return;
+            if (!/\.(step|stp)$/i.test(candidate.name)) {
+              setError("请选择 STEP 或 STP 文件");
+              return;
+            }
+            setError("");
+            setFile(candidate);
+          }}
+        >
           <input
             ref={inputRef}
             type="file"
             accept=".step,.stp"
             hidden
-            onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+            onChange={(event) => { setError(""); setFile(event.target.files?.[0] ?? null); }}
           />
-          {file ? <><Box size={28} /><strong>{file.name}</strong><small>{(file.size / 1024 / 1024).toFixed(2)} MB · STEP</small></> : <><FileUp size={28} /><strong>选择 STEP / STP 零件</strong><small>服务端使用 OCCT 精确解析 B-Rep</small></>}
+          {file ? <><Box size={26} /><strong>{file.name}</strong><small>{(file.size / 1024 / 1024).toFixed(2)} MB · 点击可重新选择</small></> : <><FileUp size={26} /><strong>拖入 STEP / STP，或点击选择</strong><small>使用 OCCT 精确解析 B-Rep 几何</small></>}
         </button>
         <div className="form-row">
           <label>材料<select value={material} onChange={(event) => setMaterial(event.target.value)}>{(catalogs?.materials.map((item) => item.name) ?? ["6061-T6 铝合金", "7075-T6 铝合金", "S45C", "SUS304"]).map((name) => <option key={name}>{name}</option>)}</select></label>
@@ -102,22 +131,31 @@ function UploadScreen({ onCreated }: { onCreated: (job: Job) => void }) {
         <button className="primary-action" disabled={!file || busy} onClick={submit}>
           {busy ? <><LoaderCircle className="spin" size={17} /> 正在识别几何与规划工艺…</> : <>开始智能规划 <ChevronRight size={17} /></>}
         </button>
-        <div className="safety-note"><ShieldCheck size={15} /> 工艺输出为工程草案，不会未经审核生成上机指令</div>
+        <footer><ShieldCheck size={14} /> 工艺输出为工程草案，需通过审查和仿真后才能导出</footer>
       </section>
-    </main>
+    </div>
   );
 }
 
-function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job; onReset: () => void; readOnly?: boolean }) {
+function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; onNew: () => void; readOnly?: boolean }) {
   const [job, setJob] = useState(initialJob);
   const [selectedOperation, setSelectedOperation] = useState<Operation | null>(job.plan?.setups[0]?.operations[0] ?? null);
   const [selectedFeatureIds, setSelectedFeatureIds] = useState<string[]>(selectedOperation?.feature_ids ?? []);
   const [activeMode, setActiveMode] = useState("工艺");
   const [approving, setApproving] = useState(false);
   const [generatingCam, setGeneratingCam] = useState(false);
-  const [loadingCam, setLoadingCam] = useState(true);
+  const [loadingCam, setLoadingCam] = useState(readOnly);
   const [camResult, setCamResult] = useState<CamResult | null>(null);
   const [camError, setCamError] = useState("");
+  const [camProgress, setCamProgress] = useState<{
+    stage: string;
+    message: string;
+    percent: number;
+    setup_id?: string;
+    operation_id?: string;
+    current?: number;
+    total?: number;
+  } | null>(null);
   const [clearance, setClearance] = useState(job.plan?.safety?.clearance_mm ?? 3);
   const [viseGripHeight, setViseGripHeight] = useState(job.plan?.safety?.vise_grip_height_mm ?? 1.5);
   const [supportThickness, setSupportThickness] = useState(job.plan?.safety?.support_thickness_mm ?? 3);
@@ -127,15 +165,23 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
   const [shareMessage, setShareMessage] = useState("");
   const [reanalyzing, setReanalyzing] = useState(false);
   const [showSimulationChecks, setShowSimulationChecks] = useState(false);
+  const [showWarnings, setShowWarnings] = useState(false);
   const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
   const [showOperationLibrary, setShowOperationLibrary] = useState(false);
   const [libraryFeatureIds, setLibraryFeatureIds] = useState<string[]>([]);
   const [operationMessage, setOperationMessage] = useState("");
   const [operationBusy, setOperationBusy] = useState(false);
+  const [aiReview, setAiReview] = useState<AIProcessReviewResult | null>(null);
+  const [aiReviewBusy, setAiReviewBusy] = useState(false);
+  const [aiReviewError, setAiReviewError] = useState("");
+  const [showAiReview, setShowAiReview] = useState(false);
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
-  const [structureExpanded, setStructureExpanded] = useState(true);
+  const [structureExpanded, setStructureExpanded] = useState(
+    (job.plan?.setups.reduce((count, setup) => count + setup.operations.length, 0) ?? 0) <= 8,
+  );
   const [rationaleExpanded, setRationaleExpanded] = useState(true);
   const [playbackMode, setPlaybackMode] = useState<"single" | "cumulative">("single");
+  const operationFlowRef = useRef<HTMLDivElement>(null);
   const operations = useMemo(
     () => job.plan?.setups.flatMap((setup) => setup.operations) ?? [],
     [job.plan?.setups],
@@ -155,8 +201,10 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
     [operations],
   );
   const enabledOperations = operations.filter((operation) => operation.enabled !== false);
+  const isSheetForming = job.plan?.process_kind === "sheet_forming";
   const planApproved = enabledOperations.length > 0 && enabledOperations.every((operation) => operation.status === "approved");
   const automationBlocked = job.plan?.automation_status === "unsupported";
+  const aiApprovalBlocked = aiReview?.review.approval_blocked === true;
   const holes = useMemo(
     () => job.analysis?.cylindrical_features.filter((item) => item.kind === "hole" && item.review_state !== "excluded") ?? [],
     [job.analysis?.cylindrical_features],
@@ -172,6 +220,14 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
   const excludedCount = job.analysis?.cylindrical_features.filter((item) => item.kind === "hole" && item.review_state === "excluded").length ?? 0;
   const prismaticExcludedCount = job.analysis?.prismatic_features?.filter((item) => item.review_state === "excluded").length ?? 0;
   const reviewCount = manufacturingFeatures.filter((item) => item.review_state === "review").length;
+  const firstReviewFeature = manufacturingFeatures.find((item) => item.review_state === "review");
+  const coverage = job.plan?.coverage;
+  const warningMessages = [
+    ...(coverage?.issues.map((item) => `覆盖检查：${item}`) ?? []),
+    ...(coverage?.capability_gaps.map((item) => `能力缺口：${item}`) ?? []),
+    ...(job.plan?.warnings ?? []),
+  ];
+  const warningCount = warningMessages.length;
   const sourceSolids = Number(job.analysis?.topology.source_solids ?? job.analysis?.topology.solids ?? 1);
   const requestedProgress = Number(new URLSearchParams(window.location.search).get("progress") ?? 0);
   const initialSimulationProgress = Number.isFinite(requestedProgress) ? Math.min(1, Math.max(0, requestedProgress)) : 0;
@@ -183,8 +239,10 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
         ? "warning"
         : "passed";
   const cutOperationIds = useMemo(
-    () => new Set(camResult?.preview_segments.filter((segment) => segment.motion === "cut").map((segment) => segment.operation_id) ?? []),
-    [camResult?.preview_segments],
+    () => new Set(isSheetForming
+      ? camResult?.generated_operations ?? []
+      : camResult?.preview_segments.filter((segment) => segment.motion === "cut").map((segment) => segment.operation_id) ?? []),
+    [camResult?.generated_operations, camResult?.preview_segments, isSheetForming],
   );
 
   const selectedFeatures = useMemo(
@@ -209,11 +267,46 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
   ], [job.analysis?.cylindrical_features, job.analysis?.planar_features, job.analysis?.prismatic_features]);
 
   useEffect(() => {
+    const flow = operationFlowRef.current;
+    const activeOperation = flow?.querySelector<HTMLElement>('[aria-current="step"]');
+    if (!flow || !activeOperation) return;
+    flow.scrollTo({
+      left: Math.max(0, activeOperation.offsetLeft - (flow.clientWidth - activeOperation.clientWidth) / 2),
+      behavior: "smooth",
+    });
+  }, [selectedOperation?.id]);
+
+  useEffect(() => {
     fetch(apiUrl("/api/v1/catalogs"))
       .then((response) => response.ok ? response.json() : Promise.reject())
       .then((payload: Catalogs) => setCatalogs(payload))
       .catch(() => setOperationMessage("工序库暂时无法加载"));
   }, []);
+
+  useEffect(() => {
+    fetch(apiUrl(`/api/v1/jobs/${job.id}/ai/plan`))
+      .then((response) => response.ok ? response.json() : null)
+      .then((payload: AIProcessReviewResult | null) => {
+        if (payload) setAiReview(payload);
+      })
+      .catch(() => undefined);
+  }, [job.id]);
+
+  const runAiReview = async () => {
+    setAiReviewBusy(true);
+    setAiReviewError("");
+    setShowAiReview(true);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/ai/plan`), { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "AI 工艺审查失败");
+      setAiReview(payload as AIProcessReviewResult);
+    } catch (reason) {
+      setAiReviewError(reason instanceof Error ? reason.message : "无法连接 Qwen 工艺中枢");
+    } finally {
+      setAiReviewBusy(false);
+    }
+  };
 
   const visibleToolpathSegments = useMemo(() => {
     if (activeMode === "刀路") return camResult?.preview_segments ?? [];
@@ -263,7 +356,7 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
     return surface ? { url: apiUrl(`/api/v1/jobs/${job.id}/files/${surface.file}`), frame: surface.frame } : null;
   }, [activeMode, camResult?.camotics_surfaces, job.id, selectedSetupId, usesCumulativeStock]);
   const visibleSimulation = useMemo(() => {
-    if (activeMode !== "仿真" || !simulationResult) return null;
+    if (activeMode !== "仿真" || !simulationResult || isSheetForming) return null;
     const surface = usesCumulativeStock
       ? simulationResult.surface
       : simulationResult.setup_surfaces?.find((item) => item.setup_id === selectedSetupId) ?? simulationResult.surface;
@@ -280,7 +373,7 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
         removed_percent: stockVolume ? Math.round(removedVolume / stockVolume * 10000) / 100 : 0,
       },
     };
-  }, [activeMode, selectedSetupId, simulationResult, usesCumulativeStock]);
+  }, [activeMode, isSheetForming, selectedSetupId, simulationResult, usesCumulativeStock]);
   const visibleFixtureComponents = useMemo(
     () => activeMode === "仿真" ? job.plan?.safety?.fixture_components ?? [] : [],
     [activeMode, job.plan?.safety?.fixture_components],
@@ -297,10 +390,16 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
         if (config.public_base_url) setShareBaseUrl(config.public_base_url);
       })
       .catch(() => undefined);
+  }, [job.id]);
+
+  useEffect(() => {
+    const needsCam = readOnly || activeMode === "刀路" || activeMode === "仿真";
+    if (!needsCam || camResult) return;
+    let cancelled = false;
     fetch(apiUrl(`/api/v1/jobs/${job.id}/cam`))
       .then((response) => response.ok ? response.json() : null)
       .then((payload: CamResult | null) => {
-        if (payload) {
+        if (payload && !cancelled) {
           setCamResult(payload);
           if (readOnly) {
             const ids = new Set(payload.preview_segments.filter((segment) => segment.motion === "cut").map((segment) => segment.operation_id));
@@ -314,8 +413,13 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
         }
       })
       .catch(() => undefined)
-      .finally(() => setLoadingCam(false));
-  }, [job.id, readOnly, operations]);
+      .finally(() => {
+        if (!cancelled) setLoadingCam(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeMode, camResult, job.id, operations, readOnly]);
 
   const copyShareLink = async () => {
     const shareUrl = `${shareBaseUrl}/jobs/${job.id}?view=1`;
@@ -352,6 +456,7 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
         setSelectedFeatureIds(playable.feature_ids);
       }
     }
+    setLoadingCam((mode === "刀路" || mode === "仿真") && !camResult);
     setActiveMode(mode);
   };
 
@@ -359,6 +464,19 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
     setSelectedFeatureIds([id]);
     const relatedOperation = operations.find((operation) => operation.feature_ids.includes(id));
     if (relatedOperation) setSelectedOperation(relatedOperation);
+  };
+
+  const openReviewQueue = () => {
+    setActiveMode("特征");
+    setRationaleExpanded(true);
+    if (firstReviewFeature) chooseFeature(firstReviewFeature.id);
+  };
+
+  const navigateOperation = (direction: -1 | 1) => {
+    if (!selectedOperation) return;
+    const index = operations.findIndex((operation) => operation.id === selectedOperation.id);
+    const target = operations[index + direction];
+    if (target) chooseOperation(target);
   };
 
   const approve = async () => {
@@ -381,7 +499,9 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
       const updatedJob = payload as Job;
       const updatedOperations = updatedJob.plan?.setups.flatMap((setup) => setup.operations) ?? [];
       setJob(updatedJob);
+      setAiReview(null);
       setCamResult(null);
+      setLoadingCam(activeMode === "刀路" || activeMode === "仿真");
       setSelectedOperation(updatedOperations[0] ?? null);
       setSelectedFeatureIds(updatedOperations[0]?.feature_ids ?? []);
       setClearance(updatedJob.plan?.safety?.clearance_mm ?? 3);
@@ -408,7 +528,9 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
       if (!response.ok) throw new Error(payload.detail || "安全参数保存失败");
       const updatedJob = payload as Job;
       setJob(updatedJob);
+      setAiReview(null);
       setCamResult(null);
+      setLoadingCam(activeMode === "刀路" || activeMode === "仿真");
       setCamError("");
       setSelectedOperation(updatedJob.plan?.setups.flatMap((setup) => setup.operations)[0] ?? null);
       setSafetyMessage("安全参数已更新，工艺方案需要重新批准");
@@ -422,14 +544,62 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
   const generateCam = async () => {
     setGeneratingCam(true);
     setCamError("");
+    setCamProgress({ stage: "connecting", message: "正在连接 CAM 生成器", percent: 0 });
     try {
-      const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/cam`), { method: "POST" });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || "刀路生成失败");
-      setCamResult(payload as CamResult);
+      await new Promise<void>((resolve, reject) => {
+        const stream = new EventSource(apiUrl(`/api/v1/jobs/${job.id}/cam/stream`));
+        let settled = false;
+        stream.onmessage = async (event) => {
+          const progress = JSON.parse(event.data) as {
+            stage: string; message: string; percent: number;
+            setup_id?: string; operation_id?: string; current?: number; total?: number;
+          };
+          setCamProgress(progress);
+          if (progress.operation_id) {
+            const activeOperation = operations.find((operation) => operation.id === progress.operation_id);
+            if (activeOperation) {
+              setSelectedOperation(activeOperation);
+              setSelectedFeatureIds(activeOperation.feature_ids);
+            }
+          }
+          if (progress.stage === "error") {
+            settled = true;
+            stream.close();
+            reject(new Error(progress.message));
+            return;
+          }
+          if (progress.stage !== "completed") return;
+          settled = true;
+          stream.close();
+          try {
+            const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/cam`));
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.detail || "刀路结果加载失败");
+            const generated = payload as CamResult;
+            setCamResult(generated);
+            if (isSheetForming) {
+              setShowSimulationChecks(true);
+              setActiveMode("仿真");
+            } else if (generated.verification.status === "failed" || generated.collision.status === "failed") {
+              setShowSimulationChecks(true);
+              setActiveMode("仿真");
+            } else {
+              setActiveMode("刀路");
+            }
+            resolve();
+          } catch (reason) {
+            reject(reason);
+          }
+        };
+        stream.onerror = () => {
+          if (settled) return;
+          settled = true;
+          stream.close();
+          reject(new Error("刀路进度连接中断"));
+        };
+      });
       const refreshedJob = await fetch(apiUrl(`/api/v1/jobs/${job.id}`));
       if (refreshedJob.ok) setJob(await refreshedJob.json() as Job);
-      setActiveMode("刀路");
     } catch (reason) {
       setCamError(reason instanceof Error ? reason.message : "刀路生成失败");
     } finally {
@@ -446,7 +616,9 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
     if (!response.ok) return;
     const updatedJob = await response.json() as Job;
     setJob(updatedJob);
+    setAiReview(null);
     setCamResult(null);
+    setLoadingCam(activeMode === "刀路" || activeMode === "仿真");
     const updatedOperations = updatedJob.plan?.setups.flatMap((setup) => setup.operations) ?? [];
     const relatedOperation = updatedOperations.find((operation) => operation.feature_ids.includes(featureId));
     setSelectedOperation(relatedOperation ?? updatedOperations[0] ?? null);
@@ -457,7 +629,9 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
     const updatedOperations = updatedJob.plan?.setups.flatMap((setup) => setup.operations) ?? [];
     const preferred = updatedOperations.find((operation) => operation.id === preferredOperationId) ?? updatedOperations[0] ?? null;
     setJob(updatedJob);
+    setAiReview(null);
     setCamResult(null);
+    setLoadingCam(activeMode === "刀路" || activeMode === "仿真");
     setSelectedOperation(preferred);
     setSelectedFeatureIds(preferred?.feature_ids ?? []);
     setParameterEdits({});
@@ -575,7 +749,7 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
   };
 
   if (!job.plan || !job.analysis || !job.model_url) {
-    return <div className="fatal-state"><AlertTriangle />{job.error || "任务没有产生可用结果"}<button onClick={onReset}>返回</button></div>;
+    return <div className="fatal-state"><AlertTriangle />{job.error || "任务没有产生可用结果"}<button onClick={onNew}>上传新零件</button></div>;
   }
 
   return (
@@ -587,18 +761,22 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
         <div className="header-actions">
           <button className="ghost share-button" onClick={copyShareLink}><Link2 size={14} />分享</button>
           {!readOnly && <button className="ghost reanalyze-button" onClick={reanalyze} disabled={reanalyzing}><RefreshCw className={reanalyzing ? "spin" : ""} size={14} />{reanalyzing ? "分析中" : "重新分析"}</button>}
-          <button className="ghost" onClick={onReset}>新建</button>
-          {!readOnly && <button className={`approve ${automationBlocked ? "blocked" : ""}`} onClick={approve} disabled={approving || automationBlocked}>{automationBlocked ? <AlertTriangle size={15} /> : <Check size={15} />}{automationBlocked ? "无法自动规划" : approving ? "确认中" : planApproved ? "已批准" : "批准方案"}</button>}
+          <button className="ghost new-job-button" onClick={onNew}><FileUp size={14} />新建</button>
+          {!readOnly && <button className={`approve ${automationBlocked || aiApprovalBlocked ? "blocked" : ""}`} onClick={approve} disabled={approving || automationBlocked || aiApprovalBlocked || planApproved}>{automationBlocked || aiApprovalBlocked ? <AlertTriangle size={15} /> : <Check size={15} />}{automationBlocked ? "无法自动规划" : aiApprovalBlocked ? "AI 阻止批准" : approving ? "确认中" : planApproved ? "工艺已批准" : "批准方案"}</button>}
         </div>
       </header>
       <nav className="mode-tabs workspace-toolbar">
         <div className="mode-switcher">
-          {["特征", "工艺", "刀路", "仿真"].map((mode) => <button key={mode} className={activeMode === mode ? "active" : ""} onClick={() => chooseMode(mode)}>{mode}</button>)}
+          {["特征", "工艺", "刀路", "仿真"].map((mode) => <button key={mode} className={activeMode === mode ? "active" : ""} onClick={() => chooseMode(mode)}>{isSheetForming && mode === "刀路" ? "成形" : mode}</button>)}
         </div>
-        <div className="plan-state"><i /> {sourceSolids > 1 ? `${sourceSolids} 实体 / 主体已筛选 · ` : ""}{job.plan.setups.length} 次装夹 · {operations.length} 道候选工序</div>
+        <div className={`plan-state ${reviewCount > 0 ? "needs-review" : ""}`}><i /> {sourceSolids > 1 ? `${sourceSolids} 实体 / 主体已筛选 · ` : ""}{job.plan.setups.length} 次装夹 · {operations.length} 道工序</div>
         <div className="context-actions">
-          {!readOnly && <button onClick={() => { setLibraryFeatureIds(selectedFeatureIds); setShowOperationLibrary(true); }}><Library size={15} />工序库</button>}
-          {!readOnly && <button className="primary" disabled={automationBlocked || !planApproved || generatingCam} onClick={generateCam}><Play size={15} />{generatingCam ? "生成中…" : "生成刀路"}</button>}
+          {coverage && <button className={`coverage-button ${coverage.status}`} onClick={() => setShowWarnings(true)}><CircleDot size={14} />覆盖 {Math.round(coverage.score * 100)}%{coverage.unresolved_count > 0 ? ` · ${coverage.unresolved_count} 未识别` : ""}</button>}
+          {!readOnly && <button className="ai-review-button" disabled={aiReviewBusy} onClick={runAiReview}><Bot className={aiReviewBusy ? "spin" : ""} size={15} />{aiReviewBusy ? "AI 审查中" : "AI 工艺审查"}</button>}
+          {readOnly && aiReview && <button className="ai-review-button" onClick={() => setShowAiReview(true)}><Bot size={15} />AI 审查结果</button>}
+          {reviewCount > 0 && <button className="review-queue-button" onClick={openReviewQueue}><AlertTriangle size={15} />{reviewCount} 项待复核</button>}
+          {!readOnly && !isSheetForming && <button onClick={() => { setLibraryFeatureIds(selectedFeatureIds); setShowOperationLibrary(true); }}><Library size={15} />工序库</button>}
+          {!readOnly && <button className="primary" disabled={automationBlocked || !planApproved || generatingCam} onClick={generateCam}><Play size={15} />{generatingCam ? `生成中 ${Math.round(camProgress?.percent ?? 0)}%` : isSheetForming ? "生成成形仿真" : "生成刀路"}</button>}
         </div>
       </nav>
 
@@ -634,7 +812,7 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
                 <div key={setup.id} className="setup-tree">
                   <div className="tree-section"><strong><Rotate3D size={15} /> {setup.name}</strong><small>{setup.fixture}</small></div>
                   {setup.operations.map((operation) => (
-                    <button key={operation.id} disabled={activeMode === "仿真" && Boolean(camResult) && !cutOperationIds.has(operation.id)} className={`${selectedOperation?.id === operation.id ? "selected" : ""} ${operation.enabled === false ? "suppressed" : ""} ${activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? "unavailable" : ""}`} onClick={() => chooseOperation(operation)}>
+                    <button key={operation.id} disabled={activeMode === "仿真" && Boolean(camResult) && !cutOperationIds.has(operation.id)} className={`${selectedOperation?.id === operation.id ? "selected" : ""} ${operation.enabled === false ? "suppressed" : ""} ${generatingCam && camProgress?.operation_id === operation.id ? "stream-active" : ""} ${activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? "unavailable" : ""}`} onClick={() => chooseOperation(operation)}>
                       <span>{operation.id}</span><div><strong>{operation.name}</strong><small>{operation.tool.name}{activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? " · 无有效刀路" : ""}</small></div>
                     </button>
                   ))}
@@ -651,10 +829,10 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
                 <>
                   <div className="confidence"><span>建议置信度</span><strong>{Math.round(selectedOperation.confidence * 100)}%</strong><div><i style={{ width: `${selectedOperation.confidence * 100}%` }} /></div></div>
                   <div className="inspector-block"><label>工序</label><h3>{selectedOperation.name}</h3><p>{selectedOperation.id} · {selectedOperation.type}</p></div>
-                  <div className="inspector-block"><label>刀具</label><div className="tool-card"><Wrench size={18} /><div><strong>{selectedOperation.tool.name}</strong><small>{selectedOperation.tool.kind} · 伸出 {selectedOperation.tool.stickout_mm} mm · 刀柄 Ø{selectedOperation.tool.holder_diameter_mm}</small></div></div>
+                  <div className="inspector-block"><label>{isSheetForming ? "工艺装备" : "刀具"}</label><div className="tool-card"><Wrench size={18} /><div><strong>{selectedOperation.tool.name}</strong><small>{isSheetForming ? selectedOperation.tool.kind : `${selectedOperation.tool.kind} · 伸出 ${selectedOperation.tool.stickout_mm} mm · 刀柄 Ø${selectedOperation.tool.holder_diameter_mm}`}</small></div></div>
                     {selectedDefinition && !readOnly && <select className="tool-selector" disabled={operationBusy} value={selectedOperation.tool.id} onChange={(event) => updateOperationTool(event.target.value)}>{(catalogs?.tools ?? []).filter((tool) => selectedDefinition.tool.accepts.includes(tool.kind)).map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select>}
                   </div>
-                  <div className="inspector-block safety-editor">
+                  {!isSheetForming && <div className="inspector-block safety-editor">
                     <label>安全与夹具</label>
                     <div><span>安全间隙 mm</span><input disabled={readOnly} type="number" min="0.5" max="50" step="0.5" value={clearance} onChange={(event) => setClearance(Number(event.target.value))} /></div>
                     {job.plan.safety?.fixture_strategy === "sacrificial_plate"
@@ -662,7 +840,7 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
                       : <div><span>平口钳夹持高度 mm</span><input disabled={readOnly} type="number" min="0.5" max="50" step="0.5" value={viseGripHeight} onChange={(event) => setViseGripHeight(Number(event.target.value))} /></div>}
                     {!readOnly && <button onClick={saveSafety} disabled={savingSafety}>{savingSafety ? "保存中…" : "保存并重新校核"}</button>}
                     {safetyMessage && <small>{safetyMessage}</small>}
-                  </div>
+                  </div>}
                   <div className="inspector-block"><label>推理依据</label><ul>{selectedOperation.rationale.map((item) => <li key={item}>{item}</li>)}</ul></div>
                   <div className="inspector-block operation-parameters"><label>工序参数</label>
                     {selectedDefinition ? <>
@@ -725,27 +903,61 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
             playbackMode={playbackMode}
             onPlaybackModeChange={setPlaybackMode}
             toolpathLoaded={!loadingCam}
+            formingPreview={activeMode === "仿真" ? camResult?.forming_preview ?? null : null}
           />
+          {loadingCam && <div className="cam-loading-notice"><LoaderCircle className="spin" size={16} /><div><strong>{isSheetForming ? "正在加载成形仿真" : "正在加载刀路数据"}</strong><small>模型可以继续查看，结果就绪后会自动显示</small></div></div>}
+          {generatingCam && camProgress && <div className="cam-loading-notice cam-stream-progress"><LoaderCircle className="spin" size={16} /><div><strong>{camProgress.message}</strong><small>{camProgress.operation_id ? `${camProgress.operation_id} · ` : ""}{camProgress.current != null && camProgress.total ? `${camProgress.current}/${camProgress.total} · ` : ""}{Math.round(camProgress.percent)}%</small><span><i style={{ width: `${camProgress.percent}%` }} /></span></div></div>}
+          {activeMode === "仿真" && validationStatus === "failed" && camResult && !isSheetForming && <div className="simulation-failure-banner"><AlertTriangle size={18} /><div><strong>当前刀路未达到成品，禁止上机</strong><span>STEP 空间重合 {camResult.verification.metrics.target_overlap_percent?.toFixed(1) ?? "—"}% · 目标过切 {camResult.verification.metrics.missing_target_volume_mm3?.toFixed(2) ?? "—"} mm³ · 多余残料 {camResult.verification.metrics.excess_stock_volume_mm3?.toFixed(2) ?? "—"} mm³</span></div></div>}
+          {activeMode === "仿真" && isSheetForming && camResult && <div className="forming-preview-banner"><Rotate3D size={18} /><div><strong>薄板成形工艺预览</strong><span>名义板厚 {camResult.forming_preview?.nominal_thickness_mm.toFixed(2)} mm · 成形深度 {camResult.forming_preview?.formed_depth_mm.toFixed(2)} mm · 不输出生产 NC</span></div></div>}
           {activeMode === "仿真" && <button className={`simulation-check-toggle ${validationStatus ?? ""}`} onClick={() => setShowSimulationChecks(!showSimulationChecks)}><ShieldCheck size={15} /> 检查结果 <span>{validationStatus ? validationStatus.toUpperCase() : "WAIT"}</span></button>}
           {activeMode === "仿真" && showSimulationChecks && <div className="simulation-panel">
             <div><ShieldCheck size={16} /><strong>碰撞与静态预检</strong><span className={validationStatus ?? undefined}>{validationStatus ? validationStatus.toUpperCase() : "等待生成刀路"}</span><button aria-label="关闭检查结果" onClick={() => setShowSimulationChecks(false)}><X size={14} /></button></div>
             {camResult ? <>
               {camResult.collision.checks.map((check) => <p key={check.id} className={check.status}><i />{check.message}</p>)}
               {camResult.verification.checks.map((check) => <p key={check.id} className={check.status}><i />{check.message}</p>)}
-              <div className="simulation-metrics"><strong>{camResult.simulation.metrics.removed_percent}%</strong><span>材料去除<br />{camResult.simulation.metrics.removed_volume_mm3.toLocaleString()} mm³</span><strong>{camResult.simulation.metrics.resolution_mm}</strong><span>网格精度<br />mm</span></div>
-              <small>刀路估算 {camResult.verification.metrics.estimated_cycle_minutes} min · 绿色为牺牲垫板，红色为硬限位禁入区；包络校核不替代机床级仿真</small>
+              {isSheetForming
+                ? <div className="simulation-metrics"><strong>{camResult.forming_preview?.stages.length ?? 0}</strong><span>工艺阶段<br />完整覆盖</span><strong>{camResult.forming_preview?.nominal_thickness_mm.toFixed(2)}</strong><span>名义板厚<br />mm</span></div>
+                : <div className="simulation-metrics"><strong>{camResult.simulation.metrics.removed_percent}%</strong><span>材料去除<br />{camResult.simulation.metrics.removed_volume_mm3.toLocaleString()} mm³</span><strong>{camResult.simulation.metrics.resolution_mm}</strong><span>网格精度<br />mm</span></div>}
+              <small>{isSheetForming ? "概念动画不包含应变、减薄、起皱、破裂和回弹有限元计算，不能用于模具生产放行" : `刀路估算 ${camResult.verification.metrics.estimated_cycle_minutes} min · 绿色为牺牲垫板，红色为硬限位禁入区；包络校核不替代机床级仿真`}</small>
             </> : <p>批准方案并生成刀路后执行机床行程、参数范围、刀具直径和工序覆盖校验。</p>}
           </div>}
         </section>
 
       </section>
 
+      {showWarnings && <div className="warning-drawer">
+          <header><div><AlertTriangle size={15} /><strong>任务提醒</strong><span>{warningCount}</span></div><button aria-label="关闭任务提醒" onClick={() => setShowWarnings(false)}><X size={14} /></button></header>
+          <div>{warningMessages.map((warning, index) => <p key={`${index}-${warning}`}><span>{index + 1}</span>{warning}</p>)}</div>
+        </div>}
+      {showAiReview && <div className="ai-review-drawer">
+        <header><div><Bot size={16} /><strong>Qwen 工艺中枢</strong>{aiReview && <span className={aiReview.review.approval_blocked ? "blocked" : "ready"}>{aiReview.review.approval_blocked ? "阻止批准" : "建议复核"}</span>}</div><button aria-label="关闭 AI 审查" onClick={() => setShowAiReview(false)}><X size={14} /></button></header>
+        <div className="ai-review-content">
+          {aiReviewBusy && <div className="ai-review-loading"><LoaderCircle className="spin" size={18} /><div><strong>正在综合几何、工艺与仿真结果</strong><small>通常需要 20–60 秒，请勿重复提交</small></div></div>}
+          {aiReviewError && <div className="inline-error"><AlertTriangle size={15} />{aiReviewError}</div>}
+          {aiReview && !aiReviewBusy && <>
+            <div className="ai-review-summary"><div><small>制造意图</small><strong>{aiReview.review.manufacturing_intent}</strong></div><div><small>建议路线</small><strong>{aiReview.review.recommended_process_kind}</strong></div><div><small>置信度</small><strong>{Math.round(aiReview.review.confidence * 100)}%</strong></div><div><small>耗时</small><strong>{(aiReview.latency_ms / 1000).toFixed(1)}s</strong></div></div>
+            <p className="ai-review-conclusion">{aiReview.review.summary}</p>
+            <section><h4>装夹策略</h4>{aiReview.review.setup_strategy.map((item, index) => <p key={`${index}-${item}`}><span>{index + 1}</span>{item}</p>)}</section>
+            <section><h4>工序建议</h4>{aiReview.review.operation_recommendations.length ? [...aiReview.review.operation_recommendations].sort((a, b) => a.priority - b.priority).map((item, index) => <p key={`${index}-${item.operation_id}-${item.action}`}><span>{item.action}</span><b>{item.operation_id || item.operation_type}</b>{item.reason}</p>) : <small>当前没有新增或修改建议</small>}</section>
+            <section><h4>制造风险</h4>{aiReview.review.risks.map((risk) => <p className={`risk-${risk.severity}`} key={risk.code}><span>{risk.severity}</span><b>{risk.code}</b>{risk.description}；{risk.recommended_action}</p>)}</section>
+            {aiReview.review.missing_information.length > 0 && <section><h4>缺失信息</h4>{aiReview.review.missing_information.map((item) => <p key={item}><AlertTriangle size={12} />{item}</p>)}</section>}
+            <footer>{aiReview.model} · {aiReview.usage?.total_tokens?.toLocaleString() ?? "—"} tokens · AI 仅提供建议，仍需确定性校验和工程师批准</footer>
+          </>}
+        </div>
+      </div>}
       <section className="operation-deck panel">
-        <div className="deck-heading"><div><Settings2 size={16} /><strong>工序路线</strong></div><span><Clock3 size={14} />{camResult ? "刀路估算" : "规划估算"} {camResult?.verification.metrics.estimated_cycle_minutes ?? job.plan.estimated_minutes} min</span></div>
-        <div className="operation-flow">
+        <div className="deck-heading">
+          <div><Settings2 size={16} /><strong>工序路线</strong><span className="operation-position">{selectedOperation ? `${selectedOperation.id} · ${operations.findIndex((operation) => operation.id === selectedOperation.id) + 1}/${operations.length}` : `0/${operations.length}`}</span></div>
+          <div className="deck-actions">
+            <button aria-label="上一道工序" title="上一道工序" disabled={!selectedOperation || operations[0]?.id === selectedOperation.id} onClick={() => navigateOperation(-1)}><ChevronLeft size={14} /></button>
+            <button aria-label="下一道工序" title="下一道工序" disabled={!selectedOperation || operations[operations.length - 1]?.id === selectedOperation.id} onClick={() => navigateOperation(1)}><ChevronRight size={14} /></button>
+            <span><Clock3 size={14} />{camResult ? "刀路估算" : "规划估算"} {camResult?.verification.metrics.estimated_cycle_minutes ?? job.plan.estimated_minutes} min</span>
+          </div>
+        </div>
+        <div className="operation-flow" ref={operationFlowRef}>
           {operations.map((operation, index) => (
             <div key={operation.id} className="flow-group">
-              <button disabled={activeMode === "仿真" && Boolean(camResult) && !cutOperationIds.has(operation.id)} className={`${selectedOperation?.id === operation.id ? "active" : ""} ${operation.status} ${operation.enabled === false ? "suppressed" : ""} ${activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? "unavailable" : ""}`} onClick={() => chooseOperation(operation)}>
+              <button aria-current={selectedOperation?.id === operation.id ? "step" : undefined} disabled={activeMode === "仿真" && Boolean(camResult) && !cutOperationIds.has(operation.id)} className={`${selectedOperation?.id === operation.id ? "active" : ""} ${operation.status} ${operation.enabled === false ? "suppressed" : ""} ${generatingCam && camProgress?.operation_id === operation.id ? "stream-active" : ""} ${activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? "unavailable" : ""}`} onClick={() => chooseOperation(operation)}>
                 <span>{operation.id}</span><strong>{operation.name}</strong><small>{activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? "无有效 FreeCAD 刀路" : operation.tool.name}</small><i>{Math.round(operation.confidence * 100)}%</i>
               </button>
               {index < operations.length - 1 && <ChevronRight className="flow-arrow" size={18} />}
@@ -754,10 +966,11 @@ function Workbench({ initialJob, onReset, readOnly = false }: { initialJob: Job;
         </div>
         <div className="warnings">
           <AlertTriangle size={15} />
-          <span>{shareMessage || camError || (camResult ? `FreeCAD ${camResult.engine_version} 原生 CAM · ${camResult.path_command_count} 条指令 · 综合校验 ${validationStatus}` : safetyMessage || job.plan.warnings[0])}</span>
+          <span>{shareMessage || camError || safetyMessage || (generatingCam ? camProgress?.message : "") || (camResult ? isSheetForming ? `${camResult.engine} · ${camResult.generated_operations.length} 个阶段 · 工艺校验 ${validationStatus}` : `FreeCAD ${camResult.engine_version} 原生 CAM · ${camResult.path_command_count} 条指令 · 刀路校验 ${validationStatus}` : warningMessages[0])}</span>
+          {warningCount > 0 && <button className="warning-count-button" onClick={() => setShowWarnings((value) => !value)}><AlertTriangle size={14} />{warningCount} 条提醒</button>}
           <button onClick={() => window.open(apiUrl(`/api/v1/jobs/${job.id}/files/plan.json`))}><Download size={14} />工艺 JSON</button>
-          {camResult && <button onClick={() => window.open(apiUrl(camResult.files.gcode))}><Download size={14} />G-code 草案</button>}
-          {camResult && <button onClick={() => window.open(apiUrl(camResult.files.freecad))}><Download size={14} />FreeCAD</button>}
+          {camResult && !isSheetForming && <button disabled={validationStatus === "failed"} title={validationStatus === "failed" ? "空间成品校验未通过，禁止下载上机程序" : "下载 G-code 草案"} onClick={() => window.open(apiUrl(camResult.files.gcode))}><Download size={14} />{validationStatus === "failed" ? "G-code 已拦截" : "G-code 草案"}</button>}
+          {camResult && !isSheetForming && <button onClick={() => window.open(apiUrl(camResult.files.freecad))}><Download size={14} />FreeCAD</button>}
           {camResult && <button onClick={() => window.open(apiUrl(camResult.files.verification))}><ShieldCheck size={14} />预检报告</button>}
           {camResult && <button onClick={() => window.open(apiUrl(camResult.files.collision))}><AlertTriangle size={14} />碰撞报告</button>}
           {camResult && <button onClick={() => window.open(apiUrl(camResult.files.simulation))}><Box size={14} />仿真数据</button>}
@@ -772,6 +985,7 @@ export default function App() {
   const [loadingSession, setLoadingSession] = useState(true);
   const [sessionError, setSessionError] = useState("");
   const [readOnly, setReadOnly] = useState(false);
+  const [showNewJob, setShowNewJob] = useState(false);
 
   useEffect(() => {
     const restoreFromLocation = async () => {
@@ -779,6 +993,7 @@ export default function App() {
       if (!match) {
         setJob(null);
         setReadOnly(false);
+        setShowNewJob(true);
         setLoadingSession(false);
         return;
       }
@@ -806,16 +1021,18 @@ export default function App() {
     window.history.pushState({}, "", `/jobs/${createdJob.id}`);
     setReadOnly(false);
     setJob(createdJob);
-  };
-
-  const reset = () => {
-    window.history.pushState({}, "", "/");
-    setReadOnly(false);
-    setJob(null);
+    setShowNewJob(false);
     setSessionError("");
   };
 
   if (loadingSession) return <div className="fatal-state"><LoaderCircle className="spin" />正在加载任务会话…</div>;
-  if (sessionError) return <div className="fatal-state"><AlertTriangle />{sessionError}<button onClick={reset}>返回新建任务</button></div>;
-  return job ? <Workbench key={job.id} initialJob={job} onReset={reset} readOnly={readOnly} /> : <UploadScreen onCreated={openJob} />;
+  return <>
+    {job
+      ? <Workbench key={job.id} initialJob={job} onNew={() => setShowNewJob(true)} readOnly={readOnly} />
+      : <main className="empty-workspace">
+          <header><div className="brand"><span>S</span> SEKSUN CNC</div></header>
+          <section>{sessionError ? <AlertTriangle /> : <Box />}<strong>{sessionError || "尚未打开零件"}</strong><small>新任务将在当前工作台中创建</small><button onClick={() => setShowNewJob(true)}><FileUp size={15} />上传 STEP</button></section>
+        </main>}
+    <NewJobDialog open={showNewJob} canClose={Boolean(job)} onClose={() => setShowNewJob(false)} onCreated={openJob} />
+  </>;
 }

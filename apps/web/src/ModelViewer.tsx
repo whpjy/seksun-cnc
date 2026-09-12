@@ -4,7 +4,7 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import type { FixtureComponent, ManufacturingFeature, SimulationResult, ToolpathSegment, Vec3 } from "./types";
+import type { FixtureComponent, FormingPreview, ManufacturingFeature, SimulationResult, ToolpathSegment, Vec3 } from "./types";
 
 type Props = {
   modelUrl: string;
@@ -26,6 +26,7 @@ type Props = {
   toolpathLoaded?: boolean;
   playbackMode?: "single" | "cumulative";
   onPlaybackModeChange?: (mode: "single" | "cumulative") => void;
+  formingPreview?: FormingPreview | null;
 };
 
 // Siemens NX/UG-style neutral blue-gray: dark enough to preserve the part's
@@ -34,7 +35,7 @@ const UG_PART_COLOR = 0x6f7b7d;
 const UG_TARGET_COLOR = 0x788689;
 const UG_EDGE_COLOR = 0x303a3d;
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
   const onSelectRef = useRef(onSelectFeature);
@@ -149,6 +150,13 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     scene.add(floorGrid);
 
     let model: THREE.Mesh | null = null;
+    let lastFormingFactor = -1;
+    let formingActuator: THREE.Mesh | null = null;
+    let formingStock: THREE.Mesh | null = null;
+    let formingLowerDie: THREE.Mesh | null = null;
+    let formingCutOutline: THREE.LineLoop | null = null;
+    let formingCutPaths: THREE.LineSegments | null = null;
+    const formingCutSegmentPoints: THREE.Vector3[] = [];
     let simulationMesh: THREE.Mesh | null = null;
     let simulationLowerMesh: THREE.Mesh | null = null;
     let simulationWalls: THREE.Mesh | null = null;
@@ -238,7 +246,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           clearcoat: 0.04,
           clearcoatRoughness: 0.68,
           envMapIntensity: 0.5,
-          transparent: Boolean(simulation),
+          transparent: Boolean(simulation || formingPreview),
           opacity: simulation ? 0.16 : 1,
           depthWrite: !simulation,
           // Keep coplanar CAD edge overlays stable when zoomed in. Without a
@@ -256,6 +264,95 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       model.castShadow = true;
       model.receiveShadow = true;
       scene.add(model);
+
+      if (formingPreview) {
+        const partSize = bounds?.getSize(new THREE.Vector3()) ?? new THREE.Vector3(viewSize, viewSize * 0.1, viewSize * 0.6);
+        const sheetThickness = Math.max(formingPreview.nominal_thickness_mm, viewSize * 0.004);
+        formingStock = new THREE.Mesh(
+          new THREE.BoxGeometry(partSize.x * 1.14, sheetThickness, partSize.z * 1.14),
+          new THREE.MeshPhysicalMaterial({
+            color: 0xaab5b9, roughness: 0.46, metalness: 0.28,
+            transparent: true, opacity: 0.92, depthWrite: true,
+          }),
+        );
+        formingStock.castShadow = true;
+        formingStock.receiveShadow = true;
+        scene.add(formingStock);
+
+        const cutHalfX = partSize.x * 0.535;
+        const cutHalfZ = partSize.z * 0.535;
+        formingCutOutline = new THREE.LineLoop(
+          new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(-cutHalfX, -sheetThickness * 0.75, -cutHalfZ),
+            new THREE.Vector3(cutHalfX, -sheetThickness * 0.75, -cutHalfZ),
+            new THREE.Vector3(cutHalfX, -sheetThickness * 0.75, cutHalfZ),
+            new THREE.Vector3(-cutHalfX, -sheetThickness * 0.75, cutHalfZ),
+          ]),
+          new THREE.LineBasicMaterial({ color: 0x66dfff, transparent: true, opacity: 0.95, depthTest: false }),
+        );
+        formingCutOutline.visible = false;
+        formingCutOutline.renderOrder = 8;
+        scene.add(formingCutOutline);
+
+        const uniqueProjectedSegments = new Set<string>();
+        for (const edge of topologyEdges) {
+          for (let index = 1; index < edge.length; index += 1) {
+            const start = new THREE.Vector3(
+              edge[index - 1].x - modelCenter.x,
+              -sheetThickness * 1.15,
+              edge[index - 1].z - modelCenter.z,
+            );
+            const end = new THREE.Vector3(
+              edge[index].x - modelCenter.x,
+              -sheetThickness * 1.15,
+              edge[index].z - modelCenter.z,
+            );
+            if (start.distanceToSquared(end) < 1e-8) continue;
+            const pointKey = (point: THREE.Vector3) => `${Math.round(point.x * 50)},${Math.round(point.z * 50)}`;
+            const firstKey = pointKey(start);
+            const secondKey = pointKey(end);
+            const segmentKey = firstKey < secondKey ? `${firstKey}|${secondKey}` : `${secondKey}|${firstKey}`;
+            if (uniqueProjectedSegments.has(segmentKey)) continue;
+            uniqueProjectedSegments.add(segmentKey);
+            formingCutSegmentPoints.push(start, end);
+          }
+        }
+        if (formingCutSegmentPoints.length) {
+          formingCutPaths = new THREE.LineSegments(
+            new THREE.BufferGeometry().setFromPoints(formingCutSegmentPoints),
+            new THREE.LineBasicMaterial({
+              color: 0x5fffd0, transparent: true, opacity: 0.94,
+              depthTest: false, depthWrite: false,
+            }),
+          );
+          formingCutPaths.geometry.setDrawRange(0, 0);
+          formingCutPaths.visible = false;
+          formingCutPaths.renderOrder = 9;
+          scene.add(formingCutPaths);
+        }
+
+        formingLowerDie = new THREE.Mesh(
+          renderGeometry.clone(),
+          new THREE.MeshPhysicalMaterial({
+            color: 0x31547b, roughness: 0.34, metalness: 0.48,
+            transparent: true, opacity: 0.13, depthWrite: false, side: THREE.DoubleSide,
+          }),
+        );
+        formingLowerDie.position.y = viewSize * 0.14;
+        formingLowerDie.visible = false;
+        formingLowerDie.renderOrder = 1;
+        scene.add(formingLowerDie);
+
+        formingActuator = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.5, 0.8, 1, 20),
+          new THREE.MeshPhysicalMaterial({
+            color: 0x55b8d0, transparent: true, opacity: 0.28,
+            roughness: 0.35, metalness: 0.18, depthWrite: false,
+          }),
+        );
+        formingActuator.renderOrder = 6;
+        scene.add(formingActuator);
+      }
 
       const edgeCoordinates: number[] = [];
       if (topologyEdges.length) {
@@ -284,7 +381,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         }),
       );
       cadEdges.renderOrder = 2;
-      cadEdges.visible = !simulation || targetVisibleRef.current;
+      cadEdges.visible = !formingPreview && (!simulation || targetVisibleRef.current);
       scene.add(cadEdges);
       if (renderGeometry !== geometry) geometry.dispose();
 
@@ -1016,11 +1113,105 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       }
     };
 
+    const updateFormingScene = (currentProgress: number) => {
+      if (!formingPreview || !model) return;
+      const timeline = Math.min(currentProgress * formingPreview.stages.length, formingPreview.stages.length - 1e-6);
+      const stageIndex = Math.floor(timeline);
+      const stageProgress = timeline - stageIndex;
+      const stage = formingPreview.stages[stageIndex];
+      if (!stage) return;
+      const eased = stageProgress * stageProgress * (3 - 2 * stageProgress);
+      const normalizedFactor = THREE.MathUtils.lerp(stage.start_factor, stage.end_factor, eased);
+      const flatFactor = Math.min(1, formingPreview.nominal_thickness_mm / Math.max(formingPreview.formed_depth_mm, formingPreview.nominal_thickness_mm));
+      const factor = THREE.MathUtils.lerp(flatFactor, 1, normalizedFactor);
+      const isLayout = stage.process === "sheet_flat_pattern";
+      const isBlanking = stage.process === "sheet_blanking";
+      const isPressing = stage.process === "sheet_preforming" || stage.process === "sheet_final_forming";
+      const isFinishing = stage.process === "sheet_deburring";
+      const isInspecting = stage.process === "sheet_inspection";
+
+      model.visible = !isLayout || stageProgress > 0.72;
+      const modelMaterial = model.material as THREE.MeshPhysicalMaterial;
+      modelMaterial.opacity = isLayout ? Math.max(0, (stageProgress - 0.72) / 0.28) * 0.28 : isBlanking ? 0.3 + eased * 0.7 : 1;
+      modelMaterial.depthWrite = modelMaterial.opacity > 0.95;
+      if (formingStock) {
+        formingStock.visible = isLayout || isBlanking;
+        const stockMaterial = formingStock.material as THREE.MeshPhysicalMaterial;
+        stockMaterial.opacity = isLayout ? 0.92 : Math.max(0.08, 0.92 * (1 - eased));
+        formingStock.scale.setScalar(isBlanking ? 1 - eased * 0.015 : 1);
+      }
+      if (formingCutOutline) {
+        formingCutOutline.visible = isBlanking && !formingCutSegmentPoints.length;
+        formingCutOutline.geometry.setDrawRange(0, Math.max(1, Math.ceil(eased * 4)));
+      }
+      if (formingCutPaths) {
+        formingCutPaths.visible = isBlanking;
+        const completedVertices = Math.min(
+          formingCutSegmentPoints.length,
+          Math.floor(eased * (formingCutSegmentPoints.length / 2)) * 2,
+        );
+        formingCutPaths.geometry.setDrawRange(0, completedVertices);
+      }
+      if (formingLowerDie) {
+        formingLowerDie.visible = isPressing;
+        formingLowerDie.position.y = viewSize * (0.2 - eased * 0.12);
+        (formingLowerDie.material as THREE.MeshPhysicalMaterial).opacity = 0.08 + eased * 0.1;
+      }
+      if (Math.abs(factor - lastFormingFactor) >= 0.001) {
+        // The geometry is centered at the origin, so an object transform is
+        // equivalent to rewriting every vertex's Y coordinate.  Leaving that
+        // work to the GPU keeps large (30+ MB) STL previews interactive.
+        model.scale.y = factor;
+        modelMaterial.color.setHSL(0.55 - normalizedFactor * 0.02, 0.07 + normalizedFactor * 0.03, 0.52 - normalizedFactor * 0.08);
+        lastFormingFactor = factor;
+      }
+      if (formingActuator) {
+        formingActuator.visible = !isLayout;
+        if (isPressing) {
+          formingActuator.scale.set(viewSize * 0.92, Math.max(viewSize * 0.045, 1), viewSize * 0.72);
+          formingActuator.position.set(0, -viewSize * (0.32 - eased * 0.22), 0);
+          formingActuator.rotation.set(0, 0, 0);
+          (formingActuator.material as THREE.MeshPhysicalMaterial).color.set(0x5a83d8);
+          (formingActuator.material as THREE.MeshPhysicalMaterial).opacity = 0.24;
+        } else {
+          formingActuator.scale.set(viewSize * (isBlanking ? 0.025 : 0.018), viewSize * 0.16, viewSize * (isFinishing ? 0.055 : 0.025));
+          if (isBlanking && formingCutSegmentPoints.length >= 2) {
+            const segmentCount = formingCutSegmentPoints.length / 2;
+            const path = Math.min(eased * segmentCount, segmentCount - 1e-6);
+            const pointIndex = Math.floor(path) * 2;
+            formingActuator.position.lerpVectors(
+              formingCutSegmentPoints[pointIndex],
+              formingCutSegmentPoints[pointIndex + 1],
+              path % 1,
+            );
+          } else if (isBlanking) {
+            const sweep = [
+              new THREE.Vector3(-viewSize * 0.43, -viewSize * 0.12, -viewSize * 0.28),
+              new THREE.Vector3(viewSize * 0.43, -viewSize * 0.12, -viewSize * 0.28),
+              new THREE.Vector3(viewSize * 0.43, -viewSize * 0.12, viewSize * 0.28),
+              new THREE.Vector3(-viewSize * 0.43, -viewSize * 0.12, viewSize * 0.28),
+              new THREE.Vector3(-viewSize * 0.43, -viewSize * 0.12, -viewSize * 0.28),
+            ];
+            const path = Math.min(eased * 4, 3.9999);
+            formingActuator.position.lerpVectors(sweep[Math.floor(path)], sweep[Math.floor(path) + 1], path % 1);
+          } else {
+            formingActuator.position.set(THREE.MathUtils.lerp(-viewSize * 0.48, viewSize * 0.48, eased), -viewSize * 0.08, 0);
+          }
+          formingActuator.rotation.set(0, 0, isFinishing ? Math.PI / 2 : 0);
+          (formingActuator.material as THREE.MeshPhysicalMaterial).color.set(
+            isInspecting ? 0x45cfa1 : isFinishing ? 0xe0a64f : 0x55b8d0,
+          );
+          (formingActuator.material as THREE.MeshPhysicalMaterial).opacity = isInspecting ? 0.48 : 0.72;
+        }
+      }
+    };
+
     const animate = (time: number) => {
       const elapsed = Math.min((time - lastFrameTime) / 1000, 0.1);
       lastFrameTime = time;
-      if (animateToolpath && playbackRef.current.playing && toolpathSegments.length) {
-        const nextProgress = Math.min(1, playbackRef.current.progress + elapsed * playbackRef.current.speed / 30);
+      if (animateToolpath && playbackRef.current.playing && (toolpathSegments.length || formingPreview)) {
+        const duration = formingPreview ? 18 : 30;
+        const nextProgress = Math.min(1, playbackRef.current.progress + elapsed * playbackRef.current.speed / duration);
         playbackRef.current.progress = nextProgress;
         setProgress(nextProgress);
         if (nextProgress >= 1) {
@@ -1029,6 +1220,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         }
       }
       if (animateToolpath) updatePlaybackScene(playbackRef.current.progress);
+      if (animateToolpath) updateFormingScene(playbackRef.current.progress);
       if (camoticsMesh) camoticsMesh.visible = playbackRef.current.progress >= 0.999;
       controls.update();
       renderer.render(scene, camera);
@@ -1048,6 +1240,16 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       pmremGenerator.dispose();
       model?.geometry.dispose();
       (model?.material as THREE.Material | undefined)?.dispose();
+      formingActuator?.geometry.dispose();
+      (formingActuator?.material as THREE.Material | undefined)?.dispose();
+      formingStock?.geometry.dispose();
+      (formingStock?.material as THREE.Material | undefined)?.dispose();
+      formingLowerDie?.geometry.dispose();
+      (formingLowerDie?.material as THREE.Material | undefined)?.dispose();
+      formingCutOutline?.geometry.dispose();
+      (formingCutOutline?.material as THREE.Material | undefined)?.dispose();
+      formingCutPaths?.geometry.dispose();
+      (formingCutPaths?.material as THREE.Material | undefined)?.dispose();
       simulationMesh?.geometry.dispose();
       (simulationMesh?.material as THREE.Material | undefined)?.dispose();
       simulationLowerMesh?.geometry.dispose();
@@ -1088,37 +1290,69 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       viewApiRef.current = null;
       host.removeChild(renderer.domElement);
     };
-  }, [animateToolpath, camoticsSurface, features, fixtureComponents, initialToolpathSegments, isFinalOperation, modelUrl, operationTools, profileBoundaries, simulation, toolpathSegments, topologyEdges]);
+  }, [activeOperationId, animateToolpath, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, modelUrl, operationTools, profileBoundaries, simulation, toolpathSegments, topologyEdges]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
-  const playbackChapters = Array.from(new Set(toolpathSegments.map((segment) => segment.operation_id)));
+  const activeFormingStage = formingPreview?.stages.length
+    ? formingPreview.stages[
+        Math.min(
+          Math.floor(progress * formingPreview.stages.length),
+          formingPreview.stages.length - 1,
+        )
+      ]
+    : undefined;
+  const formingStateLabels: Record<string, string> = {
+    sheet_flat_pattern: "原始矩形板料",
+    sheet_blanking: "切除余料，得到平面展开件",
+    sheet_preforming: "预成形在制品",
+    sheet_final_forming: "终成形样品",
+    sheet_deburring: "去毛刺后的成品",
+    sheet_inspection: "检测中的最终样品",
+  };
+  const formingActivityLabels: Record<string, string> = {
+    sheet_flat_pattern: "● 正在准备原始板料",
+    sheet_blanking: "● 切割头正在沿 STEP 轮廓加工孔、槽与外形",
+    sheet_preforming: "● 预成形模具正在闭合",
+    sheet_final_forming: "● 终成形模具正在闭合",
+    sheet_deburring: "● 正在进行边缘处理",
+    sheet_inspection: "● 正在扫描最终样品",
+  };
+  const playbackChapters = formingPreview
+    ? formingPreview.stages.map((stage) => stage.operation_id)
+    : Array.from(new Set(toolpathSegments.map((segment) => segment.operation_id)));
 
   return (
     <div className="model-viewer" ref={hostRef}>
-      <div className="viewer-badge">{camoticsSurface ? progress >= 0.999 ? "CAMOTICS · 装夹最终去除结果" : "CAMOTICS 刀路 · 最终结果在 100% 显示" : simulation ? progress >= 0.999 ? simulation.surface.is_cumulative ? "CUMULATIVE · 多装夹累计余料" : "HEIGHT-FIELD · 加工后毛坯" : progress > 0 ? simulation.surface.is_cumulative ? "CUMULATIVE · 累计材料去除" : "HEIGHT-FIELD · 动态材料去除" : playbackMode === "single" && initialToolpathSegments.length ? "SINGLE STEP · 前序余料已就绪" : "HEIGHT-FIELD · 完整毛坯" : "OCCT MODEL · 空间特征可点击"}</div>
-      <div className="viewer-legend"><i />快速移动 <i className="selected" />切削轨迹 · 已完成轨迹自动淡化</div>
+      <div className="viewer-badge">{formingPreview ? progress >= 0.999 ? "FORMING · 当前工序终态" : "FORMING · 薄板成形过程" : camoticsSurface ? progress >= 0.999 ? "CAMOTICS · 装夹最终去除结果" : "CAMOTICS 刀路 · 最终结果在 100% 显示" : simulation ? progress >= 0.999 ? simulation.surface.is_cumulative ? "CUMULATIVE · 多装夹累计余料" : "HEIGHT-FIELD · 加工后毛坯" : progress > 0 ? simulation.surface.is_cumulative ? "CUMULATIVE · 累计材料去除" : "HEIGHT-FIELD · 动态材料去除" : playbackMode === "single" && initialToolpathSegments.length ? "SINGLE STEP · 前序余料已就绪" : "HEIGHT-FIELD · 完整毛坯" : "OCCT MODEL · 空间特征可点击"}</div>
+      <div className="viewer-legend">{formingPreview ? <>原始板料 <i className="selected" />落料件 → 预成形 → 终成形样品</> : <><i />快速移动 <i className="selected" />切削轨迹 · 已完成轨迹自动淡化</>}</div>
       {animateToolpath && activeMotion && <div className="simulation-stage-card">
         <span>{activeMotion.setup} · {activeMotion.operation}</span>
         <strong>{activeTool?.name ?? "加工工序"}</strong>
         <small>{activeTool?.tool_name ?? "刀具"}{activeTool?.spindle_rpm ? ` · ${activeTool.spindle_rpm} RPM` : ""}{activeTool?.feed_rate_mm_min ? ` · F${activeTool.feed_rate_mm_min}` : ""}</small>
         <em className={activeMotion.motion}>{activeMotion.motion === "cut" ? activeMotion.removesMaterial ? "● 正在切削" : "● 成形轨迹" : "→ 快速移动"}</em>
       </div>}
-      {simulation && <div className="cad-view-controls" aria-label="三维视图控制">
+      {animateToolpath && activeFormingStage && <div className="simulation-stage-card forming-stage-card">
+        <span>FORMING-1 · {activeFormingStage.operation_id}</span>
+        <strong>{activeFormingStage.name}</strong>
+        <small>在制品：{formingStateLabels[activeFormingStage.process] ?? activeFormingStage.process} · {Math.round(activeFormingStage.start_factor * 100)}% → {Math.round(activeFormingStage.end_factor * 100)}% 成形深度</small>
+        <em>{formingActivityLabels[activeFormingStage.process] ?? "● 工艺过程预览"}</em>
+      </div>}
+      {(simulation || formingPreview) && <div className="cad-view-controls" aria-label="三维视图控制">
         <div><button onClick={() => viewApiRef.current?.setView("iso")}>轴测</button><button onClick={() => viewApiRef.current?.setView("top")}>俯视</button><button onClick={() => viewApiRef.current?.setView("front")}>前视</button><button onClick={() => viewApiRef.current?.setView("fit")}>适应</button></div>
-        <div>
+        {!formingPreview && <div>
           <button className={targetVisible ? "active" : ""} onClick={() => { const value = !targetVisible; targetVisibleRef.current = value; setTargetVisible(value); viewApiRef.current?.setTargetVisible(value); }}>目标件</button>
           <button className={toolVisible ? "active" : ""} onClick={() => { const value = !toolVisible; setToolVisible(value); viewApiRef.current?.setToolVisible(value); }}>刀具</button>
           <button className={trailVisible ? "active" : ""} onClick={() => { const value = !trailVisible; setTrailVisible(value); viewApiRef.current?.setTrailVisible(value); }}>轨迹</button>
-        </div>
+        </div>}
       </div>}
-      {animateToolpath && toolpathLoaded && activeOperationId && toolpathSegments.length === 0 && <div className="empty-toolpath-notice">
+      {animateToolpath && !formingPreview && toolpathLoaded && activeOperationId && toolpathSegments.length === 0 && <div className="empty-toolpath-notice">
         当前任务没有可播放的有效 FreeCAD 切削刀路
       </div>}
-      {animateToolpath && toolpathSegments.length > 0 && <div className="playback-controls">
-        <div className="playback-mode-toggle" aria-label="播放模式">
+      {animateToolpath && (toolpathSegments.length > 0 || formingPreview) && <div className="playback-controls">
+        {!formingPreview && <div className="playback-mode-toggle" aria-label="播放模式">
           <button className={playbackMode === "single" ? "active" : ""} onClick={() => onPlaybackModeChange?.("single")}>单工序</button>
           <button className={playbackMode === "cumulative" ? "active" : ""} onClick={() => onPlaybackModeChange?.("cumulative")}>累计</button>
-        </div>
+        </div>}
         <button onClick={() => updatePlaying(!playing)}>{playing ? "❚❚ 暂停" : "▶ 播放"}</button>
         <button onClick={() => updateProgress(0)}>↺ 重播</button>
         <input aria-label="仿真进度" type="range" min="0" max="1000" value={Math.round(progress * 1000)} onChange={(event) => updateProgress(Number(event.target.value) / 1000)} />
@@ -1126,8 +1360,8 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         <select aria-label="播放速度" value={speed} onChange={(event) => updateSpeed(Number(event.target.value))}>
           <option value="1">1×</option><option value="5">5×</option><option value="20">20×</option>
         </select>
-        <div className="playback-chapters">{playbackChapters.map((operationId) => <i key={operationId} className={activeMotion?.operation === operationId ? "active" : ""} title={operationId} />)}</div>
-        <em>{activeMotion ? `${activeMotion.operation} · ${activeMotion.motion === "cut" ? activeMotion.removesMaterial ? "切削 · 正在去除材料" : "翻面/成形刀路 · 轨迹回放" : "快移 · 不去除材料"}` : playbackMode === "single" && initialToolpathSegments.length ? "准备播放 · 前置工序余料已加载" : "准备播放 · 完整毛坯"}</em>
+        <div className="playback-chapters">{playbackChapters.map((operationId) => <i key={operationId} className={(activeFormingStage?.operation_id ?? activeMotion?.operation) === operationId ? "active" : ""} title={operationId} />)}</div>
+        <em>{activeFormingStage ? `${activeFormingStage.operation_id} · ${activeFormingStage.name}` : activeMotion ? `${activeMotion.operation} · ${activeMotion.motion === "cut" ? activeMotion.removesMaterial ? "切削 · 正在去除材料" : "翻面/成形刀路 · 轨迹回放" : "快移 · 不去除材料"}` : playbackMode === "single" && initialToolpathSegments.length ? "准备播放 · 前置工序余料已加载" : "准备播放 · 完整毛坯"}</em>
       </div>}
     </div>
   );

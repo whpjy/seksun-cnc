@@ -4,14 +4,17 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from queue import Empty, Queue
+from typing import Callable
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from .models import (
     FeatureReviewRequest, GeometryAnalysis, JobResponse, OperationCreateRequest,
@@ -23,10 +26,15 @@ from .operation_library import (
     create_operation_instance, get_operation_definition, operation_library_payload, validate_parameters,
 )
 from .collision import build_safety_configuration, detect_collisions
+from .conformance import compare_stock_to_target_mesh
 from .preflight import verify_cam
 from .simulation import simulate_material_removal
 from .recognizer import normalize_manufacturing_features
 from .engines import probe_engine, resolve_executable, run_camotics, run_freecad_adapter
+from .forming import build_forming_preview
+from .qwen import QwenPlanningError, probe_qwen, qwen_config_payload, review_process_plan
+from .benchmarks import example_catalog_payload
+from .coverage import evaluate_plan_coverage
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +45,13 @@ CAMOTICS_CMD = os.getenv("CNC_CAMOTICS_CMD", "camsim")
 CAM_ADAPTER_SCRIPT = Path(os.getenv("CNC_CAM_ADAPTER_SCRIPT", APP_ROOT / "cam" / "freecad_adapter.py"))
 MAX_UPLOAD_BYTES = int(os.getenv("CNC_MAX_UPLOAD_MB", "200")) * 1024 * 1024
 PUBLIC_BASE_URL = os.getenv("CNC_PUBLIC_BASE_URL", "").rstrip("/")
+BENCHMARK_REPORT_PATH = Path(os.getenv(
+    "CNC_BENCHMARK_REPORT", STORAGE_ROOT.parent / "benchmark-report.json",
+))
+CAM_STREAM_LOCK = threading.Lock()
+CAM_STREAMING_JOBS: set[str] = set()
+AI_REVIEW_LOCK = threading.Lock()
+AI_REVIEWING_JOBS: set[str] = set()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -57,6 +72,41 @@ app.add_middleware(
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def volume_conformance(
+    target_volume: float,
+    remaining_volume: float,
+    initial_stock_volume: float,
+) -> tuple[str, float, float]:
+    """Grade final stock against the target part, not the oversized blank."""
+    absolute_error = abs(remaining_volume - target_volume)
+    target_error = absolute_error / max(target_volume, 1e-6) * 100
+    stock_error = absolute_error / max(initial_stock_volume, 1e-6) * 100
+    if target_error <= 8:
+        status = "passed"
+    elif target_error <= 15:
+        status = "warning"
+    else:
+        status = "failed"
+    return status, target_error, stock_error
+
+
+def compact_preview_segments(segments: list[dict], maximum: int = 45_000) -> list[dict]:
+    """Bound browser preview size while preserving the production toolpath.
+
+    Simulation, collision checks and NC export use the complete segment list;
+    this is called only after those stages have finished.
+    """
+    if len(segments) <= maximum:
+        return segments
+    stride = max(2, (len(segments) + maximum - 1) // maximum)
+    selected = set(range(0, len(segments), stride))
+    selected.add(len(segments) - 1)
+    for index in range(1, len(segments)):
+        if segments[index].get("operation_id") != segments[index - 1].get("operation_id"):
+            selected.update((index - 1, index))
+    return [segments[index] for index in sorted(selected)]
 
 
 def job_directory(job_id: str) -> Path:
@@ -133,7 +183,7 @@ def save_job(directory: Path, job: JobResponse) -> None:
 def invalidate_cam_artifacts(directory: Path) -> None:
     for filename in (
         "cam.FCStd", "program.nc", "toolpath.json", "verification.json",
-        "simulation.json", "collision.json",
+        "simulation.json", "collision.json", "ai-plan.json",
     ):
         (directory / filename).unlink(missing_ok=True)
     for pattern in ("program-*.nc", "camotics-*.stl", "*.camotics"):
@@ -170,7 +220,11 @@ def cam_response(
         "simulation": simulation,
         "collision": collision,
         "stdout": stdout,
-        "safety": "Draft toolpaths only. Collision checking uses conservative envelopes and still requires engineer review before machine use.",
+        "safety": (
+            "Concept forming preview only. No production NC is generated; unfolding, tooling and forming physics require engineer validation."
+            if result.get("process_kind") == "sheet_forming"
+            else "Draft toolpaths only. Collision checking uses conservative envelopes and still requires engineer review before machine use."
+        ),
     }
 
 
@@ -216,7 +270,101 @@ def get_config() -> dict[str, object]:
         "session_sharing": True,
         "cam_engine": "freecad-cam",
         "simulation_engine": "camotics-with-heightfield-fallback",
+        "ai": qwen_config_payload(),
     }
+
+
+@app.post("/api/v1/ai/qwen/test")
+def test_qwen_connection() -> dict[str, object]:
+    """Make one minimal, non-thinking request to verify Qwen credentials."""
+    return probe_qwen()
+
+
+def _optional_job_json(directory: Path, filename: str) -> dict[str, object] | None:
+    path = directory / filename
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _ai_review_block_reason(directory: Path) -> str | None:
+    payload = _optional_job_json(directory, "ai-plan.json")
+    review = payload.get("review") if payload else None
+    if not isinstance(review, dict) or review.get("approval_blocked") is not True:
+        return None
+    summary = review.get("summary")
+    return str(summary)[:500] if summary else "Qwen 工艺审查识别到未解决的制造风险"
+
+
+@app.get("/api/v1/jobs/{job_id}/ai/plan")
+def get_ai_plan_review(job_id: str) -> dict[str, object]:
+    path = job_directory(job_id) / "ai-plan.json"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="AI process review is not available")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=500, detail="AI process review is invalid") from error
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail="AI process review is invalid")
+    return payload
+
+
+@app.get("/api/v1/benchmarks/cases")
+def get_benchmark_cases() -> dict[str, object]:
+    """List the read-only paired 2D/3D examples mounted for regression tests."""
+    return example_catalog_payload()
+
+
+@app.get("/api/v1/benchmarks/report")
+def get_benchmark_report() -> dict[str, object]:
+    if not BENCHMARK_REPORT_PATH.is_file():
+        raise HTTPException(status_code=404, detail="Benchmark report is not available")
+    try:
+        payload = json.loads(BENCHMARK_REPORT_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=500, detail="Benchmark report is invalid") from error
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail="Benchmark report is invalid")
+    return payload
+
+
+@app.post("/api/v1/jobs/{job_id}/ai/plan")
+def create_ai_plan_review(job_id: str) -> dict[str, object]:
+    job = load_job(job_id)
+    if not job.analysis or not job.plan:
+        raise HTTPException(
+            status_code=409,
+            detail="Geometry analysis and deterministic process plan are required",
+        )
+    directory = job_directory(job_id)
+    with AI_REVIEW_LOCK:
+        if job_id in AI_REVIEWING_JOBS:
+            raise HTTPException(status_code=409, detail="该任务正在执行 AI 工艺审查")
+        AI_REVIEWING_JOBS.add(job_id)
+    artifacts = {
+        name: payload
+        for name, filename in (
+            ("verification", "verification.json"),
+            ("collision", "collision.json"),
+            ("simulation", "simulation.json"),
+        )
+        if (payload := _optional_job_json(directory, filename)) is not None
+    }
+    try:
+        try:
+            result = review_process_plan(job.analysis, job.plan, artifacts)
+        except QwenPlanningError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+    finally:
+        with AI_REVIEW_LOCK:
+            AI_REVIEWING_JOBS.discard(job_id)
+    write_json(directory / "ai-plan.json", result)
+    return result
 
 
 @app.post("/api/v1/jobs", response_model=JobResponse)
@@ -324,7 +472,7 @@ def reanalyze_job(job_id: str) -> JobResponse:
 
 @app.get("/api/v1/jobs/{job_id}/files/{filename}")
 def get_job_file(job_id: str, filename: str) -> FileResponse:
-    allowed = {"model.stl", "analysis.json", "plan.json", "cam.FCStd", "program.nc", "toolpath.json", "verification.json", "simulation.json", "collision.json"}
+    allowed = {"model.stl", "analysis.json", "plan.json", "ai-plan.json", "cam.FCStd", "program.nc", "toolpath.json", "verification.json", "simulation.json", "collision.json"}
     generated_artifact = (
         Path(filename).name == filename
         and ((filename.startswith("program-") and filename.endswith(".nc"))
@@ -332,6 +480,20 @@ def get_job_file(job_id: str, filename: str) -> FileResponse:
     )
     if filename not in allowed and not generated_artifact:
         raise HTTPException(status_code=404, detail="File not found")
+    if filename.endswith(".nc"):
+        if ai_block_reason := _ai_review_block_reason(job_directory(job_id)):
+            raise HTTPException(
+                status_code=409,
+                detail=f"AI 工艺审查未通过，生产 G-code 已拦截：{ai_block_reason}",
+            )
+        verification_path = job_directory(job_id) / "verification.json"
+        if verification_path.is_file():
+            verification = json.loads(verification_path.read_text(encoding="utf-8"))
+            if verification.get("status") == "failed":
+                raise HTTPException(
+                    status_code=409,
+                    detail="空间成品校验未通过，G-code 已拦截，禁止用于上机加工",
+                )
     path = job_directory(job_id) / filename
     if not path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
@@ -353,7 +515,16 @@ def approve_plan(job_id: str) -> JobResponse:
     if job.plan.automation_status == "unsupported":
         raise HTTPException(
             status_code=409,
-            detail="当前零件包含尚未覆盖的异形轮廓，自动工艺方案不可批准",
+            detail=(
+                f"{job.plan.blocking_reasons[0]} 工艺方案不可批准"
+                if job.plan.blocking_reasons
+                else "当前零件超出自动 CAM 能力范围，工艺方案不可批准"
+            ),
+        )
+    if ai_block_reason := _ai_review_block_reason(job_directory(job_id)):
+        raise HTTPException(
+            status_code=409,
+            detail=f"AI 工艺审查阻止批准：{ai_block_reason}",
         )
     for setup in job.plan.setups:
         for operation in setup.operations:
@@ -397,6 +568,7 @@ def review_feature(job_id: str, feature_id: str, request: FeatureReviewRequest) 
         safety=job.plan.safety if job.plan else None,
     )
     directory = job_directory(job_id)
+    (directory / "ai-plan.json").unlink(missing_ok=True)
     save_job(directory, job)
     write_json(directory / "analysis.json", job.analysis.model_dump(mode="json"))
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
@@ -419,6 +591,7 @@ def update_safety(job_id: str, request: SafetyConfigurationRequest) -> JobRespon
         for operation in setup.operations:
             operation.status = "proposed"
     directory = job_directory(job_id)
+    (directory / "ai-plan.json").unlink(missing_ok=True)
     save_job(directory, job)
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
     return job
@@ -469,6 +642,8 @@ def _validate_operation_geometry(job: JobResponse, definition, feature_ids: list
 def _save_manual_plan_change(job_id: str, job: JobResponse) -> JobResponse:
     directory = job_directory(job_id)
     invalidate_cam_artifacts(directory)
+    if job.analysis and job.plan:
+        job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan)
     save_job(directory, job)
     if job.plan:
         write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
@@ -582,8 +757,20 @@ def get_cam_artifact(job_id: str) -> dict[str, object]:
     )
 
 
-@app.post("/api/v1/jobs/{job_id}/cam")
-def create_cam_artifact(job_id: str) -> dict[str, object]:
+def _create_cam_artifact(
+    job_id: str,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, object]:
+    def report(stage: str, message: str, percent: float, **details: object) -> None:
+        if progress_callback:
+            progress_callback({
+                "stage": stage,
+                "message": message,
+                "percent": round(max(0.0, min(percent, 100.0)), 1),
+                **details,
+            })
+
+    report("starting", "正在准备 CAM 生成环境", 1)
     job = load_job(job_id)
     if not job.plan:
         raise HTTPException(status_code=409, detail="Plan is not available")
@@ -595,6 +782,30 @@ def create_cam_artifact(job_id: str) -> dict[str, object]:
     operations = [operation for setup in job.plan.setups for operation in setup.operations if operation.enabled]
     if not operations or any(operation.status != "approved" for operation in operations):
         raise HTTPException(status_code=409, detail="Every process operation must be approved before CAM generation")
+    if job.plan.process_kind == "sheet_forming":
+        if not job.analysis:
+            raise HTTPException(status_code=409, detail="Geometry analysis is not available")
+        directory = job_directory(job_id)
+        for index, operation in enumerate(operations, 1):
+            operation.generation_state = "generating"
+            report(
+                "forming_stage", f"正在构建 {operation.name}",
+                5 + index / len(operations) * 75,
+                operation_id=operation.id, current=index, total=len(operations),
+            )
+            operation.generation_state = "generated"
+        result, verification, simulation, collision = build_forming_preview(job.analysis, job.plan)
+        write_json(directory / "toolpath.json", result)
+        write_json(directory / "verification.json", verification)
+        write_json(directory / "simulation.json", simulation)
+        write_json(directory / "collision.json", collision)
+        save_job(directory, job)
+        write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+        report(
+            "completed", "薄板成形工序与分阶段仿真已生成", 100,
+            generated=len(operations), verification=verification["status"], collision=collision["status"],
+        )
+        return cam_response(job_id, result, verification, simulation, collision)
     if job.analysis and job.plan.safety and any(component.setup_id is None for component in job.plan.safety.fixture_components):
         job.plan.safety = build_safety_configuration(
             job.analysis,
@@ -618,12 +829,31 @@ def create_cam_artifact(job_id: str) -> dict[str, object]:
     fcstd_path = directory / "cam.FCStd"
     nc_path = directory / "program.nc"
     result_path = directory / "toolpath.json"
+    def forward_freecad_progress(payload: dict[str, object]) -> None:
+        current = float(payload.get("current", 0) or 0)
+        total = max(float(payload.get("total", 1) or 1), 1)
+        progress_callback and progress_callback({
+            **payload,
+            "percent": round(5 + current / total * 65, 1),
+        })
+
     try:
-        completed = run_freecad_adapter(
-            freecad_path,
-            CAM_ADAPTER_SCRIPT,
-            (source_path, analysis_path, plan_path, fcstd_path, nc_path, result_path),
+        adapter_arguments = (
+            source_path, analysis_path, plan_path, fcstd_path, nc_path, result_path,
         )
+        if progress_callback:
+            completed = run_freecad_adapter(
+                freecad_path,
+                CAM_ADAPTER_SCRIPT,
+                adapter_arguments,
+                progress_callback=forward_freecad_progress,
+            )
+        else:
+            completed = run_freecad_adapter(
+                freecad_path,
+                CAM_ADAPTER_SCRIPT,
+                adapter_arguments,
+            )
     except (subprocess.SubprocessError, OSError) as error:
         details = getattr(error, "stderr", None) or str(error)
         raise HTTPException(status_code=502, detail=f"FreeCAD CAM failed: {details[-2000:]}") from error
@@ -633,9 +863,18 @@ def create_cam_artifact(job_id: str) -> dict[str, object]:
     camotics_surfaces: list[dict[str, object]] = []
     if resolve_executable(CAMOTICS_CMD):
         setups_by_id = {setup.id: setup for setup in job.plan.setups}
-        for setup in result.get("setups", []):
+        simulation_setups = result.get("setups", [])
+        for simulation_index, setup in enumerate(simulation_setups, 1):
             if not isinstance(setup, dict) or not isinstance(setup.get("program"), str):
                 continue
+            report(
+                "camotics",
+                f"正在仿真 {setup.get('setup_id', f'装夹 {simulation_index}')}",
+                70 + simulation_index / max(len(simulation_setups), 1) * 12,
+                setup_id=setup.get("setup_id"),
+                current=simulation_index,
+                total=len(simulation_setups),
+            )
             program_name = Path(setup["program"]).name
             if program_name != setup["program"]:
                 setup["camotics_error"] = "unsafe_program_filename"
@@ -680,27 +919,74 @@ def create_cam_artifact(job_id: str) -> dict[str, object]:
     generated_operation_ids = set(result.get("generated_operations", []))
     for operation in operations:
         operation.generation_state = "generated" if operation.id in generated_operation_ids else "failed"
+    report("preflight", "正在校验工序覆盖、刀具与机床行程", 85)
     verification = verify_cam(job.plan, result)
     if not job.analysis:
         raise HTTPException(status_code=409, detail="Geometry analysis is not available")
-    simulation = simulate_material_removal(job.analysis, job.plan, result)
+    report("simulation", "正在累计双面高精度余料", 89)
+    simulation = simulate_material_removal(
+        job.analysis,
+        job.plan,
+        result,
+        progress_callback=lambda message, fraction: report(
+            "simulation",
+            message,
+            89 + max(0.0, min(fraction, 1.0)) * 5,
+        ),
+    )
     simulation_path = directory / "simulation.json"
     write_json(simulation_path, simulation)
     cumulative_surface = simulation.get("surface", {})
     has_cumulative_stock = isinstance(cumulative_surface, dict) and cumulative_surface.get("is_cumulative") is True
-    if result.get("profile_boundaries") and has_cumulative_stock:
+    if has_cumulative_stock:
         target_volume = float(job.analysis.measurements.get("volume", 0))
         remaining_volume = float(simulation.get("metrics", {}).get("remaining_volume_mm3", 0))
-        deviation = abs(remaining_volume - target_volume) / max(target_volume, 1e-6) * 100
-        conformance_status = "passed" if deviation <= 8 else "warning" if deviation <= 20 else "failed"
+        initial_stock_volume = float(simulation.get("metrics", {}).get("initial_stock_volume_mm3", 0))
+        conformance_status, deviation, stock_deviation = volume_conformance(
+            target_volume,
+            remaining_volume,
+            initial_stock_volume,
+        )
         verification["checks"].append({
             "id": "target_volume_conformance",
             "status": conformance_status,
-            "message": f"累计装夹仿真剩余体积与 STEP 目标偏差 {deviation:.1f}%（双面高度场网格近似）",
+            "message": (
+                f"累计装夹仿真剩余体积与 STEP 目标偏差 {deviation:.1f}%，"
+                f"占初始毛坯 {stock_deviation:.2f}%（双面高度场网格近似）"
+            ),
         })
         verification["metrics"]["target_volume_mm3"] = round(target_volume, 2)
         verification["metrics"]["remaining_volume_mm3"] = round(remaining_volume, 2)
         verification["metrics"]["target_volume_deviation_percent"] = round(deviation, 2)
+        verification["metrics"]["stock_volume_deviation_percent"] = round(stock_deviation, 3)
+        model_path = directory / "model.stl"
+        if model_path.is_file():
+            report("conformance", "正在比对余料与 STEP 空间形状", 95)
+            spatial = compare_stock_to_target_mesh(cumulative_surface, model_path)
+            verification["metrics"].update(spatial)
+            verification["checks"].append({
+                "id": "target_spatial_conformance",
+                "status": spatial["status"],
+                "message": (
+                    f"余料与 STEP 空间重合 {spatial['target_overlap_percent']:.1f}%；"
+                    f"目标缺失 {spatial['missing_target_volume_mm3']:.2f} mm³，"
+                    f"多余残料 {spatial['excess_stock_volume_mm3']:.2f} mm³"
+                ),
+            })
+            if spatial["status"] == "failed":
+                verification["errors"].append("加工余料与 STEP 目标的空间形状不一致，存在过切或残料")
+                verification["status"] = "failed"
+                blocking_reason = (
+                    f"CAM 后验空间校验失败：STEP 重合率 {spatial['target_overlap_percent']:.1f}%，"
+                    f"过切 {spatial['missing_target_volume_mm3']:.2f} mm³，"
+                    f"残料 {spatial['excess_stock_volume_mm3']:.2f} mm³。"
+                )
+                job.plan.automation_status = "unsupported"
+                if blocking_reason not in job.plan.blocking_reasons:
+                    job.plan.blocking_reasons.append(blocking_reason)
+            elif spatial["status"] == "warning" and verification["status"] == "passed":
+                verification["warnings"].append("加工余料与 STEP 目标仍存在需要复核的局部差异")
+                verification["status"] = "warning"
         if conformance_status == "failed":
             verification["errors"].append("全部装夹累计加工后的材料体积与 STEP 目标差异过大")
             verification["status"] = "failed"
@@ -718,15 +1004,78 @@ def create_cam_artifact(job_id: str) -> dict[str, object]:
             verification["status"] = "warning"
     verification_path = directory / "verification.json"
     write_json(verification_path, verification)
+    report("collision", "正在执行刀具、刀柄与夹具碰撞检查", 96)
     collision = detect_collisions(job.analysis, job.plan, result)
     collision_path = directory / "collision.json"
     write_json(collision_path, collision)
+    full_preview_count = len(result.get("preview_segments", []))
+    result["preview_segments"] = compact_preview_segments(list(result.get("preview_segments", [])))
+    result["preview_segment_count_raw"] = full_preview_count
+    result["preview_segment_count"] = len(result["preview_segments"])
+    write_json(result_path, result)
     verified_minutes = verification.get("metrics", {}).get("estimated_cycle_minutes")
     if isinstance(verified_minutes, (int, float)):
         job.plan.estimated_minutes = float(verified_minutes)
     save_job(directory, job)
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
-    return cam_response(
+    response = cam_response(
         job_id, result, verification, simulation, collision,
         stdout=completed.stdout[-1000:],
+    )
+    report(
+        "completed", "CAM 刀路与仿真已完成", 100,
+        generated=len(generated_operation_ids),
+        verification=verification.get("status"),
+        collision=collision.get("status"),
+    )
+    return response
+
+
+@app.post("/api/v1/jobs/{job_id}/cam")
+def create_cam_artifact(job_id: str) -> dict[str, object]:
+    return _create_cam_artifact(job_id)
+
+
+@app.get("/api/v1/jobs/{job_id}/cam/stream")
+def stream_cam_artifact(job_id: str) -> StreamingResponse:
+    # Validate before starting the streaming response so ordinary HTTP errors
+    # still reach clients with their proper status code.
+    job = load_job(job_id)
+    if not job.plan:
+        raise HTTPException(status_code=409, detail="Plan is not available")
+    with CAM_STREAM_LOCK:
+        if job_id in CAM_STREAMING_JOBS:
+            raise HTTPException(status_code=409, detail="该任务正在生成刀路")
+        CAM_STREAMING_JOBS.add(job_id)
+
+    events: Queue[dict[str, object]] = Queue()
+
+    def worker() -> None:
+        try:
+            _create_cam_artifact(job_id, progress_callback=events.put)
+        except HTTPException as error:
+            events.put({"stage": "error", "message": str(error.detail), "percent": 100})
+        except Exception as error:
+            events.put({"stage": "error", "message": str(error), "percent": 100})
+        finally:
+            with CAM_STREAM_LOCK:
+                CAM_STREAMING_JOBS.discard(job_id)
+
+    threading.Thread(target=worker, name=f"cam-stream-{job_id[:8]}", daemon=True).start()
+
+    def event_stream():
+        terminal = False
+        while not terminal:
+            try:
+                event = events.get(timeout=15)
+            except Empty:
+                yield ": keepalive\n\n"
+                continue
+            terminal = event.get("stage") in {"completed", "error"}
+            yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

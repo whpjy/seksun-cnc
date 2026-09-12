@@ -88,11 +88,11 @@ def verify_cam(plan: ProcessPlan, cam_result: dict) -> dict[str, object]:
     coverage_ok = generated == expected
     checks.append({
         "id": "operation_coverage",
-        "status": "passed" if coverage_ok else "warning",
+        "status": "passed" if coverage_ok else "failed",
         "message": f"已生成 {len(generated)}/{len(expected)} 道批准工序",
     })
     if not coverage_ok:
-        warnings.append("部分已批准工序未生成刀路")
+        errors.append("部分已批准工序未生成有效刀路")
 
     surface_strategies: dict[str, set[str]] = {}
     surface_rest_sets: set[str] = set()

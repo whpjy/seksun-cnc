@@ -46,6 +46,16 @@ def load_json(path):
     return json.loads(FilePath(path).read_text(encoding="utf-8"))
 
 
+def emit_progress(stage, message, **details):
+    print(
+        "CNC_PROGRESS " + json.dumps(
+            {"stage": stage, "message": message, **details},
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
 def cross(left, right):
     return (left[1] * right[2] - left[2] * right[1],
             left[2] * right[0] - left[0] * right[2],
@@ -282,24 +292,38 @@ def create_profile(document, job, operation, controller, model, bounds, clearanc
     obj.Base = face_reference(outline, 1)
     obj.Side, obj.Direction = "Outside", "CW"
     obj.processHoles, obj.processPerimeter = False, True
-    set_if_present(obj, "UseComp", False)
-    set_if_present(obj, "ExtraOffset", float(params.get("radial_allowance_mm", 0.0)))
+    # PathProfile only offsets the tool centre by its radius when UseComp is
+    # enabled.  Without it a nominal outside profile places the cutter centre
+    # on the target silhouette and overcuts the finished part by one radius.
+    set_if_present(obj, "UseComp", True)
+    set_if_present(obj, "OffsetExtra", float(params.get("radial_allowance_mm", 0.0)))
     obj.Proxy.execute(obj)
     return obj
 
 
 def create_deburr(document, job, operation, controller, model, bounds, clearance_z):
+    """Create a deterministic shallow profile for a 90-degree chamfer tool.
+
+    FreeCAD's Deburr proxy offsets every wire on a complex face and can abort
+    on small blended edges.  A profile operation over the setup-visible top
+    face is more stable, retains its internal loops, and produces the same
+    controlled chamfer depth for the conical cutter.
+    """
     params = operation.get("parameters", {})
-    obj = PathDeburr.Create(operation["id"] + "_DEBURR", parentJob=job)
+    obj = PathProfile.Create(operation["id"] + "_CHAMFER_PROFILE", parentJob=job)
     prepare_proxy(obj, job)
-    obj.ToolController = controller
-    set_if_present(obj, "OpToolDiameter", controller.Tool.Diameter)
-    set_if_present(obj, "ClearanceHeight", clearance_z)
-    set_if_present(obj, "SafeHeight", float(bounds["maximum"]["z"]) + 2.0)
+    top_z = float(bounds["maximum"]["z"])
+    chamfer_depth = max(
+        float(params.get("chamfer_width_mm", 0.3))
+        + float(params.get("extra_depth_mm", 0.05)),
+        0.05,
+    )
+    common_parameters(obj, controller, params, top_z, top_z - chamfer_depth, clearance_z)
     obj.Base = face_reference(model, top_face(model)[2])
-    obj.Width = max(float(params.get("chamfer_width_mm", 0.3)), 0.01)
-    obj.ExtraDepth = max(float(params.get("extra_depth_mm", 0.05)), 0.0)
-    obj.Direction = "CW"
+    obj.Side, obj.Direction = "Outside", "CW"
+    obj.processHoles, obj.processPerimeter = True, True
+    set_if_present(obj, "UseComp", False)
+    set_if_present(obj, "OffsetExtra", 0.0)
     obj.Proxy.execute(obj)
     return obj
 
@@ -366,13 +390,18 @@ def create_surface(document, job, operation, controller, model, bounds, stock_bo
     obj.Base = [(model, visible_faces)]
     set_if_present(obj, "ScanType", "Planar")
     set_if_present(obj, "BoundBox", "BaseBoundBox")
-    set_if_present(obj, "BoundaryEnforcement", True)
+    # Scan the complete model bounding region so stock in gaps between
+    # disconnected visible faces is cleared as well.  Restricting the cutter
+    # to every selected face independently leaves web-shaped islands of stock
+    # on sparse, relief-like parts such as the registration sample.
+    set_if_present(obj, "BoundaryEnforcement", bool(params.get("boundary_enforcement", False)))
     set_if_present(obj, "InternalFeaturesCut", True)
     set_if_present(obj, "CutPattern", "ZigZag")
     set_if_present(obj, "CutMode", "Climb")
-    set_if_present(obj, "LinearDeflection", 0.05)
+    sample_interval = max(float(params.get("sample_interval_mm", 0.8)), 0.05)
+    set_if_present(obj, "LinearDeflection", min(0.2, max(0.05, sample_interval * 0.1)))
     set_if_present(obj, "AngularDeflection", 0.25)
-    set_if_present(obj, "SampleInterval", max(float(params.get("sample_interval_mm", 0.8)), 0.05))
+    set_if_present(obj, "SampleInterval", sample_interval)
     set_if_present(obj, "DepthOffset", max(float(params.get("depth_offset_mm", 0.0)), 0.0))
     if operation["type"] == "surface_roughing":
         set_if_present(obj, "LayerMode", "Multi-pass")
@@ -416,9 +445,10 @@ def create_waterline(document, job, operation, controller, model, bounds, cleara
     set_if_present(obj, "CutPattern", "None")
     set_if_present(obj, "CutMode", "Climb")
     set_if_present(obj, "ClearLastLayer", "Off")
-    set_if_present(obj, "LinearDeflection", 0.05)
+    sample_interval = max(float(params.get("sample_interval_mm", 0.5)), 0.05)
+    set_if_present(obj, "LinearDeflection", min(0.12, max(0.05, sample_interval * 0.15)))
     set_if_present(obj, "AngularDeflection", 0.25)
-    set_if_present(obj, "SampleInterval", max(float(params.get("sample_interval_mm", 0.5)), 0.05))
+    set_if_present(obj, "SampleInterval", sample_interval)
     set_if_present(obj, "DepthOffset", max(float(params.get("depth_offset_mm", 0.0)), 0.0))
     set_if_present(obj, "StepDown", max(float(params.get("step_down_mm", 0.4)), 0.05))
     set_if_present(obj, "StepOver", min(90.0, max(1.0, float(params.get("step_over_percent", 20.0)))))
@@ -707,7 +737,17 @@ def main():
     outputs, post_outputs, preview, generated, skipped, setup_results, profile_boundaries = [], [], [], [], [], [], []
     native_types = {}
 
+    completed_operation_count = 0
     for setup_index, setup in enumerate(plan["setups"], 1):
+        emit_progress(
+            "setup",
+            "正在准备%s" % setup["name"],
+            setup_id=setup["id"],
+            setup_index=setup_index,
+            setup_total=len(plan["setups"]),
+            current=completed_operation_count,
+            total=len(operations),
+        )
         frame, local_features = setup_frame(setup["work_axis"]), transform_features(features, setup_frame(setup["work_axis"]))
         local_bounds = transform_bounds(bounds, frame)
         local_stock_bounds = transform_bounds(stock_bounds, frame)
@@ -722,6 +762,15 @@ def main():
         for operation in setup["operations"]:
             if not operation.get("enabled", True):
                 continue
+            emit_progress(
+                "operation",
+                "正在生成 %s %s" % (operation["id"], operation["name"]),
+                setup_id=setup["id"],
+                operation_id=operation["id"],
+                operation_name=operation["name"],
+                current=completed_operation_count,
+                total=len(operations),
+            )
             objects_before_operation = {item.Name for item in document.Objects}
             try:
                 controller = make_tool_controller(job, operation)
@@ -732,20 +781,45 @@ def main():
                 # geometry calculation fails. Remove the entire partial group;
                 # otherwise a later recompute/postprocess fails the whole job.
                 for item in reversed(list(document.Objects)):
-                    if item.Name not in objects_before_operation:
-                        document.removeObject(item.Name)
+                    try:
+                        item_name = item.Name
+                    except Exception:
+                        # A failed native proxy may already have invalidated
+                        # one of its temporary document objects.
+                        continue
+                    if item_name not in objects_before_operation:
+                        document.removeObject(item_name)
                 document.recompute()
                 skipped.append("%s (%s) FreeCAD 原生工序生成失败: %s" %
                                (operation["id"], operation["type"], error))
+                completed_operation_count += 1
+                emit_progress(
+                    "operation_skipped",
+                    "%s 生成失败" % operation["id"],
+                    setup_id=setup["id"], operation_id=operation["id"],
+                    current=completed_operation_count, total=len(operations),
+                )
                 continue
             if native is None or not native.Path.Commands:
                 skipped.append("%s (%s) 未生成 FreeCAD 原生刀路" %
                                (operation["id"], operation["type"]))
+                completed_operation_count += 1
+                emit_progress(
+                    "operation_skipped", "%s 未产生刀路" % operation["id"],
+                    setup_id=setup["id"], operation_id=operation["id"],
+                    current=completed_operation_count, total=len(operations),
+                )
                 continue
             enforce_rapid_clearance(native, clearance_z)
             if not has_cutting_motion(native):
                 skipped.append("%s (%s) FreeCAD 仅返回定位快移，没有有效切削运动" %
                                (operation["id"], operation["type"]))
+                completed_operation_count += 1
+                emit_progress(
+                    "operation_skipped", "%s 没有有效切削运动" % operation["id"],
+                    setup_id=setup["id"], operation_id=operation["id"],
+                    current=completed_operation_count, total=len(operations),
+                )
                 continue
             native.Label = "%s %s" % (operation["id"], operation["name"])
             native.addProperty("App::PropertyString", "SeksunOperationId", "Seksun CNC")
@@ -760,8 +834,18 @@ def main():
                                                          float(local_stock_bounds["maximum"]["z"])))
             generated.append(operation["id"])
             setup_generated.append(operation["id"])
+            completed_operation_count += 1
+            emit_progress(
+                "operation_completed",
+                "%s %s 已完成" % (operation["id"], operation["name"]),
+                setup_id=setup["id"], operation_id=operation["id"],
+                operation_name=operation["name"],
+                current=completed_operation_count, total=len(operations),
+            )
             native_types[operation["id"]] = native.Proxy.__class__.__name__
-            if operation["type"] in {"profile_contouring", "tab_removal"}:
+            if operation["type"] in {
+                "profile_contouring", "profile_roughing", "profile_finishing", "tab_removal",
+            }:
                 points = target_profile_points(source_shape, setup["work_axis"])
                 if points:
                     profile_boundaries.append({"operation_id": operation["id"], "setup_id": setup["id"],
@@ -794,6 +878,11 @@ def main():
         "path_command_count": sum(len(item.Path.Commands) for item in outputs), "preview_segments": preview,
         "profile_boundaries": profile_boundaries, "gcode_bytes": FilePath(nc_path).stat().st_size}
     FilePath(result_path).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    emit_progress(
+        "freecad_completed", "FreeCAD 原生刀路生成完成",
+        current=len(operations), total=len(operations),
+        generated=len(generated), skipped=len(skipped),
+    )
     App.closeDocument(document.Name)
     return 0
 

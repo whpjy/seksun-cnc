@@ -79,6 +79,7 @@ COPY apps/api/requirements-dev.txt apps/api/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
 COPY apps/api/app ./app
 COPY apps/api/cam ./cam
+COPY apps/api/tools ./tools
 COPY apps/api/tests ./tests
 RUN useradd --system --uid 10001 --create-home cnc \
     && mkdir -p /var/lib/seksun-cnc/jobs \

@@ -75,3 +75,16 @@ def test_surface_strategy_coverage_requires_small_ball_rest_finishing() -> None:
     )
     assert check["status"] == "failed"
     assert "small_ball_rest_finishing" in check["message"]
+
+
+def test_missing_approved_operation_fails_preflight() -> None:
+    plan = build_process_plan(thin_surface_analysis(), "6061-T6", "VMC850")
+    result = cam_result_for(plan)
+    result["generated_operations"] = result["generated_operations"][:-1]
+
+    verification = verify_cam(plan, result)
+    coverage = next(item for item in verification["checks"] if item["id"] == "operation_coverage")
+
+    assert coverage["status"] == "failed"
+    assert verification["status"] == "failed"
+    assert any("未生成有效刀路" in error for error in verification["errors"])

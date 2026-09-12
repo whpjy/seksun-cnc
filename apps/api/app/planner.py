@@ -4,6 +4,7 @@ from collections import defaultdict
 from math import radians, sqrt, tan
 
 from .catalogs import apply_cutting_parameters, resolve_machine, resolve_material
+from .coverage import evaluate_plan_coverage
 from .collision import build_safety_configuration
 from .models import GeometryAnalysis, Operation, ProcessPlan, SafetyConfiguration, Setup, Tool, Vec3
 from .operation_library import create_operation_instance
@@ -51,17 +52,21 @@ def _tool_for_prismatic(width: float) -> Tool:
 
 def _surface_operations(sequence: int, axis_key: tuple[int, int, int], nonplanar_faces: int) -> tuple[int, list[Operation]]:
     """Plan roughing plus shallow- and steep-surface finishing for one side."""
+    # OCL cost rises sharply with both face count and sampling density.  Dense
+    # mould-like parts do not benefit from the tiny-part preview defaults, so
+    # scale sampling while keeping the finish stepover below 0.8 mm.
+    complexity_scale = 2.0 if nonplanar_faces >= 180 else 1.5 if nonplanar_faces >= 80 else 1.0
     rough_tool = Tool(
         id="EM-6-SURFACE", name="Ø6 平底立铣刀", kind="end_mill", diameter_mm=6,
         flute_length_mm=18, stickout_mm=25, holder_diameter_mm=20,
     )
     finish_tool = Tool(
-        id="BM-4", name="Ø4 球头立铣刀", kind="ball_end_mill", diameter_mm=4,
-        flute_length_mm=16, stickout_mm=25, holder_diameter_mm=16,
-    )
-    rest_tool = Tool(
         id="BM-2.5", name="Ø2.5 球头立铣刀", kind="ball_end_mill", diameter_mm=2.5,
         flute_length_mm=10, stickout_mm=18, holder_diameter_mm=10,
+    )
+    rest_tool = Tool(
+        id="BM-1.5", name="Ø1.5 球头立铣刀", kind="ball_end_mill", diameter_mm=1.5,
+        flute_length_mm=8, stickout_mm=18, holder_diameter_mm=10,
     )
     direction = _axis_label(axis_key)
     sequence += 10
@@ -80,7 +85,11 @@ def _surface_operations(sequence: int, axis_key: tuple[int, int, int], nonplanar
         id=f"OP{sequence}", sequence=sequence, type="surface_3d",
         name=f"{direction} 球刀三维曲面精加工", feature_ids=[f"SURFACE-SET-{direction}"],
         tool=finish_tool,
-        parameters={"step_over_mm": 0.8, "sample_interval_mm": 1.0, "depth_offset_mm": 0.0},
+        parameters={
+            "step_over_mm": round(min(0.8, 0.35 * complexity_scale), 3),
+            "sample_interval_mm": round(min(1.0, 0.4 * complexity_scale), 3),
+            "depth_offset_mm": 0.0,
+        },
         rationale=["球头刀沿目标表面执行交错扫描，覆盖圆角、加强筋与自由曲面",
                    "当前为三轴可见面加工；倒扣和遮挡区域仍需可达性校核"],
         confidence=0.62, status="warning",
@@ -92,16 +101,16 @@ def _surface_operations(sequence: int, axis_key: tuple[int, int, int], nonplanar
         tool=rest_tool.model_copy(deep=True),
         parameters={
             "depth_mm": 0.3,
-            "step_down_mm": 0.3,
-            "step_over_percent": 15,
-            "sample_interval_mm": 0.4,
+            "step_down_mm": round(min(0.3, 0.18 * complexity_scale), 3),
+            "step_over_percent": round(min(15, 12 * complexity_scale), 1),
+            "sample_interval_mm": round(min(0.4, 0.2 * complexity_scale), 3),
             "depth_offset_mm": 0.0,
             "rest_machining": True,
         },
         rationale=[
             "平行球刀扫描主要覆盖缓坡曲面，陡峭侧壁需要等高线刀路清根并控制残留刀纹",
-            "使用经当前 FreeCAD/STEP 实跑验证稳定的 Ø2.5 球刀按 0.30 mm 层高精加工，覆盖 R1.25 及以上圆角过渡",
-            "小于 R1.25 的局部过渡需使用更高阶残料识别 CAM 或由制造工程师复核",
+            "使用 Ø1.5 球刀按 0.18 mm 层高精加工，覆盖 R0.75 及以上圆角过渡",
+            "小于 R0.75 的局部过渡需使用更高阶残料识别 CAM 或由制造工程师复核",
         ],
         confidence=0.66, status="warning",
     )
@@ -111,6 +120,146 @@ def _surface_operations(sequence: int, axis_key: tuple[int, int, int], nonplanar
 def _datum_for_axis(analysis: GeometryAnalysis, axis: Vec3):
     matching = [plane for plane in analysis.planar_features if abs(_dot(plane.normal, axis)) >= 0.98]
     return max(matching, key=lambda plane: plane.area, default=None)
+
+
+def _sheet_forming_plan(
+    analysis: GeometryAnalysis,
+    material: str,
+    machine: str,
+    equivalent_thickness: float,
+) -> ProcessPlan:
+    bounds = analysis.measurements["bounding_box"]
+    assert not isinstance(bounds, float)
+    material_profile = resolve_material(material)
+    machine_profile = resolve_machine(machine)
+    nominal_thickness = round(max(0.05, round(equivalent_thickness / 0.05) * 0.05), 3)
+    developed_area = round(float(analysis.measurements.get("volume", 0.0)) / nominal_thickness, 2)
+    holes = [
+        feature.id for feature in analysis.cylindrical_features
+        if feature.kind == "hole" and feature.review_state != "excluded"
+    ]
+    process_tool = Tool(
+        id="SHEET-PROCESS", name="薄板工艺装备（待选型）", kind="forming_equipment",
+        diameter_mm=nominal_thickness, flute_count=0, max_rpm=0, catalog_match=False,
+        flute_length_mm=0, stickout_mm=0, holder_diameter_mm=0,
+    )
+    operations = [
+        Operation(
+            id="OP10", sequence=10, type="sheet_flat_pattern", name="生成并复核板料展开",
+            feature_ids=[], tool=process_tool.model_copy(deep=True),
+            parameters={
+                "nominal_thickness_mm": nominal_thickness,
+                "estimated_developed_area_mm2": developed_area,
+                "formation_start": 0.0, "formation_end": 0.0,
+            },
+            rationale=[
+                f"实体体积/表面积推算名义板厚约 {nominal_thickness:.2f} mm",
+                "当前动画采用压平预览；真实下料轮廓必须通过中性层展开并复核弯曲扣除",
+            ], confidence=0.82, status="warning",
+        ),
+        Operation(
+            id="OP20", sequence=20, type="sheet_blanking", name="平板下料与孔槽加工",
+            feature_ids=holes, tool=Tool(
+                id="LASER-FINE", name="精细激光/精密冲裁设备", kind="laser_or_punch",
+                diameter_mm=0.1, flute_count=0, max_rpm=0, catalog_match=False,
+                flute_length_mm=0, stickout_mm=0, holder_diameter_mm=0,
+            ),
+            parameters={
+                "nominal_thickness_mm": nominal_thickness,
+                "estimated_developed_area_mm2": developed_area,
+                "recognized_hole_count": len(holes),
+                "kerf_compensation_mm": 0.05,
+                "formation_start": 0.0, "formation_end": 0.0,
+            },
+            rationale=["孔、窗口和外轮廓应在成形前加工，避免成形后定位和刀具干涉"],
+            confidence=0.72, status="warning",
+        ),
+        Operation(
+            id="OP30", sequence=30, type="sheet_preforming", name="预成形与对称折弯",
+            feature_ids=[], tool=Tool(
+                id="DIE-PREFORM", name="预成形模具/折弯工装", kind="forming_die",
+                diameter_mm=nominal_thickness, flute_count=0, max_rpm=0, catalog_match=False,
+                flute_length_mm=0, stickout_mm=0, holder_diameter_mm=0,
+            ),
+            parameters={
+                "formation_start": 0.0, "formation_end": 0.55,
+                "target_depth_mm": round(bounds.size.y * 0.55, 3),
+                "springback_compensation": "pending_material_test",
+            },
+            rationale=["先完成约 55% 成形深度，降低 0.3 mm 薄壁一次成形的起皱和撕裂风险"],
+            confidence=0.58, status="warning",
+        ),
+        Operation(
+            id="OP40", sequence=40, type="sheet_final_forming", name="终成形至 STEP 目标形状",
+            feature_ids=[], tool=Tool(
+                id="DIE-FINAL", name="终成形模具", kind="forming_die",
+                diameter_mm=nominal_thickness, flute_count=0, max_rpm=0, catalog_match=False,
+                flute_length_mm=0, stickout_mm=0, holder_diameter_mm=0,
+            ),
+            parameters={
+                "formation_start": 0.55, "formation_end": 1.0,
+                "target_depth_mm": round(bounds.size.y, 3),
+                "springback_compensation": "pending_material_test",
+            },
+            rationale=["以 STEP 成品包络作为终态；模具圆角、压边力和回弹补偿仍需材料参数"],
+            confidence=0.55, status="warning",
+        ),
+        Operation(
+            id="OP50", sequence=50, type="sheet_deburring", name="去毛刺、清洗与表面处理",
+            feature_ids=[], tool=process_tool.model_copy(deep=True),
+            parameters={"formation_start": 1.0, "formation_end": 1.0},
+            rationale=["下料边缘和冲孔边缘需去毛刺，避免装配划伤与裂纹起点"],
+            confidence=0.8, status="warning",
+        ),
+        Operation(
+            id="OP60", sequence=60, type="sheet_inspection", name="尺寸、轮廓与回弹检测",
+            feature_ids=[], tool=Tool(
+                id="CMM-OPTICAL", name="影像/CMM 检测设备", kind="inspection",
+                diameter_mm=0.0, flute_count=0, max_rpm=0, catalog_match=False,
+                flute_length_mm=0, stickout_mm=0, holder_diameter_mm=0,
+            ),
+            parameters={
+                "formation_start": 1.0, "formation_end": 1.0,
+                "target_profile": "STEP",
+                "forming_depth_mm": round(bounds.size.y, 3),
+            },
+            rationale=["终件必须与 STEP 轮廓比对，并用实测回弹修正模具或折弯参数"],
+            confidence=0.76, status="warning",
+        ),
+    ]
+    setup = Setup(
+        id="FORMING-1", name="薄板下料与成形工艺线", work_axis=Vec3(x=0, y=1, z=0),
+        datum_feature_id=None, fixture="展开定位 + 专用冲压/折弯模具（待工程师设计）",
+        operations=operations,
+    )
+    return ProcessPlan(
+        process_kind="sheet_forming",
+        title=f"{analysis.source_file} 薄板成形工艺方案",
+        material=material, machine=machine,
+        material_profile=material_profile, machine_profile=machine_profile,
+        safety=None,
+        stock={
+            "type": "sheet_blank_candidate",
+            "size_mm": [round(bounds.size.x, 3), nominal_thickness, round(bounds.size.z, 3)],
+            "nominal_thickness_mm": nominal_thickness,
+            "estimated_developed_area_mm2": developed_area,
+            "flat_pattern_status": "requires_unfolding_validation",
+        },
+        setups=[setup],
+        warnings=[
+            f"已识别为约 {nominal_thickness:.2f} mm 薄板成形件，不生成三轴铣削刀路。",
+            "当前提供工艺顺序和几何变形预览；展开尺寸、模具、压边力及回弹尚未通过成形求解器验证。",
+            "材料牌号、状态和轧制方向必须由制造工程师确认后才能设计生产模具。",
+        ],
+        assumptions=[
+            "STEP 模型单位为毫米。",
+            "使用体积/表面积推算名义板厚，并以 STEP 模型作为最终成形目标。",
+            "概念动画仅表达工序状态，不代表应变、减薄、起皱或回弹有限元结果。",
+        ],
+        estimated_minutes=8.0,
+        automation_status="review",
+        blocking_reasons=[],
+    )
 
 
 def build_process_plan(
@@ -146,15 +295,37 @@ def build_process_plan(
 
     direction_keys = set(holes_by_direction) | set(prismatic_by_direction)
 
-    rejected_open_cylinders = [
-        feature for feature in analysis.cylindrical_features
-        if feature.kind == "hole" and feature.angular_span_degrees < 355
-    ]
     bbox_volume = max(bounds.size.x * bounds.size.y * bounds.size.z, 1e-6)
     part_volume = float(analysis.measurements.get("volume", bbox_volume))
+    surface_area = float(analysis.measurements.get("surface_area", 0.0))
     fill_ratio = max(0.0, min(part_volume / bbox_volume, 1.0))
     ordered_sizes = sorted((bounds.size.x, bounds.size.y, bounds.size.z))
+    equivalent_sheet_thickness = 2.0 * part_volume / max(surface_area, 1e-6)
+    source_hint = analysis.source_file.casefold().replace("_", " ").replace("-", " ")
+    tooling_intent = any(marker in source_hint for marker in (
+        "tooling", "soft tool", "mould", "mold", "fixture", "jig",
+        "工装", "模具", "夹具", "治具",
+    ))
+    # A folded thin sheet has a very small volume-to-area thickness while its
+    # bounding box is many times deeper than the material itself.  Treating
+    # such a part as a low-fill billet caused Surface paths to alternate
+    # between gouging 0.3 mm walls and leaving large webs of stock.  Route it
+    # to blanking/forming before spending minutes on predictably invalid CAM.
+    formed_sheet_candidate = (
+        not tooling_intent
+        and surface_area > 0
+        and equivalent_sheet_thickness <= 0.8
+        and fill_ratio <= 0.15
+        and ordered_sizes[0] >= max(1.5, equivalent_sheet_thickness * 4.0)
+    )
+    if formed_sheet_candidate:
+        plan = _sheet_forming_plan(
+            analysis, material, machine, equivalent_sheet_thickness,
+        )
+        plan.coverage = evaluate_plan_coverage(analysis, plan)
+        return plan
     thin_plate = ordered_sizes[0] <= max(3.5, ordered_sizes[1] * 0.12)
+    low_fill_profile = fill_ratio <= 0.72 and ordered_sizes[0] <= max(6.0, ordered_sizes[1] * 0.25)
     thin_axis_index = min(range(3), key=lambda index: (bounds.size.x, bounds.size.y, bounds.size.z)[index])
     profile_planes = [
         plane for plane in analysis.planar_features
@@ -169,22 +340,38 @@ def build_process_plan(
         default=None,
     )
     profile_axis = _axis_key(profile_plane.normal) if profile_plane else (0, 0, 1)
-    needs_outer_profile = thin_plate and fill_ratio < 0.98 and profile_plane is not None
+    needs_outer_profile = (thin_plate or low_fill_profile) and fill_ratio < 0.98 and profile_plane is not None
     cylindrical_source_faces = sum(max(len(feature.source_face_ids), 1) for feature in analysis.cylindrical_features)
-    nonplanar_face_count = max(0, int(analysis.topology.get("faces", 0)) - len(analysis.planar_features) - cylindrical_source_faces)
+    residual_nonplanar_faces = max(
+        0,
+        int(analysis.topology.get("faces", 0))
+        - len(analysis.planar_features)
+        - cylindrical_source_faces,
+    )
+    # Partial cylinders and convex cylinders describe radii, fillets and open
+    # contours.  They are deliberately excluded from hole drilling, but still
+    # require 3D roughing/finishing instead of silently disappearing.
+    curved_surface_face_count = sum(
+        max(len(feature.source_face_ids), 1)
+        for feature in analysis.cylindrical_features
+        if feature.kind != "hole" or feature.angular_span_degrees < 355
+    )
+    nonplanar_face_count = residual_nonplanar_faces + curved_surface_face_count
+    needs_surface_machining = needs_outer_profile and nonplanar_face_count > 0
     internal_wire_count = max(0, (profile_plane.wire_count if profile_plane else 1) - 1)
     recognized_profile_holes = len(holes_by_direction[profile_axis])
     uncovered_internal_profiles = max(0, internal_wire_count - recognized_profile_holes)
     blocking_reasons: list[str] = []
     if needs_outer_profile and uncovered_internal_profiles:
-        blocking_reasons = [
+        blocking_reasons.extend([
             f"顶面包含 {internal_wire_count} 个内部轮廓，仅有 {recognized_profile_holes} 个可确认为标准孔。",
             "剩余异形内部轮廓尚未覆盖，已阻止生成不完整 CAM。",
-        ]
+        ])
     automation_status = "unsupported" if blocking_reasons else "review" if needs_outer_profile else "ready"
 
     if needs_outer_profile and not blocking_reasons:
         direction_keys.add(profile_axis)
+
 
     if not direction_keys and automation_status != "unsupported":
         primary_plane = max(analysis.planar_features, key=lambda plane: plane.area, default=None)
@@ -206,7 +393,7 @@ def build_process_plan(
         datum = _datum_for_axis(analysis, work_axis)
         operations: list[Operation] = []
 
-        if not (thin_plate and axis_key == profile_axis):
+        if not (needs_outer_profile and axis_key == profile_axis):
             sequence += 10
             operations.append(
                 create_operation_instance(
@@ -273,6 +460,12 @@ def build_process_plan(
             )
             cutting_distance += feature.length * feature.width * max(feature.depth, 0.1) / max(tool.diameter_mm**2, 1)
 
+        # Establish the target envelope before drilling; the profile remains
+        # attached by tabs until every surface and hole operation is complete.
+        if needs_surface_machining and axis_key == profile_axis:
+            sequence, surface_operations = _surface_operations(sequence, axis_key, nonplanar_face_count)
+            operations.extend(surface_operations)
+
         grouped: dict[tuple[float, str], list] = defaultdict(list)
         for hole in holes:
             grouped[(round(hole.diameter, 2), hole.end_type)].append(hole)
@@ -320,10 +513,6 @@ def build_process_plan(
                 sqrt(feature.length**2 + (2 * 3.14159 * feature.radius) ** 2)
                 for feature in features
             )
-
-        if thin_plate and axis_key == profile_axis and nonplanar_face_count:
-            sequence, surface_operations = _surface_operations(sequence, axis_key, nonplanar_face_count)
-            operations.extend(surface_operations)
 
         if needs_outer_profile and axis_key == profile_axis and automation_status != "unsupported":
             profile_thickness = _extent_along_axis(bounds, axis_key)
@@ -397,7 +586,7 @@ def build_process_plan(
                 name=f"第 {setup_index} 次装夹：{_axis_label(axis_key)} 方向加工",
                 work_axis=work_axis,
                 datum_feature_id=datum.id if datum else None,
-                fixture="牺牲垫板 + 胶粘/压板固定（薄板外轮廓候选）" if thin_plate else "平口钳 + 平行垫铁（候选，需校核可达性）",
+                fixture="牺牲垫板 + 胶粘/压板固定（低实体占比外轮廓候选）" if needs_outer_profile else "平口钳 + 平行垫铁（候选，需校核可达性）",
                 operations=operations,
             )
         )
@@ -419,7 +608,7 @@ def build_process_plan(
                 operations=[],
             )
             setups.append(reverse_setup)
-        if nonplanar_face_count:
+        if needs_surface_machining:
             sequence, surface_operations = _surface_operations(sequence, reverse_profile_key, nonplanar_face_count)
             reverse_setup.operations.extend(surface_operations)
         sequence += 10
@@ -465,12 +654,12 @@ def build_process_plan(
     if prismatic_excluded:
         warnings.append(f"已从自动规划中排除 {prismatic_excluded} 个型腔/槽候选。")
     if needs_outer_profile and automation_status == "review":
-        warnings.append("薄板已规划外轮廓粗精加工、桥位切除和双面倒角；二次固定、翻面基准及切断顺序必须由制造工程师复核。")
+        warnings.append("低实体占比零件已规划双面曲面、外轮廓粗精加工、桥位切除和双面倒角；二次固定、翻面基准及切断顺序必须由制造工程师复核。")
     if len(setups) > 3:
         warnings.append("检测到超过三个主要加工方向，三轴机床可能需要专用夹具或改用四/五轴设备。")
 
     resolved_safety = safety
-    expected_fixture_strategy = "sacrificial_plate" if thin_plate else "vise"
+    expected_fixture_strategy = "sacrificial_plate" if needs_outer_profile else "vise"
     if resolved_safety is None or resolved_safety.fixture_strategy != expected_fixture_strategy:
         resolved_safety = build_safety_configuration(
             analysis,
@@ -480,22 +669,37 @@ def build_process_plan(
             setup_axes=[(setup.id, setup.work_axis) for setup in setups],
         )
 
-    return ProcessPlan(
+    size_values = (bounds.size.x, bounds.size.y, bounds.size.z)
+    profile_axis_index = max(
+        range(3),
+        key=lambda index: abs(profile_axis[index]),
+    )
+    if needs_outer_profile and automation_status != "unsupported":
+        stock_size = [
+            round(value + (2.0 if index == profile_axis_index else 8.0), 3)
+            for index, value in enumerate(size_values)
+        ]
+    elif automation_status == "unsupported":
+        stock_size = [round(value, 3) for value in size_values]
+    else:
+        stock_size = [
+            round(bounds.size.x + 6, 3),
+            round(bounds.size.y + 6, 3),
+            round(bounds.size.z + 4, 3),
+        ]
+
+    plan = ProcessPlan(
         title=f"{analysis.source_file} 工艺方案",
         material=material,
         machine=machine,
         material_profile=material_profile,
         machine_profile=machine_profile,
         stock={
-            "type": "sheet" if thin_plate else "box",
-            "size_mm": [
-                round(bounds.size.x + (8 if thin_plate and automation_status != "unsupported" else 0 if automation_status == "unsupported" else 6), 3),
-                round(bounds.size.y + (8 if thin_plate and automation_status != "unsupported" else 0 if automation_status == "unsupported" else 6), 3),
-                round(bounds.size.z if thin_plate else bounds.size.z + 4, 3),
-            ],
+            "type": "sheet" if needs_outer_profile else "box",
+            "size_mm": stock_size,
             "allowance_mm": {
-                "xy": 4.0 if thin_plate and automation_status != "unsupported" else 0.0 if automation_status == "unsupported" else 3.0,
-                "z": 0.0 if thin_plate else 0.0 if automation_status == "unsupported" else 2.0,
+                "xy": 4.0 if needs_outer_profile and automation_status != "unsupported" else 0.0 if automation_status == "unsupported" else 3.0,
+                "z": 1.0 if needs_outer_profile and automation_status != "unsupported" else 0.0 if automation_status == "unsupported" else 2.0,
             },
         },
         setups=setups,
@@ -511,3 +715,5 @@ def build_process_plan(
         automation_status=automation_status,
         blocking_reasons=blocking_reasons,
     )
+    plan.coverage = evaluate_plan_coverage(analysis, plan)
+    return plan

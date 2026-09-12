@@ -172,6 +172,80 @@ def test_excludes_partial_cylinders_from_hole_planning() -> None:
     )
 
 
+def test_formed_sheet_part_is_routed_away_from_billet_milling() -> None:
+    analysis = GeometryAnalysis.model_validate({
+        "schema_version": "0.4.0",
+        "source_file": "0437S001ZU_20231121.stp",
+        "topology": {"solids": 1, "faces": 4, "edges": 16},
+        "measurements": {
+            "surface_area": 1712.56,
+            "volume": 243.74,
+            "bounding_box": {
+                "minimum": {"x": -21.2, "y": 0, "z": 25.6},
+                "maximum": {"x": 21.2, "y": 4.85, "z": 50.9},
+                "size": {"x": 42.4, "y": 4.85, "z": 25.3},
+            },
+        },
+        "planar_features": [{
+            "id": "PF-FRONT", "area": 173.38,
+            "center": {"x": 0, "y": 4.85, "z": 40},
+            "normal": {"x": 0, "y": 1, "z": 0},
+            "wire_count": 1,
+        }],
+        "cylindrical_features": [
+            {
+                "id": "HF-RADIUS", "kind": "boss", "radius": 20,
+                "diameter": 40, "length": 20.8,
+                "center": {"x": 0, "y": 2.4, "z": 40},
+                "axis": {"x": 1, "y": 0, "z": 0},
+                "angular_span_degrees": 80,
+                "source_face_ids": ["CF-RADIUS"],
+                "review_state": "accepted", "confidence": 0.9,
+            },
+            {
+                "id": "HF-HOLE", "kind": "hole", "radius": 0.75,
+                "diameter": 1.5, "length": 4.85,
+                "center": {"x": 19.6, "y": 2.425, "z": 43.1},
+                "axis": {"x": 0, "y": 1, "z": 0},
+                "access_direction": {"x": 0, "y": 1, "z": 0},
+                "angular_span_degrees": 360,
+                "source_face_ids": ["CF-HOLE"],
+                "end_type": "through", "review_state": "accepted", "confidence": 0.9,
+            },
+        ],
+        "prismatic_features": [],
+    })
+
+    plan = build_process_plan(analysis, "6061-T6", "VMC850")
+    assert plan.process_kind == "sheet_forming"
+    assert plan.automation_status == "review"
+    assert plan.stock["type"] == "sheet_blank_candidate"
+    assert plan.stock["size_mm"] == [42.4, 0.3, 25.3]
+    assert len(plan.setups) == 1
+    assert [operation.type for operation in plan.setups[0].operations] == [
+        "sheet_flat_pattern", "sheet_blanking", "sheet_preforming",
+        "sheet_final_forming", "sheet_deburring", "sheet_inspection",
+    ]
+    assert plan.safety is None
+    assert plan.blocking_reasons == []
+    assert any("成形求解器" in warning for warning in plan.warnings)
+
+
+def test_tooling_intent_is_not_misclassified_as_sheet_forming() -> None:
+    analysis = sample_analysis()
+    analysis.source_file = "3285506818_soft tooling_V2.stp"
+    analysis.measurements["surface_area"] = 27807.49
+    analysis.measurements["volume"] = 10921.18
+    bounds = analysis.measurements["bounding_box"]
+    bounds.minimum.x, bounds.minimum.y, bounds.minimum.z = -74.0, -9.4, -55.45
+    bounds.maximum.x, bounds.maximum.y, bounds.maximum.z = 77.0, -1.6, 63.05
+    bounds.size.x, bounds.size.y, bounds.size.z = 151.0, 7.8, 118.5
+
+    plan = build_process_plan(analysis, "6061-T6", "VMC850")
+
+    assert plan.process_kind == "subtractive"
+
+
 def test_splits_setups_by_hole_access_direction() -> None:
     analysis = sample_analysis()
     analysis.cylindrical_features[0].access_direction = Vec3(x=0, y=0, z=1)

@@ -85,7 +85,21 @@ CNC_PUBLIC_BASE_URL=http://192.168.1.100:3001
 - `POST /api/v1/jobs/{job_id}/cam`：生成 FreeCAD Path 工程与 G-code
 - `GET /api/v1/jobs/{job_id}/cam`：读取任务已经生成的 CAM、预检、仿真和碰撞结果
 - `GET /api/v1/config`：读取前端使用的公开访问地址和会话分享能力
+- `GET /api/v1/benchmarks/cases`：读取只读挂载的 2D/3D 回归案例清单
+- `GET /api/v1/benchmarks/report`：读取最近一次真实案例覆盖率基线
 - `GET /api/v1/jobs/{job_id}/files/{filename}`：下载结果文件
+
+每个新工艺方案都包含 `coverage`，用于报告制造目标覆盖率、未识别内部轮廓、待复核特征、实验级工序和临时刀具。工作台顶部的“覆盖”按钮可打开详细问题列表。
+
+使用仓库旁的 10 组 2D/3D 案例生成识别与规划基线：
+
+```powershell
+docker compose exec -T api python tools/evaluate_examples.py `
+  --root /var/lib/seksun-cnc/examples `
+  --output /var/lib/seksun-cnc/benchmark-report.json
+```
+
+报告会写入 `.seksun-cnc/benchmark-report.json`，原始案例目录以只读方式挂载，不会被修改，也不会调用 Qwen。
 
 ## 测试
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from math import ceil, floor, hypot, sqrt
+from typing import Callable
 
 from .models import GeometryAnalysis, ProcessPlan
 
@@ -41,7 +42,11 @@ def _stock_grid(
     min_y, max_y = min(p[1] for p in corners), max(p[1] for p in corners)
     bottom, top = min(p[2] for p in corners), max(p[2] for p in corners)
     width, height = max_x - min_x, max_y - min_y
-    resolution = max(0.18, max(width, height) / maximum_grid_size)
+    # Small, low-volume profile parts are highly sensitive to boundary-cell
+    # quantization.  Keep enough samples to make target-volume validation and
+    # the displayed in-process workpiece agree at sub-0.1 mm resolution.
+    precision_floor = 0.06 if maximum_grid_size >= 600 and max(width, height) >= 40 else 0.18
+    resolution = max(precision_floor, max(width, height) / maximum_grid_size)
     columns, rows = max(2, ceil(width / resolution) + 1), max(2, ceil(height / resolution) + 1)
     return min_x, min_y, bottom, top, width, height, resolution, columns, rows
 
@@ -52,6 +57,8 @@ def _surface_for_setup(setup_id: str, axis: dict[str, float], segments: list[dic
     heights = [top] * (columns * rows)
     cut_count = 0
     unsupported_tools: set[str] = set()
+    previous_cut_end: tuple[float, float, float] | None = None
+    previous_cut_operation: str | None = None
 
     def remove_disk(x: float, y: float, cutting_z: float, radius: float) -> None:
         cutting_z = max(bottom, min(top, cutting_z))
@@ -69,20 +76,32 @@ def _surface_for_setup(setup_id: str, axis: dict[str, float], segments: list[dic
 
     for segment in segments:
         if segment.get("motion") != "cut":
+            previous_cut_end = None
+            previous_cut_operation = None
             continue
-        operation = operations.get(str(segment.get("operation_id")))
+        operation_id = str(segment.get("operation_id"))
+        operation = operations.get(operation_id)
         if not operation:
+            previous_cut_end = None
+            previous_cut_operation = None
             continue
         if operation.tool.kind not in {"face_mill", "end_mill", "drill", "ball_end_mill", "bull_end_mill"}:
             unsupported_tools.add(operation.tool.id)
+            previous_cut_end = None
+            previous_cut_operation = None
             continue
         start = _local({"x": segment["x1"], "y": segment["y1"], "z": segment["z1"]}, frame)
         end = _local({"x": segment["x2"], "y": segment["y2"], "z": segment["z2"]}, frame)
         sample_count = max(1, ceil(hypot(end[0] - start[0], end[1] - start[1]) / max(resolution * 0.5, 0.1)))
-        for sample in range(sample_count + 1):
+        continuous = previous_cut_operation == operation_id and previous_cut_end is not None and all(
+            abs(previous_cut_end[index] - start[index]) <= 1e-7 for index in range(3)
+        )
+        for sample in range(1 if continuous else 0, sample_count + 1):
             ratio = sample / sample_count
             remove_disk(start[0] + (end[0] - start[0]) * ratio, start[1] + (end[1] - start[1]) * ratio, start[2] + (end[2] - start[2]) * ratio, operation.tool.diameter_mm / 2)
         cut_count += 1
+        previous_cut_end = end
+        previous_cut_operation = operation_id
 
     def inside_polygon(x: float, y: float, points: list[tuple[float, float, float]]) -> bool:
         inside, previous = False, points[-1]
@@ -130,6 +149,7 @@ def _cumulative_surface(
     stock_bounds: tuple[float, float, float, float, float, float],
     maximum_grid_size: int,
     setup_local_bounds: dict[str, dict] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, object]:
     """Accumulate opposite-side setups into one double-sided height field.
 
@@ -149,6 +169,8 @@ def _cumulative_surface(
     cut_count = 0
     unsupported_tools: set[str] = set()
     unsupported_setups: set[str] = set()
+    previous_cut_end: tuple[float, float, float] | None = None
+    previous_cut_key: tuple[str, str] | None = None
     setup_stock_tops = {}
     for setup in plan.setups:
         configured = (setup_local_bounds or {}).get(setup.id, {})
@@ -182,15 +204,25 @@ def _cumulative_surface(
                     lower[index] = min(upper[index], max(lower[index], effective_z))
 
     supported_tools = {"face_mill", "end_mill", "drill", "ball_end_mill", "bull_end_mill"}
-    for segment in segments:
+    segment_total = len(segments)
+    progress_interval = max(1000, segment_total // 24)
+    for segment_index, segment in enumerate(segments, 1):
+        if progress_callback and (segment_index == 1 or segment_index % progress_interval == 0):
+            progress_callback(segment_index, segment_total)
         if segment.get("motion") != "cut":
+            previous_cut_end = None
+            previous_cut_key = None
             continue
         operation_id = str(segment.get("operation_id"))
         operation = operations.get(operation_id)
         if not operation:
+            previous_cut_end = None
+            previous_cut_key = None
             continue
         if operation.tool.kind not in supported_tools:
             unsupported_tools.add(operation.tool.id)
+            previous_cut_end = None
+            previous_cut_key = None
             continue
         setup_id = str(segment.get("setup_id") or operation_setup.get(operation_id, ""))
         axis_value = segment.get("work_axis") or setup_axes.get(setup_id) or reference_axis
@@ -198,13 +230,19 @@ def _cumulative_surface(
         alignment = _dot(tool_axis, frame["z"])
         if abs(alignment) < 0.9:
             unsupported_setups.add(setup_id)
+            previous_cut_end = None
+            previous_cut_key = None
             continue
         start = _local({"x": segment["x1"], "y": segment["y1"], "z": segment["z1"]}, frame)
         end = _local({"x": segment["x2"], "y": segment["y2"], "z": segment["z2"]}, frame)
         sample_count = max(1, ceil(hypot(end[0] - start[0], end[1] - start[1]) / max(resolution * 0.5, 0.1)))
         local_z1 = float(segment.get("local_z1", _local({"x": segment["x1"], "y": segment["y1"], "z": segment["z1"]}, _frame(axis_value))[2]))
         local_z2 = float(segment.get("local_z2", _local({"x": segment["x2"], "y": segment["y2"], "z": segment["z2"]}, _frame(axis_value))[2]))
-        for sample in range(sample_count + 1):
+        cut_key = (operation_id, setup_id)
+        continuous = previous_cut_key == cut_key and previous_cut_end is not None and all(
+            abs(previous_cut_end[index] - start[index]) <= 1e-7 for index in range(3)
+        )
+        for sample in range(1 if continuous else 0, sample_count + 1):
             ratio = sample / sample_count
             local_cutting_z = local_z1 + (local_z2 - local_z1) * ratio
             if local_cutting_z > setup_stock_tops.get(setup_id, top) + 1e-6:
@@ -218,6 +256,10 @@ def _cumulative_surface(
                 operation.tool.kind,
             )
         cut_count += 1
+        previous_cut_end = end
+        previous_cut_key = cut_key
+    if progress_callback:
+        progress_callback(segment_total, segment_total)
 
     def polygon_area(points: list[tuple[float, float, float]]) -> float:
         return abs(sum(points[index][0] * points[(index + 1) % len(points)][1] - points[(index + 1) % len(points)][0] * points[index][1] for index in range(len(points))) / 2)
@@ -273,7 +315,27 @@ def _cumulative_surface(
     }
 
 
-def simulate_material_removal(analysis: GeometryAnalysis, plan: ProcessPlan, cam_result: dict, maximum_grid_size: int = 640) -> dict[str, object]:
+def _adaptive_grid_size(segment_count: int, requested: int) -> int:
+    """Keep dense production paths responsive without degrading small jobs.
+
+    A 318-cell maximum produces approximately 0.5 mm samples for a 159 mm
+    blank.  It also stays below the conformance check's 320-sample threshold,
+    avoiding an unnecessary second stride that would lose more accuracy.
+    """
+    if segment_count >= 100_000:
+        return min(requested, 318)
+    if segment_count >= 50_000:
+        return min(requested, 420)
+    return requested
+
+
+def simulate_material_removal(
+    analysis: GeometryAnalysis,
+    plan: ProcessPlan,
+    cam_result: dict,
+    maximum_grid_size: int = 640,
+    progress_callback: Callable[[str, float], None] | None = None,
+) -> dict[str, object]:
     """Approximate each setup and the cumulative stock left by all setups."""
     bounds = analysis.measurements["bounding_box"]
     assert not isinstance(bounds, float)
@@ -283,8 +345,15 @@ def simulate_material_removal(analysis: GeometryAnalysis, plan: ProcessPlan, cam
     operations = {operation.id: operation for setup in plan.setups for operation in setup.operations}
     operation_setup = {operation.id: setup.id for setup in plan.setups for operation in setup.operations}
     segments, boundaries = list(cam_result.get("preview_segments", [])), list(cam_result.get("profile_boundaries", []))
+    cut_segment_count = sum(1 for segment in segments if segment.get("motion") == "cut")
+    effective_grid_size = _adaptive_grid_size(cut_segment_count, maximum_grid_size)
+    if progress_callback:
+        progress_callback(
+            f"已读取 {cut_segment_count:,} 条切削轨迹，自适应网格 {effective_grid_size}",
+            0.03,
+        )
     setup_surfaces = []
-    for setup in plan.setups:
+    for setup_index, setup in enumerate(plan.setups, 1):
         setup_segments = [segment for segment in segments if str(segment.get("setup_id") or operation_setup.get(str(segment.get("operation_id")), "")) == setup.id]
         setup_boundaries = [
             boundary for boundary in boundaries
@@ -295,8 +364,13 @@ def simulate_material_removal(analysis: GeometryAnalysis, plan: ProcessPlan, cam
         # spending the available resolution on the cumulative final workpiece.
         setup_surfaces.append(_surface_for_setup(
             setup.id, axis, setup_segments, setup_boundaries, operations,
-            stock_bounds, min(maximum_grid_size, 420),
+            stock_bounds, min(effective_grid_size, 220 if cut_segment_count >= 100_000 else 360),
         ))
+        if progress_callback:
+            progress_callback(
+                f"已完成装夹余料 {setup_index}/{len(plan.setups)}",
+                0.08 + setup_index / max(len(plan.setups), 1) * 0.24,
+            )
 
     setup_local_bounds = {
         str(setup.get("setup_id")): setup.get("local_bounds")
@@ -304,8 +378,17 @@ def simulate_material_removal(analysis: GeometryAnalysis, plan: ProcessPlan, cam
     }
     cumulative = _cumulative_surface(
         plan, segments, boundaries, operations, operation_setup, stock_bounds,
-        maximum_grid_size, setup_local_bounds,
+        effective_grid_size, setup_local_bounds,
+        progress_callback=(
+            lambda current, total: progress_callback(
+                f"正在累计双面轨迹 {current:,}/{total:,}",
+                0.34 + current / max(total, 1) * 0.58,
+            )
+            if progress_callback else None
+        ),
     )
+    if progress_callback:
+        progress_callback("正在汇总余料体积与显示网格", 0.96)
     cut_count = int(cumulative["cut_segment_count"])
     stock_volume = stock_size[0] * stock_size[1] * stock_size[2]
     removed_volume = float(cumulative["removed_volume_mm3"])
@@ -321,6 +404,6 @@ def simulate_material_removal(analysis: GeometryAnalysis, plan: ProcessPlan, cam
     return {
         "schema_version": "1.0.0", "engine": "Seksun CNC cumulative double-sided height-field simulator",
         "status": "completed" if cut_count else "warning", "method": "cumulative_double_sided_height_field",
-        "metrics": {"initial_stock_volume_mm3": round(stock_volume, 2), "removed_volume_mm3": round(removed_volume, 2), "remaining_volume_mm3": round(max(stock_volume - removed_volume, 0), 2), "removed_percent": round(removed_volume / stock_volume * 100, 2) if stock_volume else 0, "cut_segment_count": cut_count, "resolution_mm": float(cumulative["resolution_mm"])},
+        "metrics": {"initial_stock_volume_mm3": round(stock_volume, 2), "removed_volume_mm3": round(removed_volume, 2), "remaining_volume_mm3": round(max(stock_volume - removed_volume, 0), 2), "removed_percent": round(removed_volume / stock_volume * 100, 2) if stock_volume else 0, "cut_segment_count": cut_count, "resolution_mm": float(cumulative["resolution_mm"]), "requested_grid_size": maximum_grid_size, "effective_grid_size": effective_grid_size},
         "surface": cumulative, "setup_surfaces": setup_surfaces, "warnings": warnings,
     }
