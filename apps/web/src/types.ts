@@ -50,7 +50,31 @@ export type PrismaticFeature = {
   review_reasons: string[];
 };
 
-export type ManufacturingFeature = CylindricalFeature | PrismaticFeature;
+export type InternalProfileFeature = {
+  id: string;
+  kind: "internal_profile";
+  source_face_id: string;
+  source_face_index: number | null;
+  wire_index: number;
+  center: Vec3;
+  bounds: Bounds;
+  access_direction: Vec3;
+  edge_count: number;
+  perimeter: number;
+  circular: boolean;
+  paired_profile_id: string | null;
+  bottom_face_id: string | null;
+  end_type: "through" | "blind" | "unknown";
+  machining_kind: "through_profile" | "blind_pocket" | "engraving" | "unknown";
+  depth: number;
+  length: number;
+  width: number;
+  confidence: number;
+  review_state: "accepted" | "review" | "excluded";
+  review_reasons: string[];
+};
+
+export type ManufacturingFeature = CylindricalFeature | PrismaticFeature | InternalProfileFeature;
 
 export type ToolpathSegment = {
   operation_id: string;
@@ -75,15 +99,56 @@ export type CamResult = {
   skipped: string[];
   path_command_count: number;
   preview_segments: ToolpathSegment[];
-  profile_boundaries: { operation_id: string; setup_id: string; work_axis: Vec3; points: Vec3[] }[];
+  profile_boundaries: { operation_id: string; setup_id: string; work_axis: Vec3; points: Vec3[]; remove_side?: "inside" | "outside" }[];
   simulation_backend?: "cumulative-height-field-with-camotics-per-setup" | "cumulative-height-field" | "camotics-per-setup" | "height-field-fallback";
   camotics_surfaces?: { setup_id: string; file: string; engine: "CAMotics"; resolution_mm: number; frame: { x: Vec3; y: Vec3; z: Vec3 } }[];
-  files: { freecad: string; gcode: string; preview: string; verification: string; simulation: string; collision: string; camotics?: string[] };
+  files: { freecad: string; gcode: string; preview: string; verification: string; simulation: string; collision: string; remediation?: string; camotics?: string[] };
   verification: VerificationResult;
   simulation: SimulationResult;
   collision: CollisionResult;
+  remediation?: RemediationReport | null;
   safety: string;
   forming_preview?: FormingPreview;
+};
+
+export type RemediationAction = {
+  id: string;
+  kind: string;
+  label: string;
+  reason: string;
+  setup_id?: string | null;
+  operation_id?: string | null;
+  operation_type?: string | null;
+  feature_ids: string[];
+  parameters: Record<string, string | number | boolean>;
+  auto_applicable: boolean;
+};
+
+export type ManufacturingDefect = {
+  id: string;
+  kind: string;
+  severity: "low" | "medium" | "high" | "critical";
+  status: "open" | "resolved";
+  source: string;
+  title: string;
+  message: string;
+  setup_ids: string[];
+  operation_ids: string[];
+  feature_ids: string[];
+  evidence: string[];
+  metrics: Record<string, string | number>;
+  action_ids: string[];
+};
+
+export type RemediationReport = {
+  schema_version: "1.0.0";
+  status: "clear" | "action_required" | "blocked";
+  iteration: number;
+  max_iterations: number;
+  can_auto_replan: boolean;
+  summary: { defect_count: number; critical_count: number; blocking_critical_count: number; action_count: number; auto_action_count: number };
+  defects: ManufacturingDefect[];
+  actions: RemediationAction[];
 };
 
 export type FormingPreview = {
@@ -186,8 +251,39 @@ export type VerificationResult = {
     target_overlap_percent?: number;
     missing_target_volume_mm3?: number;
     excess_stock_volume_mm3?: number;
+    defect_regions?: SpatialDefectRegion[];
+    defect_samples?: SpatialDefectSample[];
+    attribution_method?: string;
   };
   limitations: string[];
+};
+
+export type SpatialDefectAttribution = {
+  operation_id: string;
+  segment_index: number;
+  distance_mm: number;
+  confidence: number;
+  method: "nearest_cut_segment" | "nearest_cut_context";
+};
+
+export type SpatialDefectRegion = {
+  id: string;
+  kind: "overcut" | "excess_stock";
+  severity: "critical" | "high";
+  volume_mm3: number;
+  max_deviation_mm: number;
+  sample_cell_count: number;
+  center: Vec3;
+  bounds: { minimum: Vec3; maximum: Vec3 };
+  attribution: SpatialDefectAttribution[];
+};
+
+export type SpatialDefectSample = {
+  region_id: string;
+  kind: "overcut" | "excess_stock";
+  position: Vec3;
+  deviation_mm: number;
+  radius_mm: number;
 };
 
 export type MaterialProfile = {
@@ -339,6 +435,22 @@ export type ManufacturingCoverage = {
   capability_gaps: string[];
 };
 
+export type ManufacturingRequirements = {
+  schema_version: string;
+  source_system: string;
+  drawing_number: string | null;
+  revision: string | null;
+  status: "complete" | "review" | "incomplete";
+  unresolved_requirement_ids: string[];
+  summary: {
+    total: number;
+    matched: number;
+    ambiguous: number;
+    unmapped: number;
+    recognized_only: number;
+  };
+};
+
 export type Job = {
   id: string;
   status: "processing" | "completed" | "failed";
@@ -347,13 +459,25 @@ export type Job = {
   material: string;
   machine: string;
   model_url: string | null;
+  drawing_filename?: string | null;
+  drawing_url?: string | null;
+  measurement_job_id?: string | null;
   error: string | null;
   analysis: {
     topology: Record<string, number>;
     measurements: Record<string, unknown>;
+    solid_candidates: {
+      index: number;
+      volume: number;
+      surface_area: number;
+      center: Vec3;
+      bounds: Bounds;
+      selected: boolean;
+    }[];
     planar_features: PlanarFeature[];
     cylindrical_features: CylindricalFeature[];
     prismatic_features: PrismaticFeature[];
+    internal_profile_features: InternalProfileFeature[];
     visual_edges: Vec3[][];
   } | null;
   plan: {
@@ -372,5 +496,6 @@ export type Job = {
     automation_status: "ready" | "review" | "unsupported";
     blocking_reasons: string[];
     coverage?: ManufacturingCoverage | null;
+    manufacturing_requirements?: ManufacturingRequirements | null;
   } | null;
 };

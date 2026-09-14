@@ -4,7 +4,7 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import type { FixtureComponent, FormingPreview, ManufacturingFeature, SimulationResult, ToolpathSegment, Vec3 } from "./types";
+import type { FixtureComponent, FormingPreview, ManufacturingFeature, SimulationResult, SpatialDefectRegion, SpatialDefectSample, ToolpathSegment, Vec3 } from "./types";
 
 type Props = {
   modelUrl: string;
@@ -27,6 +27,8 @@ type Props = {
   playbackMode?: "single" | "cumulative";
   onPlaybackModeChange?: (mode: "single" | "cumulative") => void;
   formingPreview?: FormingPreview | null;
+  spatialDefects?: { regions: SpatialDefectRegion[]; samples: SpatialDefectSample[] } | null;
+  onSelectDefect?: (region: SpatialDefectRegion) => void;
 };
 
 // Siemens NX/UG-style neutral blue-gray: dark enough to preserve the part's
@@ -35,13 +37,19 @@ const UG_PART_COLOR = 0x6f7b7d;
 const UG_TARGET_COLOR = 0x788689;
 const UG_EDGE_COLOR = 0x303a3d;
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
   const onSelectRef = useRef(onSelectFeature);
+  const onSelectDefectRef = useRef(onSelectDefect);
   const selectedIdsRef = useRef(selectedFeatureIds);
   const playbackRef = useRef({ playing: false, progress: initialProgress, speed: 1 });
-  const cameraStateRef = useRef<{ position: THREE.Vector3; target: THREE.Vector3; zoom: number } | null>(null);
+  const cameraStateRef = useRef<{
+    modelUrl: string;
+    position: THREE.Vector3;
+    target: THREE.Vector3;
+    zoom: number;
+  } | null>(null);
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(initialProgress);
   const [speed, setSpeed] = useState(1);
@@ -50,6 +58,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const targetVisibleRef = useRef(false);
   const [toolVisible, setToolVisible] = useState(true);
   const [trailVisible, setTrailVisible] = useState(true);
+  const [activeDefect, setActiveDefect] = useState<SpatialDefectRegion | null>(null);
   const viewApiRef = useRef<{
     setView: (view: "iso" | "top" | "front" | "fit") => void;
     setTargetVisible: (visible: boolean) => void;
@@ -81,6 +90,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   useEffect(() => {
     onSelectRef.current = onSelectFeature;
   }, [onSelectFeature]);
+
+  useEffect(() => {
+    onSelectDefectRef.current = onSelectDefect;
+  }, [onSelectDefect]);
 
   useEffect(() => {
     playbackRef.current.playing = false;
@@ -150,6 +163,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     scene.add(floorGrid);
 
     let model: THREE.Mesh | null = null;
+    let modelLoaded = false;
     let lastFormingFactor = -1;
     let formingActuator: THREE.Mesh | null = null;
     let formingStock: THREE.Mesh | null = null;
@@ -182,6 +196,8 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     const outsideProfileIndices: number[] = [];
     let profileDetachWeight = Number.POSITIVE_INFINITY;
     const fixtureMeshes: { mesh: THREE.Mesh; setupId?: string | null }[] = [];
+    const defectRegionMeshes: THREE.Mesh[] = [];
+    let defectPointCloud: THREE.Points | null = null;
     let animation = 0;
     let lastFrameTime = performance.now();
     let lastReportedSegment = -1;
@@ -264,6 +280,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       model.castShadow = true;
       model.receiveShadow = true;
       scene.add(model);
+      modelLoaded = true;
 
       if (formingPreview) {
         const partSize = bounds?.getSize(new THREE.Vector3()) ?? new THREE.Vector3(viewSize, viewSize * 0.1, viewSize * 0.6);
@@ -578,6 +595,55 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         markerGroup.add(pathLines);
       }
 
+      if (simulation && spatialDefects?.regions.length) {
+        const pointPositions = spatialDefects.samples.flatMap((sample) => [
+          sample.position.x - modelCenter.x,
+          sample.position.y - modelCenter.y,
+          sample.position.z - modelCenter.z,
+        ]);
+        const pointColors = spatialDefects.samples.flatMap((sample) => {
+          const color = new THREE.Color(sample.kind === "overcut" ? 0xff3b30 : 0xffb020);
+          return [color.r, color.g, color.b];
+        });
+        if (pointPositions.length) {
+          const pointGeometry = new THREE.BufferGeometry();
+          pointGeometry.setAttribute("position", new THREE.Float32BufferAttribute(pointPositions, 3));
+          pointGeometry.setAttribute("color", new THREE.Float32BufferAttribute(pointColors, 3));
+          defectPointCloud = new THREE.Points(
+            pointGeometry,
+            new THREE.PointsMaterial({
+              size: Math.max(viewSize * 0.018, 1.5), vertexColors: true,
+              transparent: true, opacity: 0.82, depthTest: false, sizeAttenuation: true,
+            }),
+          );
+          defectPointCloud.renderOrder = 18;
+          markerGroup.add(defectPointCloud);
+        }
+        for (const region of spatialDefects.regions) {
+          const size = new THREE.Vector3(
+            Math.max(region.bounds.maximum.x - region.bounds.minimum.x, viewSize * 0.008),
+            Math.max(region.bounds.maximum.y - region.bounds.minimum.y, viewSize * 0.008),
+            Math.max(region.bounds.maximum.z - region.bounds.minimum.z, viewSize * 0.008),
+          );
+          const regionMesh = new THREE.Mesh(
+            new THREE.BoxGeometry(size.x, size.y, size.z),
+            new THREE.MeshBasicMaterial({
+              color: region.kind === "overcut" ? 0xff3b30 : 0xffb020,
+              transparent: true, opacity: 0.2, wireframe: true, depthTest: false,
+            }),
+          );
+          regionMesh.position.set(
+            (region.bounds.minimum.x + region.bounds.maximum.x) / 2 - modelCenter.x,
+            (region.bounds.minimum.y + region.bounds.maximum.y) / 2 - modelCenter.y,
+            (region.bounds.minimum.z + region.bounds.maximum.z) / 2 - modelCenter.z,
+          );
+          regionMesh.userData.defectRegion = region;
+          regionMesh.renderOrder = 19;
+          markerGroup.add(regionMesh);
+          defectRegionMeshes.push(regionMesh);
+        }
+      }
+
       for (const feature of simulation ? [] : features) {
         let markerGeometry: THREE.BufferGeometry;
         let axisValue;
@@ -642,8 +708,6 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         let maxX = Number.NEGATIVE_INFINITY;
         let minY = Number.POSITIVE_INFINITY;
         let maxY = Number.NEGATIVE_INFINITY;
-        let minDepth = Number.POSITIVE_INFINITY;
-        let maxDepth = Number.NEGATIVE_INFINITY;
         const positions = modelPositions.array as ArrayLike<number>;
         for (let index = 0; index < positions.length; index += 3) {
           const x = positions[index];
@@ -651,22 +715,22 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           const z = positions[index + 2];
           const projectedX = x * right.x + y * right.y + z * right.z;
           const projectedY = x * screenUp.x + y * screenUp.y + z * screenUp.z;
-          const projectedDepth = x * forward.x + y * forward.y + z * forward.z;
           minX = Math.min(minX, projectedX);
           maxX = Math.max(maxX, projectedX);
           minY = Math.min(minY, projectedY);
           maxY = Math.max(maxY, projectedY);
-          minDepth = Math.min(minDepth, projectedDepth);
-          maxDepth = Math.max(maxDepth, projectedDepth);
         }
         const halfWidth = (maxX - minX) / 2;
         const halfHeight = (maxY - minY) / 2;
-        viewHeight = Math.max(halfHeight * 2, halfWidth * 2 / Math.max(viewAspect, 0.1)) / 0.82;
+        // Leave enough breathing room on first display. A tighter fit makes
+        // large or elongated parts look cropped even when they technically fit.
+        viewHeight = Math.max(halfHeight * 2, halfWidth * 2 / Math.max(viewAspect, 0.1)) / 0.7;
         const radius = viewSize / 2;
         const distance = viewSize * 2.2;
-        const target = right.clone().multiplyScalar((minX + maxX) / 2)
-          .add(screenUp.clone().multiplyScalar((minY + maxY) / 2))
-          .add(forward.clone().multiplyScalar((minDepth + maxDepth) / 2));
+        // The STL has already been translated by its bounding-box center.
+        // Using the projected silhouette midpoint here shifts asymmetric parts
+        // toward a long edge; the origin is the stable visual pivot instead.
+        const target = new THREE.Vector3(0, 0, 0);
         controls.target.copy(target);
         camera.position.copy(target).add(direction.multiplyScalar(distance));
         camera.zoom = 1;
@@ -699,7 +763,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         setTrailVisible: (visible) => { if (trailPath) trailPath.visible = visible; },
       };
       const savedCamera = cameraStateRef.current;
-      if (savedCamera) {
+      if (savedCamera?.modelUrl === modelUrl) {
         camera.position.copy(savedCamera.position);
         camera.zoom = savedCamera.zoom;
         controls.target.copy(savedCamera.target);
@@ -712,15 +776,46 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
-    const pickFeature = (event: PointerEvent) => {
+    let pointerDownPosition: { x: number; y: number } | null = null;
+    const setPointerFromEvent = (event: PointerEvent) => {
       const rectangle = renderer.domElement.getBoundingClientRect();
       pointer.x = ((event.clientX - rectangle.left) / rectangle.width) * 2 - 1;
       pointer.y = -((event.clientY - rectangle.top) / rectangle.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
+    };
+    const focusRotationAtPointer = (event: PointerEvent) => {
+      pointerDownPosition = { x: event.clientX, y: event.clientY };
+      if (event.button !== 0) return;
+      setPointerFromEvent(event);
+      const rotationSurfaces = [formingStock, camoticsMesh, simulationMesh, simulationLowerMesh, simulationWalls, model]
+        .filter((surface): surface is THREE.Mesh => Boolean(surface?.visible));
+      const hit = raycaster.intersectObjects(rotationSurfaces, false)[0];
+      if (!hit) return;
+      controls.target.copy(hit.point);
+      controls.update();
+    };
+    const pickFeature = (event: PointerEvent) => {
+      if (event.button !== 0 || !pointerDownPosition) return;
+      const pointerTravel = Math.hypot(event.clientX - pointerDownPosition.x, event.clientY - pointerDownPosition.y);
+      pointerDownPosition = null;
+      if (pointerTravel > 4) return;
+      setPointerFromEvent(event);
+      const defectHit = raycaster.intersectObjects(defectRegionMeshes, false)[0];
+      const defectRegion = defectHit?.object.userData.defectRegion as SpatialDefectRegion | undefined;
+      if (defectRegion) {
+        setActiveDefect(defectRegion);
+        onSelectDefectRef.current?.(defectRegion);
+        for (const mesh of defectRegionMeshes) {
+          const material = mesh.material as THREE.MeshBasicMaterial;
+          material.opacity = mesh.userData.defectRegion.id === defectRegion.id ? 0.58 : 0.12;
+        }
+        return;
+      }
       const hit = raycaster.intersectObjects(Array.from(markersRef.current.values()), false)[0];
       const featureId = hit?.object.userData.featureId as string | undefined;
       if (featureId) onSelectRef.current(featureId);
     };
+    renderer.domElement.addEventListener("pointerdown", focusRotationAtPointer, true);
     renderer.domElement.addEventListener("pointerup", pickFeature);
 
     const segmentWeights = toolpathSegments.map((segment) => {
@@ -1067,6 +1162,12 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       for (const fixture of fixtureMeshes) {
         fixture.mesh.visible = !fixture.setupId || !segment.setup_id || fixture.setupId === segment.setup_id;
       }
+      defectPointCloud?.geometry.dispose();
+      (defectPointCloud?.material as THREE.Material | undefined)?.dispose();
+      for (const mesh of defectRegionMeshes) {
+        mesh.geometry.dispose();
+        (mesh.material as THREE.Material).dispose();
+      }
       const startWeight = cumulativeWeights[segmentIndex];
       const ratio = Math.min(1, Math.max(0, (targetWeight - startWeight) / segmentWeights[segmentIndex]));
       const tip = new THREE.Vector3(
@@ -1230,9 +1331,17 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     rebuildMaterialWalls();
     animate(performance.now());
     return () => {
-      cameraStateRef.current = { position: camera.position.clone(), target: controls.target.clone(), zoom: camera.zoom };
+      if (modelLoaded) {
+        cameraStateRef.current = {
+          modelUrl,
+          position: camera.position.clone(),
+          target: controls.target.clone(),
+          zoom: camera.zoom,
+        };
+      }
       cancelAnimationFrame(animation);
       observer.disconnect();
+      renderer.domElement.removeEventListener("pointerdown", focusRotationAtPointer, true);
       renderer.domElement.removeEventListener("pointerup", pickFeature);
       controls.dispose();
       renderer.dispose();
@@ -1290,7 +1399,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       viewApiRef.current = null;
       host.removeChild(renderer.domElement);
     };
-  }, [activeOperationId, animateToolpath, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, modelUrl, operationTools, profileBoundaries, simulation, toolpathSegments, topologyEdges]);
+  }, [activeOperationId, animateToolpath, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, modelUrl, operationTools, profileBoundaries, simulation, spatialDefects, toolpathSegments, topologyEdges]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
   const activeFormingStage = formingPreview?.stages.length
@@ -1320,11 +1429,22 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const playbackChapters = formingPreview
     ? formingPreview.stages.map((stage) => stage.operation_id)
     : Array.from(new Set(toolpathSegments.map((segment) => segment.operation_id)));
+  const visibleActiveDefect = activeDefect
+    ? spatialDefects?.regions.find((region) => region.id === activeDefect.id) ?? null
+    : null;
 
   return (
     <div className="model-viewer" ref={hostRef}>
       <div className="viewer-badge">{formingPreview ? progress >= 0.999 ? "FORMING · 当前工序终态" : "FORMING · 薄板成形过程" : camoticsSurface ? progress >= 0.999 ? "CAMOTICS · 装夹最终去除结果" : "CAMOTICS 刀路 · 最终结果在 100% 显示" : simulation ? progress >= 0.999 ? simulation.surface.is_cumulative ? "CUMULATIVE · 多装夹累计余料" : "HEIGHT-FIELD · 加工后毛坯" : progress > 0 ? simulation.surface.is_cumulative ? "CUMULATIVE · 累计材料去除" : "HEIGHT-FIELD · 动态材料去除" : playbackMode === "single" && initialToolpathSegments.length ? "SINGLE STEP · 前序余料已就绪" : "HEIGHT-FIELD · 完整毛坯" : "OCCT MODEL · 空间特征可点击"}</div>
       <div className="viewer-legend">{formingPreview ? <>原始板料 <i className="selected" />落料件 → 预成形 → 终成形样品</> : <><i />快速移动 <i className="selected" />切削轨迹 · 已完成轨迹自动淡化</>}</div>
+      {spatialDefects && spatialDefects.regions.length > 0 && <div className="defect-legend"><span><i className="overcut" />过切</span><span><i className="rest" />残料</span><small>点击色块定位责任工序</small></div>}
+      {visibleActiveDefect && <div className={`defect-focus-card ${visibleActiveDefect.kind}`}>
+        <button aria-label="关闭缺陷详情" onClick={() => setActiveDefect(null)}>×</button>
+        <small>{visibleActiveDefect.id} · {visibleActiveDefect.kind === "overcut" ? "过切区域" : "残料区域"}</small>
+        <strong>{visibleActiveDefect.volume_mm3.toFixed(2)} mm³</strong>
+        <span>最大偏差 {visibleActiveDefect.max_deviation_mm.toFixed(2)} mm</span>
+        {visibleActiveDefect.attribution[0] && <em>候选工序 {visibleActiveDefect.attribution[0].operation_id} · 置信度 {Math.round(visibleActiveDefect.attribution[0].confidence * 100)}%</em>}
+      </div>}
       {animateToolpath && activeMotion && <div className="simulation-stage-card">
         <span>{activeMotion.setup} · {activeMotion.operation}</span>
         <strong>{activeTool?.name ?? "加工工序"}</strong>

@@ -156,4 +156,24 @@ def test_closed_profile_removes_detached_outside_scrap() -> None:
     }, maximum_grid_size=40)
 
     assert result["metrics"]["removed_percent"] > 50
-    assert any("外侧废料" in warning for warning in result["warnings"])
+    assert any("轮廓切透" in warning for warning in result["warnings"])
+
+
+def test_internal_profile_boundary_removes_detached_slug() -> None:
+    analysis = simple_analysis()
+    plan = build_process_plan(analysis, "6061-T6", "VMC")
+    operation = plan.setups[0].operations[0]
+    result = simulate_material_removal(analysis, plan, {
+        "preview_segments": [],
+        "profile_boundaries": [{
+            "operation_id": operation.id,
+            "work_axis": {"x": 0, "y": 0, "z": 1},
+            "remove_side": "inside",
+            "points": [
+                {"x": 3, "y": 3}, {"x": 7, "y": 3},
+                {"x": 7, "y": 7}, {"x": 3, "y": 7}, {"x": 3, "y": 3},
+            ],
+        }],
+    }, maximum_grid_size=80)
+
+    assert 5 < result["metrics"]["removed_percent"] < 15

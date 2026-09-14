@@ -6,7 +6,9 @@ from math import radians, sqrt, tan
 from .catalogs import apply_cutting_parameters, resolve_machine, resolve_material
 from .coverage import evaluate_plan_coverage
 from .collision import build_safety_configuration
-from .models import GeometryAnalysis, Operation, ProcessPlan, SafetyConfiguration, Setup, Tool, Vec3
+from .models import GeometryAnalysis, ManufacturingRequirements, Operation, ProcessPlan, SafetyConfiguration, Setup, Tool, Vec3
+from .manufacturing_knowledge import assess_plan_knowledge
+from .route_planner import build_manufacturing_route
 from .operation_library import create_operation_instance
 
 
@@ -267,6 +269,7 @@ def build_process_plan(
     material: str,
     machine: str,
     safety: SafetyConfiguration | None = None,
+    requirements: ManufacturingRequirements | None = None,
 ) -> ProcessPlan:
     material_profile = resolve_material(material)
     machine_profile = resolve_machine(machine)
@@ -293,7 +296,20 @@ def build_process_plan(
     for feature in usable_prismatic:
         prismatic_by_direction[_axis_key(feature.access_direction)].append(feature)
 
-    direction_keys = set(holes_by_direction) | set(prismatic_by_direction)
+    usable_internal_profiles = [
+        feature for feature in analysis.internal_profile_features
+        if feature.review_state == "accepted"
+        and feature.machining_kind != "unknown"
+        and feature.confidence >= 0.7
+    ]
+    internal_profiles_by_direction: dict[tuple[int, int, int], list] = defaultdict(list)
+    for feature in usable_internal_profiles:
+        internal_profiles_by_direction[_axis_key(feature.access_direction)].append(feature)
+
+    direction_keys = (
+        set(holes_by_direction) | set(prismatic_by_direction)
+        | set(internal_profiles_by_direction)
+    )
 
     bbox_volume = max(bounds.size.x * bounds.size.y * bounds.size.z, 1e-6)
     part_volume = float(analysis.measurements.get("volume", bbox_volume))
@@ -322,7 +338,10 @@ def build_process_plan(
         plan = _sheet_forming_plan(
             analysis, material, machine, equivalent_sheet_thickness,
         )
+        plan.manufacturing_requirements = requirements
         plan.coverage = evaluate_plan_coverage(analysis, plan)
+        plan.manufacturing_route = build_manufacturing_route(analysis, plan)
+        plan.knowledge_assessment = assess_plan_knowledge(analysis, plan)
         return plan
     thin_plate = ordered_sizes[0] <= max(3.5, ordered_sizes[1] * 0.12)
     low_fill_profile = fill_ratio <= 0.72 and ordered_sizes[0] <= max(6.0, ordered_sizes[1] * 0.25)
@@ -360,11 +379,14 @@ def build_process_plan(
     needs_surface_machining = needs_outer_profile and nonplanar_face_count > 0
     internal_wire_count = max(0, (profile_plane.wire_count if profile_plane else 1) - 1)
     recognized_profile_holes = len(holes_by_direction[profile_axis])
-    uncovered_internal_profiles = max(0, internal_wire_count - recognized_profile_holes)
+    recognized_internal_profiles = len(internal_profiles_by_direction[profile_axis])
+    uncovered_internal_profiles = max(
+        0, internal_wire_count - recognized_profile_holes - recognized_internal_profiles,
+    )
     blocking_reasons: list[str] = []
     if needs_outer_profile and uncovered_internal_profiles:
         blocking_reasons.extend([
-            f"顶面包含 {internal_wire_count} 个内部轮廓，仅有 {recognized_profile_holes} 个可确认为标准孔。",
+            f"顶面包含 {internal_wire_count} 个内部轮廓，已识别 {recognized_profile_holes} 个标准孔和 {recognized_internal_profiles} 个异形贯通孔。",
             "剩余异形内部轮廓尚未覆盖，已阻止生成不完整 CAM。",
         ])
     automation_status = "unsupported" if blocking_reasons else "review" if needs_outer_profile else "ready"
@@ -389,6 +411,7 @@ def build_process_plan(
     for setup_index, axis_key in enumerate(direction_groups, start=1):
         holes = holes_by_direction[axis_key]
         prismatic_features = prismatic_by_direction[axis_key]
+        internal_profiles = internal_profiles_by_direction[axis_key]
         work_axis = _vec_from_key(axis_key)
         datum = _datum_for_axis(analysis, work_axis)
         operations: list[Operation] = []
@@ -514,6 +537,91 @@ def build_process_plan(
                 for feature in features
             )
 
+        # Through profiles release comparatively large slugs.  Machine them
+        # only after the target envelope and holes are complete, while the
+        # untouched outer stock still provides maximum rigidity.
+        for feature in sorted(internal_profiles, key=lambda item: (-item.perimeter, item.id)):
+            if feature.machining_kind == "engraving":
+                sequence += 10
+                operations.append(create_operation_instance(
+                    id=f"OP{sequence}", sequence=sequence, type="engraving",
+                    name=f"浅雕刻 {feature.length:.1f}×{feature.width:.1f} 深 {feature.depth:.2f}",
+                    feature_ids=[feature.id],
+                    tool=Tool(
+                        id="CM-6-90", name="Ø6 90°雕刻刀", kind="chamfer_mill",
+                        diameter_mm=6, flute_length_mm=8, stickout_mm=20,
+                        holder_diameter_mm=20,
+                    ),
+                    parameters={"depth_mm": round(feature.depth, 3)},
+                    rationale=[
+                        f"轮廓下方存在匹配底面 {feature.bottom_face_id}，确认不是贯通孔",
+                        "深度和槽宽属于浅表标记范围，采用无半径补偿的轮廓雕刻",
+                    ], confidence=feature.confidence, status="proposed",
+                ))
+                cutting_distance += feature.perimeter
+                continue
+
+            if feature.machining_kind == "blind_pocket":
+                tool = _tool_for_prismatic(feature.width)
+                for operation_type, allowance, suffix in (
+                    ("pocket_roughing", 0.15, "分层粗加工"),
+                    ("pocket_finishing", 0.0, "侧壁与底面精加工"),
+                ):
+                    sequence += 10
+                    operations.append(create_operation_instance(
+                        id=f"OP{sequence}", sequence=sequence, type=operation_type,
+                        name=f"异形盲型腔{suffix}", feature_ids=[feature.id],
+                        tool=tool.model_copy(deep=True),
+                        parameters={
+                            "depth_mm": round(feature.depth, 3),
+                            "step_down_mm": round(min(tool.diameter_mm * 0.35, 2.0), 2),
+                            "step_over_percent": 40,
+                            "wall_allowance_mm": allowance,
+                            "floor_allowance_mm": 0.1 if allowance else 0.0,
+                            "spring_pass": allowance == 0,
+                        },
+                        rationale=[
+                            f"轮廓与底面 {feature.bottom_face_id} 配对，确认盲型腔深度 {feature.depth:.3f} mm",
+                            "使用真实 STEP 底面边界清除材料",
+                        ], confidence=feature.confidence, status="proposed",
+                    ))
+                cutting_distance += feature.length * feature.width * feature.depth / max(tool.diameter_mm**2, 1)
+                continue
+
+            tool = _tool_for_prismatic(feature.width)
+            cutting_depth = feature.depth + 0.2
+            sequence += 10
+            operations.append(create_operation_instance(
+                id=f"OP{sequence}", sequence=sequence, type="internal_profile_roughing",
+                name=f"异形贯通孔分层粗铣 {feature.length:.1f}×{feature.width:.1f}",
+                feature_ids=[feature.id], tool=tool.model_copy(deep=True),
+                parameters={
+                    "depth_mm": round(cutting_depth, 3),
+                    "step_down_mm": round(min(tool.diameter_mm * 0.4, 2.0), 2),
+                    "radial_allowance_mm": 0.2,
+                },
+                rationale=[
+                    f"相对外表面的匹配轮廓证明该特征沿 {_axis_label(axis_key)} 方向贯通",
+                    "主体曲面和孔加工完成后再切穿内部废料，外部毛坯仍保持装夹刚性",
+                    "分层粗铣保留 0.20 mm 侧壁余量",
+                ], confidence=feature.confidence, status="proposed",
+            ))
+            sequence += 10
+            operations.append(create_operation_instance(
+                id=f"OP{sequence}", sequence=sequence, type="internal_profile_finishing",
+                name="异形贯通孔侧壁精铣",
+                feature_ids=[feature.id], tool=tool.model_copy(deep=True),
+                parameters={
+                    "depth_mm": round(cutting_depth, 3),
+                    "step_down_mm": round(min(tool.diameter_mm * 0.5, 2.5), 2),
+                    "radial_allowance_mm": 0.0,
+                    "spring_pass": True,
+                },
+                rationale=["粗铣后沿真实 STEP 内轮廓完成尺寸侧壁与光刀加工"],
+                confidence=max(0.5, feature.confidence - 0.03), status="proposed",
+            ))
+            cutting_distance += feature.perimeter * max(2, cutting_depth / max(tool.diameter_mm * 0.4, 0.1))
+
         if needs_outer_profile and axis_key == profile_axis and automation_status != "unsupported":
             profile_thickness = _extent_along_axis(bounds, axis_key)
             profile_tool = Tool(
@@ -636,6 +744,7 @@ def build_process_plan(
     review = sum(feature.review_state == "review" for feature in analysis.cylindrical_features if feature.kind == "hole")
     prismatic_review = sum(feature.review_state == "review" for feature in analysis.prismatic_features)
     prismatic_excluded = sum(feature.review_state == "excluded" for feature in analysis.prismatic_features)
+    internal_profile_review = sum(feature.review_state == "review" for feature in analysis.internal_profile_features)
     warnings = [
         *blocking_reasons,
         "碰撞预检采用刀具/刀柄圆柱包络与平口钳禁入区，结果仍需制造工程师复核。",
@@ -643,7 +752,8 @@ def build_process_plan(
         *parameter_warnings,
     ]
     source_solids = int(analysis.topology.get("source_solids", 1))
-    if source_solids > 1:
+    selection_confirmed = bool(analysis.topology.get("selection_confirmed", 0))
+    if source_solids > 1 and not selection_confirmed:
         warnings.append(f"STEP 中包含 {source_solids} 个实体，当前自动选择体积最大的实体作为目标零件，请人工确认主体选择。")
     if review:
         warnings.append(f"有 {review} 个孔特征处于待复核状态，相关工序已标记警告。")
@@ -651,6 +761,8 @@ def build_process_plan(
         warnings.append(f"已从自动规划中排除 {excluded} 个非闭合或短圆柱伪特征候选。")
     if prismatic_review:
         warnings.append(f"有 {prismatic_review} 个型腔/槽特征处于待复核状态，需确认开放边界和刀具可达性。")
+    if internal_profile_review:
+        warnings.append(f"有 {internal_profile_review} 个单面异形内部轮廓待复核，尚未自动生成切穿刀路。")
     if prismatic_excluded:
         warnings.append(f"已从自动规划中排除 {prismatic_excluded} 个型腔/槽候选。")
     if needs_outer_profile and automation_status == "review":
@@ -714,6 +826,13 @@ def build_process_plan(
         estimated_minutes=estimated_minutes,
         automation_status=automation_status,
         blocking_reasons=blocking_reasons,
+        manufacturing_requirements=requirements,
     )
     plan.coverage = evaluate_plan_coverage(analysis, plan)
+    plan.manufacturing_route = build_manufacturing_route(analysis, plan)
+    plan.knowledge_assessment = assess_plan_knowledge(analysis, plan)
+    if plan.automation_status == "ready" and not plan.knowledge_assessment.production_ready:
+        plan.automation_status = "review"
+        if "工序知识库校验尚需工程师确认" not in plan.warnings:
+            plan.warnings.append("工序知识库校验尚需工程师确认")
     return plan

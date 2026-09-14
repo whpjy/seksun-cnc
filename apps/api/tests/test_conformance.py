@@ -52,8 +52,18 @@ def test_spatial_conformance_rejects_equal_volume_in_wrong_place(tmp_path) -> No
     surface["heights"] = [0.5] * 121
     surface["lower_heights"] = [-0.5] * 121
 
-    result = compare_stock_to_target_mesh(surface, mesh)
+    result = compare_stock_to_target_mesh(surface, mesh, toolpath_segments=[{
+        "operation_id": "OP20", "motion": "cut",
+        "x1": 0, "y1": 0.5, "z1": 0.5,
+        "x2": 1, "y2": 0.5, "z2": 0.5,
+    }])
 
     assert result["status"] == "failed"
     assert result["target_overlap_percent"] == 50
     assert result["missing_target_volume_mm3"] == result["excess_stock_volume_mm3"]
+    assert {item["kind"] for item in result["defect_regions"]} == {"overcut", "excess_stock"}
+    assert result["defect_samples"]
+    overcut = next(item for item in result["defect_regions"] if item["kind"] == "overcut")
+    assert overcut["attribution"][0]["operation_id"] == "OP20"
+    assert overcut["attribution"][0]["method"] == "nearest_cut_segment"
+    assert overcut["bounds"]["minimum"]["z"] >= 0.5

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -48,6 +48,30 @@ class PrismaticFeature(BaseModel):
     review_reasons: list[str] = Field(default_factory=list)
 
 
+class InternalProfileFeature(BaseModel):
+    id: str
+    kind: Literal["internal_profile"] = "internal_profile"
+    source_face_id: str
+    source_face_index: int | None = None
+    wire_index: int = Field(ge=1)
+    center: Vec3
+    bounds: Bounds
+    access_direction: Vec3
+    edge_count: int = 0
+    perimeter: float = Field(default=0, ge=0)
+    circular: bool = False
+    paired_profile_id: str | None = None
+    bottom_face_id: str | None = None
+    end_type: Literal["through", "blind", "unknown"] = "unknown"
+    machining_kind: Literal["through_profile", "blind_pocket", "engraving", "unknown"] = "unknown"
+    depth: float = Field(default=0, ge=0)
+    length: float = Field(default=0, ge=0)
+    width: float = Field(default=0, ge=0)
+    confidence: float = Field(default=0.6, ge=0, le=1)
+    review_state: Literal["accepted", "review", "excluded"] = "review"
+    review_reasons: list[str] = Field(default_factory=list)
+
+
 class CylindricalFeature(BaseModel):
     id: str
     kind: Literal["hole", "boss", "cylinder"]
@@ -66,6 +90,15 @@ class CylindricalFeature(BaseModel):
     review_reasons: list[str] = Field(default_factory=list)
 
 
+class SolidCandidate(BaseModel):
+    index: int = Field(ge=1)
+    volume: float = Field(ge=0)
+    surface_area: float = Field(ge=0)
+    center: Vec3
+    bounds: Bounds
+    selected: bool = False
+
+
 class GeometryAnalysis(BaseModel):
     schema_version: str
     source_file: str
@@ -74,6 +107,8 @@ class GeometryAnalysis(BaseModel):
     planar_features: list[PlanarFeature]
     cylindrical_features: list[CylindricalFeature]
     prismatic_features: list[PrismaticFeature] = Field(default_factory=list)
+    internal_profile_features: list[InternalProfileFeature] = Field(default_factory=list)
+    solid_candidates: list[SolidCandidate] = Field(default_factory=list)
     visual_edges: list[list[Vec3]] = Field(default_factory=list)
 
 
@@ -143,6 +178,7 @@ class Operation(BaseModel):
     source: Literal["manual", "automatic", "template", "recommendation"] = "automatic"
     enabled: bool = True
     generation_state: Literal["dirty", "generating", "generated", "failed"] = "dirty"
+    manufacturing_code: str | None = None
 
 
 class Setup(BaseModel):
@@ -178,6 +214,91 @@ class ManufacturingCoverage(BaseModel):
     capability_gaps: list[str] = Field(default_factory=list)
 
 
+class ProcessKnowledgeAssessment(BaseModel):
+    schema_version: str = "1.0.0"
+    catalog_version: str
+    catalog_process_count: int
+    status: Literal["complete", "review", "incomplete"]
+    production_ready: bool = False
+    route_process_codes: list[str] = Field(default_factory=list)
+    operation_count: int = 0
+    mapped_operation_count: int = 0
+    executable_operation_count: int = 0
+    unmapped_operation_ids: list[str] = Field(default_factory=list)
+    nonvalidated_operation_ids: list[str] = Field(default_factory=list)
+    missing_information: list[str] = Field(default_factory=list)
+    required_engineer_decisions: list[str] = Field(default_factory=list)
+
+
+class ManufacturingRouteStep(BaseModel):
+    sequence: int
+    process_code: str
+    name: str
+    phase: Literal[
+        "incoming", "blank", "roughing", "stabilization", "semi_finishing",
+        "finishing", "special", "surface_treatment", "inspection", "release",
+    ]
+    selection: Literal["required", "conditional"]
+    execution_mode: Literal["cam", "external", "manual", "inspection"]
+    execution_state: Literal["partially_executable", "reference_only"]
+    cam_operation_ids: list[str] = Field(default_factory=list)
+    source_operation_ids: list[str] = Field(default_factory=list)
+    source_feature_ids: list[str] = Field(default_factory=list)
+    prerequisite_codes: list[str] = Field(default_factory=list)
+    reason: str
+    confidence: float = Field(ge=0, le=1)
+    blocking_missing_information: list[str] = Field(default_factory=list)
+
+
+class ManufacturingRouteProposal(BaseModel):
+    schema_version: str = "1.0.0"
+    catalog_version: str
+    status: Literal["complete", "review", "incomplete"]
+    part_family: Literal["prismatic", "rotational", "freeform", "sheet_forming", "mixed"]
+    planning_basis: list[str] = Field(default_factory=list)
+    steps: list[ManufacturingRouteStep] = Field(default_factory=list)
+    capability_gaps: list[str] = Field(default_factory=list)
+    missing_information: list[str] = Field(default_factory=list)
+    alternative_process_codes: list[str] = Field(default_factory=list)
+
+
+class ManufacturingRequirement(BaseModel):
+    id: str
+    type: str
+    subtype: str | None = None
+    nominal: float | None = None
+    minimum: float | None = None
+    maximum: float | None = None
+    tolerance_upper: float | None = None
+    tolerance_lower: float | None = None
+    unit: str = "mm"
+    quantity: int = Field(default=1, ge=1)
+    parameter: str | None = None
+    cad_feature_ids: list[str] = Field(default_factory=list)
+    mapping_status: Literal["matched", "ambiguous", "unmapped", "not_applicable"]
+    verification_status: str
+    confidence: float = Field(default=0, ge=0, le=1)
+    raw_text: str | None = None
+    source: dict[str, Any] = Field(default_factory=dict)
+
+
+class ManufacturingRequirements(BaseModel):
+    schema_version: str = "1.0.0"
+    source_system: str
+    source_schema_version: str | None = None
+    drawing_number: str | None = None
+    revision: str | None = None
+    status: Literal["complete", "review", "incomplete"]
+    requirements: list[ManufacturingRequirement] = Field(default_factory=list)
+    unresolved_requirement_ids: list[str] = Field(default_factory=list)
+    summary: dict[str, int] = Field(default_factory=dict)
+
+
+class ManufacturingRequirementsImportRequest(BaseModel):
+    source_system: str = "seksun-meas"
+    specification: dict[str, Any]
+
+
 class ProcessPlan(BaseModel):
     schema_version: str = "0.8.0"
     process_kind: Literal["subtractive", "sheet_forming"] = "subtractive"
@@ -195,6 +316,9 @@ class ProcessPlan(BaseModel):
     automation_status: Literal["ready", "review", "unsupported"] = "ready"
     blocking_reasons: list[str] = Field(default_factory=list)
     coverage: ManufacturingCoverage | None = None
+    manufacturing_requirements: ManufacturingRequirements | None = None
+    manufacturing_route: ManufacturingRouteProposal | None = None
+    knowledge_assessment: ProcessKnowledgeAssessment | None = None
 
 
 class JobResponse(BaseModel):
@@ -207,11 +331,18 @@ class JobResponse(BaseModel):
     analysis: GeometryAnalysis | None = None
     plan: ProcessPlan | None = None
     model_url: str | None = None
+    drawing_filename: str | None = None
+    drawing_url: str | None = None
+    measurement_job_id: str | None = None
     error: str | None = None
 
 
 class FeatureReviewRequest(BaseModel):
     review_state: Literal["accepted", "review", "excluded"]
+
+
+class SolidSelectionRequest(BaseModel):
+    solid_index: int = Field(ge=1)
 
 
 class SafetyConfigurationRequest(BaseModel):

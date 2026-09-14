@@ -4,7 +4,10 @@ from dataclasses import dataclass, field
 from itertools import product
 from math import sqrt
 
-from .models import Bounds, CylindricalFeature, GeometryAnalysis, PrismaticFeature, Vec3
+from .models import (
+    Bounds, CylindricalFeature, GeometryAnalysis, InternalProfileFeature,
+    PrismaticFeature, Vec3,
+)
 
 
 AXIS_PARALLEL_TOLERANCE = 0.9995
@@ -300,6 +303,129 @@ def _recognize_prismatic_features(analysis: GeometryAnalysis) -> list[PrismaticF
     return result
 
 
+def _recognize_internal_profiles(analysis: GeometryAnalysis) -> list[InternalProfileFeature]:
+    raw_profiles = [item for item in analysis.internal_profile_features if not item.circular]
+    result: list[InternalProfileFeature] = []
+    used: set[str] = set()
+
+    def transverse_signature(feature: InternalProfileFeature, axis_index: int):
+        indices = [index for index in range(3) if index != axis_index]
+        center = tuple(_component(feature.center, index) for index in indices)
+        size = tuple(_component(feature.bounds.size, index) for index in indices)
+        return center, size
+
+    def matching_bottom_plane(
+        feature: InternalProfileFeature,
+        axis_index: int,
+        signed_component: float,
+    ):
+        center, size = transverse_signature(feature, axis_index)
+        transverse_indices = [index for index in range(3) if index != axis_index]
+        tolerance = max(0.05, max(size) * 0.03)
+        matches = []
+        for plane in analysis.planar_features:
+            if plane.id == feature.source_face_id or plane.bounds is None:
+                continue
+            plane_axis, plane_component = _dominant_axis(plane.normal)
+            if plane_axis != axis_index or abs(plane_component) < PLANAR_AXIS_TOLERANCE:
+                continue
+            depth = (
+                _component(feature.center, axis_index) - _component(plane.center, axis_index)
+            ) * (1 if signed_component >= 0 else -1)
+            if depth <= 0.005:
+                continue
+            plane_center = tuple(_component(plane.center, index) for index in transverse_indices)
+            plane_size = tuple(_component(plane.bounds.size, index) for index in transverse_indices)
+            center_error = sqrt(sum((center[index] - plane_center[index]) ** 2 for index in range(2)))
+            size_error = max(abs(size[index] - plane_size[index]) for index in range(2))
+            if center_error <= tolerance and size_error <= tolerance:
+                matches.append((depth + center_error + size_error, depth, plane))
+        return min(matches, key=lambda item: item[0])[1:] if matches else None
+
+    for feature in raw_profiles:
+        if feature.id in used:
+            continue
+        axis_index, signed_component = _dominant_axis(feature.access_direction)
+        if abs(signed_component) < PLANAR_AXIS_TOLERANCE:
+            feature.review_state = "review"
+            feature.review_reasons = ["内部轮廓所在平面不是标准正交加工方向，需人工确认可达性"]
+            result.append(feature)
+            used.add(feature.id)
+            continue
+
+        center, size = transverse_signature(feature, axis_index)
+        tolerance = max(0.15, max(size) * 0.01)
+        matches: list[tuple[float, InternalProfileFeature]] = []
+        for candidate in raw_profiles:
+            if candidate.id == feature.id or candidate.id in used:
+                continue
+            candidate_axis, candidate_sign = _dominant_axis(candidate.access_direction)
+            if candidate_axis != axis_index or signed_component * candidate_sign >= 0:
+                continue
+            other_center, other_size = transverse_signature(candidate, axis_index)
+            center_error = sqrt(sum((center[index] - other_center[index]) ** 2 for index in range(2)))
+            size_error = max(abs(size[index] - other_size[index]) for index in range(2))
+            perimeter_error = abs(feature.perimeter - candidate.perimeter)
+            if center_error <= tolerance and size_error <= tolerance and perimeter_error <= max(0.3, feature.perimeter * 0.01):
+                matches.append((center_error + size_error + perimeter_error, candidate))
+
+        paired = min(matches, key=lambda item: item[0])[1] if matches else None
+        selected = feature
+        if paired and signed_component < 0:
+            selected = paired
+        selected = selected.model_copy(deep=True)
+        transverse_sizes = [value for index, value in enumerate(
+            (selected.bounds.size.x, selected.bounds.size.y, selected.bounds.size.z)
+        ) if index != axis_index]
+        selected.length = max(transverse_sizes)
+        selected.width = min(transverse_sizes)
+        if paired:
+            selected.paired_profile_id = paired.id if selected.id == feature.id else feature.id
+            selected.end_type = "through"
+            selected.machining_kind = "through_profile"
+            selected.depth = abs(
+                _component(feature.center, axis_index) - _component(paired.center, axis_index)
+            )
+            selected.confidence = 0.9
+            selected.review_state = "accepted"
+            selected.review_reasons = [
+                "在零件相对外表面检测到中心、尺寸和周长一致的非圆闭合轮廓",
+                f"判定为贯通异形孔，切穿深度 {selected.depth:.2f} mm",
+            ]
+            used.add(paired.id)
+        else:
+            bottom_match = matching_bottom_plane(selected, axis_index, signed_component)
+            if bottom_match:
+                depth, bottom = bottom_match
+                selected.bottom_face_id = bottom.id
+                selected.end_type = "blind"
+                selected.depth = depth
+                selected.machining_kind = (
+                    "engraving" if depth <= 0.3 and selected.width <= 1.0 else "blind_pocket"
+                )
+                selected.confidence = 0.88
+                selected.review_state = "accepted"
+                selected.review_reasons = [
+                    f"内部轮廓下方检测到中心和边界尺寸一致的底面 {bottom.id}",
+                    f"判定为{'浅雕刻' if selected.machining_kind == 'engraving' else '盲型腔'}，深度 {depth:.3f} mm",
+                ]
+                used.add(feature.id)
+                result.append(selected)
+                continue
+            selected.end_type = "unknown"
+            selected.machining_kind = "unknown"
+            selected.depth = 0
+            selected.confidence = 0.55
+            selected.review_state = "review"
+            selected.review_reasons = [
+                "仅在一个外表面检测到非圆闭合轮廓，无法可靠区分盲腔、台阶或贯通孔",
+            ]
+        used.add(feature.id)
+        result.append(selected)
+
+    return result
+
+
 def normalize_manufacturing_features(analysis: GeometryAnalysis) -> GeometryAnalysis:
     groups: list[_CylinderGroup] = []
     for feature in analysis.cylindrical_features:
@@ -321,7 +447,8 @@ def normalize_manufacturing_features(analysis: GeometryAnalysis) -> GeometryAnal
             merged.append(_merged_feature(connected_members, group.axis, analysis, next_index))
             next_index += 1
 
-    analysis.schema_version = "0.4.0"
+    analysis.schema_version = "0.5.0"
     analysis.cylindrical_features = merged
     analysis.prismatic_features = _recognize_prismatic_features(analysis)
+    analysis.internal_profile_features = _recognize_internal_profiles(analysis)
     return analysis

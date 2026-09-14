@@ -18,13 +18,19 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from .models import (
     FeatureReviewRequest, GeometryAnalysis, JobResponse, OperationCreateRequest,
-    OperationReorderRequest, OperationUpdateRequest, ProcessPlan, SafetyConfigurationRequest,
+    ManufacturingRequirementsImportRequest, OperationReorderRequest, OperationUpdateRequest,
+    ProcessPlan, SafetyConfigurationRequest,
+    SolidSelectionRequest,
 )
 from .planner import build_process_plan
 from .catalogs import apply_cutting_parameters, catalog_payload, get_tool, resolve_machine, resolve_material
 from .operation_library import (
     create_operation_instance, get_operation_definition, operation_library_payload, validate_parameters,
 )
+from .manufacturing_knowledge import assess_plan_knowledge, get_manufacturing_process, manufacturing_process_payload
+from .route_planner import build_manufacturing_route
+from .requirements_adapter import import_measurement_specification, reconcile_requirement_bindings
+from .measurement_client import MeasurementServiceError, analyze_pdf_step
 from .collision import build_safety_configuration, detect_collisions
 from .conformance import compare_stock_to_target_mesh
 from .preflight import verify_cam
@@ -35,6 +41,7 @@ from .forming import build_forming_preview
 from .qwen import QwenPlanningError, probe_qwen, qwen_config_payload, review_process_plan
 from .benchmarks import example_catalog_payload
 from .coverage import evaluate_plan_coverage
+from .remediation import apply_automatic_remediation, build_remediation_report
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +52,8 @@ CAMOTICS_CMD = os.getenv("CNC_CAMOTICS_CMD", "camsim")
 CAM_ADAPTER_SCRIPT = Path(os.getenv("CNC_CAM_ADAPTER_SCRIPT", APP_ROOT / "cam" / "freecad_adapter.py"))
 MAX_UPLOAD_BYTES = int(os.getenv("CNC_MAX_UPLOAD_MB", "200")) * 1024 * 1024
 PUBLIC_BASE_URL = os.getenv("CNC_PUBLIC_BASE_URL", "").rstrip("/")
+MEAS_API_BASE_URL = os.getenv("CNC_MEAS_API_BASE_URL", "").strip().rstrip("/")
+MEAS_TIMEOUT_SECONDS = max(float(os.getenv("CNC_MEAS_TIMEOUT_SECONDS", "600")), 1.0)
 BENCHMARK_REPORT_PATH = Path(os.getenv(
     "CNC_BENCHMARK_REPORT", STORAGE_ROOT.parent / "benchmark-report.json",
 ))
@@ -183,7 +192,7 @@ def save_job(directory: Path, job: JobResponse) -> None:
 def invalidate_cam_artifacts(directory: Path) -> None:
     for filename in (
         "cam.FCStd", "program.nc", "toolpath.json", "verification.json",
-        "simulation.json", "collision.json", "ai-plan.json",
+        "simulation.json", "collision.json", "remediation.json", "remediation-history.json", "ai-plan.json",
     ):
         (directory / filename).unlink(missing_ok=True)
     for pattern in ("program-*.nc", "camotics-*.stl", "*.camotics"):
@@ -192,12 +201,35 @@ def invalidate_cam_artifacts(directory: Path) -> None:
                 artifact.unlink(missing_ok=True)
 
 
+def run_geometry_analyzer(
+    source_path: Path,
+    analysis_path: Path,
+    model_path: Path,
+    solid_index: int | None = None,
+) -> GeometryAnalysis:
+    command = [ANALYZER_BIN, str(source_path), str(analysis_path), str(model_path)]
+    if solid_index is not None:
+        command.append(str(solid_index))
+    subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    analysis = GeometryAnalysis.model_validate_json(analysis_path.read_text(encoding="utf-8"))
+    analysis = normalize_manufacturing_features(analysis)
+    write_json(analysis_path, analysis.model_dump(mode="json"))
+    return analysis
+
+
 def cam_response(
     job_id: str,
     result: dict[str, object],
     verification: dict[str, object],
     simulation: dict[str, object],
     collision: dict[str, object],
+    remediation: dict[str, object] | None = None,
     stdout: str = "",
 ) -> dict[str, object]:
     return {
@@ -210,6 +242,7 @@ def cam_response(
             "verification": f"/api/v1/jobs/{job_id}/files/verification.json",
             "simulation": f"/api/v1/jobs/{job_id}/files/simulation.json",
             "collision": f"/api/v1/jobs/{job_id}/files/collision.json",
+            "remediation": f"/api/v1/jobs/{job_id}/files/remediation.json",
             "camotics": [
                 f"/api/v1/jobs/{job_id}/files/{surface['file']}"
                 for surface in result.get("camotics_surfaces", [])
@@ -219,6 +252,7 @@ def cam_response(
         "verification": verification,
         "simulation": simulation,
         "collision": collision,
+        "remediation": remediation,
         "stdout": stdout,
         "safety": (
             "Concept forming preview only. No production NC is generated; unfolding, tooling and forming physics require engineer validation."
@@ -263,6 +297,21 @@ def get_operation_library_item(definition_id: str) -> dict[str, object]:
         raise HTTPException(status_code=404, detail=str(error)) from error
 
 
+@app.get("/api/v1/manufacturing-processes")
+def get_manufacturing_processes(
+    family: str | None = None, query: str | None = None, compact: bool = False,
+) -> dict[str, object]:
+    return manufacturing_process_payload(family=family, query=query, compact=compact)
+
+
+@app.get("/api/v1/manufacturing-processes/{code}")
+def get_manufacturing_process_item(code: str) -> dict[str, object]:
+    try:
+        return get_manufacturing_process(code)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
 @app.get("/api/v1/config")
 def get_config() -> dict[str, object]:
     return {
@@ -270,6 +319,10 @@ def get_config() -> dict[str, object]:
         "session_sharing": True,
         "cam_engine": "freecad-cam",
         "simulation_engine": "camotics-with-heightfield-fallback",
+        "drawing_intelligence": {
+            "configured": bool(MEAS_API_BASE_URL),
+            "provider": "seksun-meas",
+        },
         "ai": qwen_config_payload(),
     }
 
@@ -352,6 +405,7 @@ def create_ai_plan_review(job_id: str) -> dict[str, object]:
             ("verification", "verification.json"),
             ("collision", "collision.json"),
             ("simulation", "simulation.json"),
+            ("remediation", "remediation.json"),
         )
         if (payload := _optional_job_json(directory, filename)) is not None
     }
@@ -370,12 +424,16 @@ def create_ai_plan_review(job_id: str) -> dict[str, object]:
 @app.post("/api/v1/jobs", response_model=JobResponse)
 async def create_job(
     step: UploadFile = File(...),
-    material: str = Form("6061-T6 铝合金"),
-    machine: str = Form("VMC850 三轴立式加工中心（FANUC 0i-MF Plus）"),
+    drawing: UploadFile = File(...),
+    material: str = Form("待确认（候选：6061-T6 铝合金）"),
+    machine: str = Form("待确认（候选：VMC850 三轴立式加工中心）"),
 ) -> JobResponse:
     filename = Path(step.filename or "part.step").name
     if Path(filename).suffix.lower() not in {".step", ".stp"}:
         raise HTTPException(status_code=400, detail="Only STEP/STP files are supported")
+    drawing_filename = Path(drawing.filename or "drawing.pdf").name
+    if Path(drawing_filename).suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Only PDF drawings are supported")
 
     job_id = uuid.uuid4().hex
     directory = job_directory(job_id)
@@ -390,6 +448,16 @@ async def create_job(
                 raise HTTPException(status_code=413, detail="STEP file exceeds upload limit")
             output.write(chunk)
 
+    drawing_path = directory / "drawing.pdf"
+    drawing_size = 0
+    with drawing_path.open("wb") as output:
+        while chunk := await drawing.read(1024 * 1024):
+            drawing_size += len(chunk)
+            if drawing_size > MAX_UPLOAD_BYTES:
+                shutil.rmtree(directory, ignore_errors=True)
+                raise HTTPException(status_code=413, detail="PDF drawing exceeds upload limit")
+            output.write(chunk)
+
     job = JobResponse(
         id=job_id,
         status="processing",
@@ -397,23 +465,34 @@ async def create_job(
         created_at=utc_now(),
         material=material,
         machine=machine,
+        drawing_filename=drawing_filename,
+        drawing_url=f"/api/v1/jobs/{job_id}/files/drawing.pdf",
     )
     save_job(directory, job)
 
     analysis_path = directory / "analysis.json"
     model_path = directory / "model.stl"
     try:
-        subprocess.run(
-            [ANALYZER_BIN, str(source_path), str(analysis_path), str(model_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        analysis = GeometryAnalysis.model_validate_json(analysis_path.read_text(encoding="utf-8"))
-        analysis = normalize_manufacturing_features(analysis)
-        write_json(analysis_path, analysis.model_dump(mode="json"))
+        analysis = run_geometry_analyzer(source_path, analysis_path, model_path)
         plan = build_process_plan(analysis, material=material, machine=machine)
+        try:
+            specification, measurement_link = analyze_pdf_step(
+                MEAS_API_BASE_URL, drawing_path, source_path,
+                timeout_seconds=MEAS_TIMEOUT_SECONDS,
+            )
+            requirements = reconcile_requirement_bindings(
+                import_measurement_specification(specification), analysis,
+            )
+            plan = build_process_plan(
+                analysis, material=material, machine=machine,
+                requirements=requirements,
+            )
+            job.measurement_job_id = measurement_link.get("measurement_job_id")
+            write_json(directory / "manufacturing-specification.json", specification)
+            write_json(directory / "manufacturing-requirements.json", requirements.model_dump(mode="json"))
+            write_json(directory / "measurement-link.json", measurement_link)
+        except MeasurementServiceError as error:
+            plan.warnings.append(f"二维图纸识别未完成：{error}")
         write_json(directory / "plan.json", plan.model_dump(mode="json"))
         job.status = "completed"
         job.analysis = analysis
@@ -432,6 +511,55 @@ def get_job(job_id: str) -> JobResponse:
     return load_job(job_id)
 
 
+@app.get("/api/v1/jobs/{job_id}/manufacturing-route")
+def get_job_manufacturing_route(job_id: str) -> dict[str, object]:
+    job = load_job(job_id)
+    if not job.analysis or not job.plan:
+        raise HTTPException(status_code=409, detail="Geometry analysis or process plan is not available")
+    route = build_manufacturing_route(job.analysis, job.plan)
+    plan = job.plan.model_copy(deep=True)
+    plan.manufacturing_route = route
+    assessment = assess_plan_knowledge(job.analysis, plan)
+    return {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "route": route.model_dump(mode="json"),
+        "knowledge_assessment": assessment.model_dump(mode="json"),
+    }
+
+
+@app.post("/api/v1/jobs/{job_id}/manufacturing-requirements", response_model=JobResponse)
+def import_job_manufacturing_requirements(
+    job_id: str, request: ManufacturingRequirementsImportRequest,
+) -> JobResponse:
+    job = load_job(job_id)
+    if not job.analysis or not job.plan:
+        raise HTTPException(status_code=409, detail="Geometry analysis or process plan is not available")
+    try:
+        requirements = reconcile_requirement_bindings(
+            import_measurement_specification(
+                request.specification, source_system=request.source_system,
+            ),
+            job.analysis,
+        )
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    job.plan.manufacturing_requirements = requirements
+    job.plan.manufacturing_route = build_manufacturing_route(job.analysis, job.plan)
+    job.plan.knowledge_assessment = assess_plan_knowledge(job.analysis, job.plan)
+    for setup in job.plan.setups:
+        for operation in setup.operations:
+            if operation.enabled:
+                operation.status = "proposed"
+                operation.generation_state = "dirty"
+    directory = job_directory(job_id)
+    invalidate_cam_artifacts(directory)
+    write_json(directory / "manufacturing-requirements.json", requirements.model_dump(mode="json"))
+    write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+    save_job(directory, job)
+    return job
+
+
 @app.post("/api/v1/jobs/{job_id}/reanalyze", response_model=JobResponse)
 def reanalyze_job(job_id: str) -> JobResponse:
     job = load_job(job_id)
@@ -446,17 +574,14 @@ def reanalyze_job(job_id: str) -> JobResponse:
     analysis_path = directory / "analysis.json"
     model_path = directory / "model.stl"
     try:
-        subprocess.run(
-            [ANALYZER_BIN, str(source_path), str(analysis_path), str(model_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=180,
+        selected_index = int(job.analysis.topology.get("selected_solid_index", 0)) if job.analysis else 0
+        analysis = run_geometry_analyzer(
+            source_path, analysis_path, model_path, selected_index or None,
         )
-        analysis = GeometryAnalysis.model_validate_json(analysis_path.read_text(encoding="utf-8"))
-        analysis = normalize_manufacturing_features(analysis)
-        write_json(analysis_path, analysis.model_dump(mode="json"))
-        plan = build_process_plan(analysis, material=job.material, machine=job.machine)
+        plan = build_process_plan(
+            analysis, material=job.material, machine=job.machine,
+            requirements=job.plan.manufacturing_requirements if job.plan else None,
+        )
         write_json(directory / "plan.json", plan.model_dump(mode="json"))
         job.status = "completed"
         job.analysis = analysis
@@ -470,9 +595,58 @@ def reanalyze_job(job_id: str) -> JobResponse:
     return job
 
 
+@app.patch("/api/v1/jobs/{job_id}/solid", response_model=JobResponse)
+def select_job_solid(job_id: str, request: SolidSelectionRequest) -> JobResponse:
+    job = load_job(job_id)
+    if not job.analysis:
+        raise HTTPException(status_code=409, detail="Geometry analysis is not available")
+    available_indices = {candidate.index for candidate in job.analysis.solid_candidates}
+    source_solid_count = int(job.analysis.topology.get("source_solids", 1))
+    if available_indices and request.solid_index not in available_indices:
+        raise HTTPException(status_code=400, detail="Solid index is not available")
+    if not available_indices and not 1 <= request.solid_index <= source_solid_count:
+        raise HTTPException(status_code=400, detail="Solid index is not available")
+
+    directory = job_directory(job_id)
+    source_path = directory / job.filename
+    if not source_path.is_file():
+        raise HTTPException(status_code=409, detail="Original STEP file is not available")
+    current_index = int(job.analysis.topology.get("selected_solid_index", 0))
+    if current_index == request.solid_index:
+        return job
+
+    invalidate_cam_artifacts(directory)
+    analysis_path = directory / "analysis.json"
+    model_path = directory / "model.stl"
+    try:
+        analysis = run_geometry_analyzer(
+            source_path, analysis_path, model_path, request.solid_index,
+        )
+        plan = build_process_plan(
+            analysis, material=job.material, machine=job.machine,
+            requirements=job.plan.manufacturing_requirements if job.plan else None,
+        )
+    except (subprocess.SubprocessError, OSError, ValueError) as error:
+        details = getattr(error, "stderr", None) or str(error)
+        raise HTTPException(status_code=422, detail=details[-2000:]) from error
+
+    job.status = "completed"
+    job.error = None
+    job.analysis = analysis
+    job.plan = plan
+    write_json(directory / "plan.json", plan.model_dump(mode="json"))
+    save_job(directory, job)
+    return job
+
+
 @app.get("/api/v1/jobs/{job_id}/files/{filename}")
 def get_job_file(job_id: str, filename: str) -> FileResponse:
-    allowed = {"model.stl", "analysis.json", "plan.json", "ai-plan.json", "cam.FCStd", "program.nc", "toolpath.json", "verification.json", "simulation.json", "collision.json"}
+    allowed = {
+        "model.stl", "drawing.pdf", "analysis.json", "plan.json",
+        "manufacturing-specification.json", "manufacturing-requirements.json", "measurement-link.json",
+        "ai-plan.json", "cam.FCStd", "program.nc", "toolpath.json", "verification.json",
+        "simulation.json", "collision.json", "remediation.json", "remediation-history.json",
+    }
     generated_artifact = (
         Path(filename).name == filename
         and ((filename.startswith("program-") and filename.endswith(".nc"))
@@ -545,6 +719,7 @@ def review_feature(job_id: str, feature_id: str, request: FeatureReviewRequest) 
             item for item in [
                 *job.analysis.cylindrical_features,
                 *job.analysis.prismatic_features,
+                *job.analysis.internal_profile_features,
             ] if item.id == feature_id
         ),
         None,
@@ -566,6 +741,7 @@ def review_feature(job_id: str, feature_id: str, request: FeatureReviewRequest) 
         material=job.material,
         machine=job.machine,
         safety=job.plan.safety if job.plan else None,
+        requirements=job.plan.manufacturing_requirements if job.plan else None,
     )
     directory = job_directory(job_id)
     (directory / "ai-plan.json").unlink(missing_ok=True)
@@ -644,6 +820,8 @@ def _save_manual_plan_change(job_id: str, job: JobResponse) -> JobResponse:
     invalidate_cam_artifacts(directory)
     if job.analysis and job.plan:
         job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan)
+        job.plan.manufacturing_route = build_manufacturing_route(job.analysis, job.plan)
+        job.plan.knowledge_assessment = assess_plan_knowledge(job.analysis, job.plan)
     save_job(directory, job)
     if job.plan:
         write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
@@ -748,13 +926,93 @@ def get_cam_artifact(job_id: str) -> dict[str, object]:
     }
     if not all(path.is_file() for path in paths.values()):
         raise HTTPException(status_code=404, detail="CAM artifacts are not available for this job")
+    result = json.loads(paths["result"].read_text(encoding="utf-8"))
+    verification = json.loads(paths["verification"].read_text(encoding="utf-8"))
+    simulation = json.loads(paths["simulation"].read_text(encoding="utf-8"))
+    collision = json.loads(paths["collision"].read_text(encoding="utf-8"))
+    remediation_path = directory / "remediation.json"
+    remediation = json.loads(remediation_path.read_text(encoding="utf-8")) if remediation_path.is_file() else None
+    if remediation is None:
+        job = load_job(job_id)
+        if job.analysis and job.plan:
+            history_path = directory / "remediation-history.json"
+            history = json.loads(history_path.read_text(encoding="utf-8")) if history_path.is_file() else []
+            remediation = build_remediation_report(
+                job.analysis, job.plan, result, verification, collision,
+                iteration=len(history) if isinstance(history, list) else 0,
+            )
+            write_json(remediation_path, remediation)
     return cam_response(
-        job_id,
-        json.loads(paths["result"].read_text(encoding="utf-8")),
-        json.loads(paths["verification"].read_text(encoding="utf-8")),
-        json.loads(paths["simulation"].read_text(encoding="utf-8")),
-        json.loads(paths["collision"].read_text(encoding="utf-8")),
+        job_id, result, verification, simulation, collision, remediation=remediation,
     )
+
+
+def _apply_cam_remediation(job_id: str, *, auto_approve: bool = False) -> dict[str, object]:
+    """Apply deterministic low-risk corrections and invalidate stale CAM artifacts."""
+    job = load_job(job_id)
+    if not job.analysis or not job.plan:
+        raise HTTPException(status_code=409, detail="几何分析或工艺方案不可用")
+    directory = job_directory(job_id)
+    remediation_path = directory / "remediation.json"
+    if not remediation_path.is_file():
+        raise HTTPException(status_code=409, detail="请先生成刀路和仿真，再执行缺陷修复")
+    remediation = json.loads(remediation_path.read_text(encoding="utf-8"))
+    if not remediation.get("can_auto_replan"):
+        raise HTTPException(status_code=409, detail="当前缺陷包含必须由工程师复核的高风险项，不能自动修改")
+
+    history_path = directory / "remediation-history.json"
+    history = (
+        json.loads(history_path.read_text(encoding="utf-8"))
+        if history_path.is_file()
+        else []
+    )
+    if not isinstance(history, list):
+        history = []
+    applied_actions = apply_automatic_remediation(job.plan, remediation)
+    if not applied_actions:
+        raise HTTPException(status_code=409, detail="没有可安全自动执行的修复动作")
+
+    if any(item["kind"] == "adjust_safety" for item in applied_actions) and job.plan.safety:
+        job.plan.safety = build_safety_configuration(
+            job.analysis,
+            clearance_mm=job.plan.safety.clearance_mm,
+            vise_grip_height_mm=job.plan.safety.vise_grip_height_mm,
+            support_thickness_mm=job.plan.safety.support_thickness_mm,
+            setup_axes=[(setup.id, setup.work_axis) for setup in job.plan.setups],
+        )
+    if auto_approve:
+        for setup in job.plan.setups:
+            for operation in setup.operations:
+                if operation.enabled:
+                    operation.status = "approved"
+    job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan)
+    job.plan.manufacturing_route = build_manufacturing_route(job.analysis, job.plan)
+    job.plan.knowledge_assessment = assess_plan_knowledge(job.analysis, job.plan)
+    history.append({
+        "iteration": len(history) + 1,
+        "applied_at": utc_now(),
+        "source_report": {
+            "status": remediation.get("status"),
+            "defect_ids": [item.get("id") for item in remediation.get("defects", []) if isinstance(item, dict)],
+        },
+        "actions": applied_actions,
+    })
+    invalidate_cam_artifacts(directory)
+    write_json(history_path, history)
+    save_job(directory, job)
+    write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+    return {
+        "status": "applied",
+        "iteration": len(history),
+        "requires_approval": not auto_approve,
+        "applied_actions": applied_actions,
+        "job": job.model_dump(mode="json"),
+    }
+
+
+@app.post("/api/v1/jobs/{job_id}/cam/remediation/apply")
+def apply_cam_remediation(job_id: str) -> dict[str, object]:
+    return _apply_cam_remediation(job_id)
 
 
 def _create_cam_artifact(
@@ -795,17 +1053,24 @@ def _create_cam_artifact(
             )
             operation.generation_state = "generated"
         result, verification, simulation, collision = build_forming_preview(job.analysis, job.plan)
+        history_path = directory / "remediation-history.json"
+        remediation_history = json.loads(history_path.read_text(encoding="utf-8")) if history_path.is_file() else []
+        remediation = build_remediation_report(
+            job.analysis, job.plan, result, verification, collision,
+            iteration=len(remediation_history) if isinstance(remediation_history, list) else 0,
+        )
         write_json(directory / "toolpath.json", result)
         write_json(directory / "verification.json", verification)
         write_json(directory / "simulation.json", simulation)
         write_json(directory / "collision.json", collision)
+        write_json(directory / "remediation.json", remediation)
         save_job(directory, job)
         write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
         report(
             "completed", "薄板成形工序与分阶段仿真已生成", 100,
             generated=len(operations), verification=verification["status"], collision=collision["status"],
         )
-        return cam_response(job_id, result, verification, simulation, collision)
+        return cam_response(job_id, result, verification, simulation, collision, remediation)
     if job.analysis and job.plan.safety and any(component.setup_id is None for component in job.plan.safety.fixture_components):
         job.plan.safety = build_safety_configuration(
             job.analysis,
@@ -962,7 +1227,13 @@ def _create_cam_artifact(
         model_path = directory / "model.stl"
         if model_path.is_file():
             report("conformance", "正在比对余料与 STEP 空间形状", 95)
-            spatial = compare_stock_to_target_mesh(cumulative_surface, model_path)
+            spatial = compare_stock_to_target_mesh(
+                cumulative_surface,
+                model_path,
+                toolpath_segments=[
+                    item for item in result.get("preview_segments", []) if isinstance(item, dict)
+                ],
+            )
             verification["metrics"].update(spatial)
             verification["checks"].append({
                 "id": "target_spatial_conformance",
@@ -1008,6 +1279,14 @@ def _create_cam_artifact(
     collision = detect_collisions(job.analysis, job.plan, result)
     collision_path = directory / "collision.json"
     write_json(collision_path, collision)
+    report("remediation", "正在定位缺陷并生成补救建议", 98)
+    history_path = directory / "remediation-history.json"
+    remediation_history = json.loads(history_path.read_text(encoding="utf-8")) if history_path.is_file() else []
+    remediation = build_remediation_report(
+        job.analysis, job.plan, result, verification, collision,
+        iteration=len(remediation_history) if isinstance(remediation_history, list) else 0,
+    )
+    write_json(directory / "remediation.json", remediation)
     full_preview_count = len(result.get("preview_segments", []))
     result["preview_segments"] = compact_preview_segments(list(result.get("preview_segments", [])))
     result["preview_segment_count_raw"] = full_preview_count
@@ -1019,7 +1298,7 @@ def _create_cam_artifact(
     save_job(directory, job)
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
     response = cam_response(
-        job_id, result, verification, simulation, collision,
+        job_id, result, verification, simulation, collision, remediation,
         stdout=completed.stdout[-1000:],
     )
     report(
@@ -1029,6 +1308,102 @@ def _create_cam_artifact(
         collision=collision.get("status"),
     )
     return response
+
+
+def _run_cam_remediation_loop(
+    job_id: str,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, object]:
+    """Apply safe corrections and regenerate CAM until validation converges or blocks."""
+
+    def report(stage: str, message: str, percent: float, **details: object) -> None:
+        if progress_callback:
+            progress_callback({
+                "stage": stage,
+                "message": message,
+                "percent": round(max(0.0, min(percent, 100.0)), 1),
+                **details,
+            })
+
+    latest_result: dict[str, object] | None = None
+    while True:
+        directory = job_directory(job_id)
+        remediation_path = directory / "remediation.json"
+        if not remediation_path.is_file():
+            raise HTTPException(status_code=409, detail="请先生成刀路和仿真，再启动自动纠错")
+        current_report = json.loads(remediation_path.read_text(encoding="utf-8"))
+        if not current_report.get("can_auto_replan"):
+            raise HTTPException(status_code=409, detail="当前缺陷不能进入自动纠错闭环")
+
+        applied = _apply_cam_remediation(job_id, auto_approve=True)
+        iteration = int(applied["iteration"])
+        max_iterations = max(int(current_report.get("max_iterations", 3)), 1)
+        action_labels = [
+            str(item.get("label", ""))
+            for item in applied.get("applied_actions", [])
+            if isinstance(item, dict)
+        ]
+        report(
+            "remediation_applied",
+            f"第 {iteration} 轮：已应用 {len(action_labels)} 项安全修复",
+            min((iteration - 1) / max_iterations * 100 + 2, 92),
+            iteration=iteration,
+            max_iterations=max_iterations,
+            actions=action_labels,
+        )
+
+        def forward_cam_progress(event: dict[str, object]) -> None:
+            inner_percent = float(event.get("percent", 0) or 0)
+            overall = ((iteration - 1) + inner_percent / 100) / max_iterations * 94
+            stage = str(event.get("stage", "cam"))
+            report(
+                "revalidation" if stage == "completed" else stage,
+                f"第 {iteration} 轮复验：{event.get('message', '正在重新生成刀路')}",
+                min(overall, 94),
+                iteration=iteration,
+                max_iterations=max_iterations,
+                operation_id=event.get("operation_id"),
+                setup_id=event.get("setup_id"),
+                current=event.get("current"),
+                total=event.get("total"),
+            )
+
+        latest_result = _create_cam_artifact(job_id, progress_callback=forward_cam_progress)
+        next_report = latest_result.get("remediation")
+        if not isinstance(next_report, dict):
+            raise HTTPException(status_code=500, detail="复验未生成缺陷报告")
+        defects = next_report.get("defects", [])
+        if not defects:
+            outcome = "passed"
+            message = f"自动纠错在第 {iteration} 轮通过全部复验"
+        elif next_report.get("can_auto_replan"):
+            report(
+                "iteration_retry",
+                f"第 {iteration} 轮仍有可修复问题，准备继续迭代",
+                min(iteration / max_iterations * 94, 94),
+                iteration=iteration,
+                max_iterations=max_iterations,
+                defect_count=len(defects) if isinstance(defects, list) else 0,
+            )
+            continue
+        elif next_report.get("status") == "blocked":
+            outcome = "blocked"
+            message = f"第 {iteration} 轮发现高风险问题，已停止自动纠错"
+        elif int(next_report.get("iteration", iteration)) >= int(next_report.get("max_iterations", max_iterations)):
+            outcome = "max_iterations"
+            message = f"已完成 {iteration} 轮自动纠错，问题尚未收敛"
+        else:
+            outcome = "manual_review"
+            message = f"第 {iteration} 轮仍有需要工程师处理的问题"
+        report(
+            "completed", message, 100,
+            mode="remediation_loop",
+            outcome=outcome,
+            iteration=iteration,
+            max_iterations=max_iterations,
+            defect_count=len(defects) if isinstance(defects, list) else 0,
+        )
+        return {**latest_result, "remediation_loop": {"outcome": outcome, "iteration": iteration}}
 
 
 @app.post("/api/v1/jobs/{job_id}/cam")
@@ -1062,6 +1437,55 @@ def stream_cam_artifact(job_id: str) -> StreamingResponse:
                 CAM_STREAMING_JOBS.discard(job_id)
 
     threading.Thread(target=worker, name=f"cam-stream-{job_id[:8]}", daemon=True).start()
+
+    def event_stream():
+        terminal = False
+        while not terminal:
+            try:
+                event = events.get(timeout=15)
+            except Empty:
+                yield ": keepalive\n\n"
+                continue
+            terminal = event.get("stage") in {"completed", "error"}
+            yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/v1/jobs/{job_id}/cam/remediation/stream")
+def stream_cam_remediation(job_id: str) -> StreamingResponse:
+    job = load_job(job_id)
+    if not job.plan:
+        raise HTTPException(status_code=409, detail="工艺方案不可用")
+    remediation_path = job_directory(job_id) / "remediation.json"
+    if not remediation_path.is_file():
+        raise HTTPException(status_code=409, detail="请先生成刀路和仿真，再启动自动纠错")
+    remediation = json.loads(remediation_path.read_text(encoding="utf-8"))
+    if not remediation.get("can_auto_replan"):
+        raise HTTPException(status_code=409, detail="当前缺陷包含人工复核项，不能启动自动纠错")
+    with CAM_STREAM_LOCK:
+        if job_id in CAM_STREAMING_JOBS:
+            raise HTTPException(status_code=409, detail="该任务正在生成刀路或执行自动纠错")
+        CAM_STREAMING_JOBS.add(job_id)
+
+    events: Queue[dict[str, object]] = Queue()
+
+    def worker() -> None:
+        try:
+            _run_cam_remediation_loop(job_id, progress_callback=events.put)
+        except HTTPException as error:
+            events.put({"stage": "error", "message": str(error.detail), "percent": 100})
+        except Exception as error:
+            events.put({"stage": "error", "message": str(error), "percent": 100})
+        finally:
+            with CAM_STREAM_LOCK:
+                CAM_STREAMING_JOBS.discard(job_id)
+
+    threading.Thread(target=worker, name=f"remediation-stream-{job_id[:8]}", daemon=True).start()
 
     def event_stream():
         terminal = False

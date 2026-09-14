@@ -94,6 +94,9 @@ def test_manufacturing_context_omits_large_visual_edge_payload() -> None:
     assert "visual_edges" not in context["geometry"]
     assert context["geometry"]["omissions"]["visual_edges"] == "omitted_from_language_context"
     assert context["safety_policy"]["ai_must_not_generate_gcode"] is True
+    assert 5 < len(context["manufacturing_process_knowledge"]["processes"]) < 98
+    assert context["manufacturing_process_knowledge"]["retrieval"]["mode"] == "route_and_family_relevant"
+    assert len(context["manufacturing_process_knowledge"]["typical_routes"]) == 8
 
 
 def test_process_review_uses_strict_schema_and_validates_response() -> None:
@@ -107,6 +110,12 @@ def test_process_review_uses_strict_schema_and_validates_response() -> None:
         "confidence": 0.91,
         "summary": "三轴铣削方案可继续复核。",
         "setup_strategy": ["以最大平面作为首装基准"],
+        "route_recommendations": [{
+            "process_code": "GX-C-07", "action": "keep", "stage": "roughing",
+            "sequence": 20, "reason": "匹配当前铣削粗加工",
+            "confidence": 0.8, "prerequisite_codes": [],
+            "blocking_missing_information": ["尺寸公差"],
+        }],
         "operation_recommendations": [],
         "risks": [{
             "severity": "medium", "code": "FIXTURE_REVIEW",
@@ -123,6 +132,7 @@ def test_process_review_uses_strict_schema_and_validates_response() -> None:
         assert body["enable_thinking"] is True
         assert body["response_format"]["type"] == "json_schema"
         assert body["response_format"]["json_schema"]["strict"] is True
+        assert "route_recommendations" in body["response_format"]["json_schema"]["schema"]["required"]
         assert "max_tokens" not in body
         return httpx.Response(200, json={
             "id": "review-1", "model": "qwen3.8-max-0902",
@@ -134,6 +144,7 @@ def test_process_review_uses_strict_schema_and_validates_response() -> None:
         analysis, plan, settings=settings(), transport=httpx.MockTransport(handler),
     )
     assert result["review"]["recommended_process_kind"] == "subtractive"
+    assert result["review"]["route_recommendations"][0]["process_code"] == "GX-C-07"
     assert result["review"]["requires_engineer_review"] is True
     assert result["input_summary"]["operation_count"] == 1
 
@@ -149,6 +160,7 @@ def test_process_review_rejects_unknown_operation_type() -> None:
         "confidence": 0.8,
         "summary": "需要增加未受支持的工序。",
         "setup_strategy": ["三轴装夹"],
+        "route_recommendations": [],
         "operation_recommendations": [{
             "action": "add",
             "operation_type": "imaginary_laser_polishing",

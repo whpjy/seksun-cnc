@@ -78,6 +78,7 @@ WORKDIR /app
 COPY apps/api/requirements-dev.txt apps/api/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
 COPY apps/api/app ./app
+COPY apps/api/data ./data
 COPY apps/api/cam ./cam
 COPY apps/api/tools ./tools
 COPY apps/api/tests ./tests

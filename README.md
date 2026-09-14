@@ -16,8 +16,10 @@ STEP → OCCT 几何/特征分析 → 规则式工艺规划 → 人工审查 →
 当前 v0.8 聚焦三轴、2.5D 棱柱类零件，已提供：
 
 - STEP 上传、OCCT 精确解析和 STL 预览
-- 多实体 STEP 完整预览；当前默认以最大实体作为加工主体，其他实体保留为装配参考
-- 平面、孔、矩形封闭型腔和单向贯通槽候选识别
+- 多实体 STEP 完整预览；默认以最大实体作为候选主体，并可在工作台按体积与尺寸切换目标实体、重新识别和规划
+- 平面、孔、矩形封闭型腔、单向贯通槽和非圆异形贯通孔识别
+- 异形贯通孔按真实 STEP 内轮廓生成分层粗铣、侧壁精铣及仿真废料脱落
+- 单面内轮廓通过匹配下层底面区分浅雕刻与异形盲型腔，避免一律误判为通孔
 - 面邻接高低关系过滤凸台、开放台阶等伪型腔
 - 按加工方向生成 Setup，按特征、刀具生成 OP 工艺草案
 - 3D 模型、特征标记、工序联动审查，支持确认或排除候选
@@ -79,6 +81,7 @@ CNC_PUBLIC_BASE_URL=http://192.168.1.100:3001
 
 - `POST /api/v1/jobs`：上传 STEP 并生成分析及工艺草案
 - `POST /api/v1/jobs/{job_id}/reanalyze`：使用最新规则重新分析原始 STEP，并使旧 CAM 结果失效
+- `PATCH /api/v1/jobs/{job_id}/solid`：选择多实体 STEP 中的目标加工实体，并同步重建特征、工艺和 CAM 上下文
 - `PATCH /api/v1/jobs/{job_id}/features/{feature_id}`：确认或排除候选特征
 - `PATCH /api/v1/jobs/{job_id}/safety`：更新安全间隙与夹持高度，并使旧批准失效
 - `POST /api/v1/jobs/{job_id}/approve`：批准当前工艺草案
@@ -126,3 +129,5 @@ v0.4 的 10 个真实 STEP 批量结果保存在本地 `.seksun-cnc/batch-result
 - 输出不可未经工程师审核直接上机。G-code 下载按钮中的“草案”是刻意保留的安全边界。
 
 依赖与许可证边界见 [OPEN_SOURCE.md](OPEN_SOURCE.md)。
+
+二维图纸、制造要求统一契约及 STEP AP242 PMI 接入路线见 [docs/drawing-pmi-integration.md](docs/drawing-pmi-integration.md)。

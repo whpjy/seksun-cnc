@@ -1,4 +1,6 @@
-from app.models import Bounds, GeometryAnalysis, PrismaticFeature, Vec3
+import pytest
+
+from app.models import Bounds, GeometryAnalysis, InternalProfileFeature, PrismaticFeature, Vec3
 from app.planner import _extent_along_axis, build_process_plan
 from app.recognizer import normalize_manufacturing_features
 
@@ -124,7 +126,7 @@ def test_merges_connected_coaxial_cylinder_faces() -> None:
 
     normalized = normalize_manufacturing_features(analysis)
 
-    assert normalized.schema_version == "0.4.0"
+    assert normalized.schema_version == "0.5.0"
     assert len(normalized.cylindrical_features) == 1
     feature = normalized.cylindrical_features[0]
     assert feature.segment_count == 2
@@ -148,6 +150,23 @@ def test_excludes_partial_cylinders_from_hole_planning() -> None:
     assert all(feature.review_state == "excluded" for feature in normalized.cylindrical_features)
     assert all("圆周仅覆盖" in feature.review_reasons[-1] for feature in normalized.cylindrical_features)
     assert plan.automation_status == "review"
+    assert plan.knowledge_assessment is not None
+    assert plan.knowledge_assessment.catalog_process_count == 98
+    assert "GX-C-09" in plan.knowledge_assessment.route_process_codes
+    assert all(
+        operation.manufacturing_code
+        for setup in plan.setups
+        for operation in setup.operations
+    )
+    assert plan.manufacturing_route is not None
+    assert plan.manufacturing_route.part_family == "freeform"
+    assert plan.manufacturing_route.steps[0].process_code == "GX-Q-11"
+    assert any(step.process_code == "GX-C-31" for step in plan.manufacturing_route.steps)
+    assert any(
+        step.process_code == "GX-C-09" and step.execution_mode == "cam"
+        for step in plan.manufacturing_route.steps
+    )
+    assert plan.manufacturing_route.steps[-1].process_code == "GX-Q-14"
     assert any(
         operation.type == "profile_roughing"
         for setup in plan.setups
@@ -170,6 +189,35 @@ def test_excludes_partial_cylinders_from_hole_planning() -> None:
         for setup in plan.setups
         for operation in setup.operations
     )
+
+
+def test_rotational_part_is_routed_to_turning_without_claiming_cam_support() -> None:
+    analysis = sample_analysis()
+    bounds = analysis.measurements["bounding_box"]
+    bounds.maximum.x = 120
+    bounds.maximum.y = 20
+    bounds.maximum.z = 20
+    bounds.size.x = 120
+    bounds.size.y = 20
+    bounds.size.z = 20
+    analysis.measurements["volume"] = 30000
+    cylinder = analysis.cylindrical_features[0]
+    cylinder.kind = "cylinder"
+    cylinder.length = 120
+    analysis.cylindrical_features = [cylinder]
+    analysis.prismatic_features = []
+    analysis.internal_profile_features = []
+
+    plan = build_process_plan(analysis, "45 steel", "VMC850")
+
+    assert plan.manufacturing_route is not None
+    assert plan.manufacturing_route.part_family == "rotational"
+    route_codes = [step.process_code for step in plan.manufacturing_route.steps]
+    assert "GX-C-01" in route_codes
+    assert "GX-C-02" in route_codes
+    assert "GX-C-03" in route_codes
+    assert any("车削" in item for item in plan.manufacturing_route.capability_gaps)
+    assert plan.manufacturing_route.status == "incomplete"
 
 
 def test_formed_sheet_part_is_routed_away_from_billet_milling() -> None:
@@ -227,6 +275,10 @@ def test_formed_sheet_part_is_routed_away_from_billet_milling() -> None:
         "sheet_final_forming", "sheet_deburring", "sheet_inspection",
     ]
     assert plan.safety is None
+    assert plan.manufacturing_route is not None
+    assert plan.manufacturing_route.part_family == "sheet_forming"
+    assert plan.manufacturing_route.status == "incomplete"
+    assert any("冲压" in item for item in plan.manufacturing_route.capability_gaps)
     assert plan.blocking_reasons == []
     assert any("成形求解器" in warning for warning in plan.warnings)
 
@@ -283,7 +335,7 @@ def test_recognizes_rectangular_pocket_and_generates_rough_finish_operations() -
     )
 
     normalized = normalize_manufacturing_features(analysis)
-    assert normalized.schema_version == "0.4.0"
+    assert normalized.schema_version == "0.5.0"
     assert len(normalized.prismatic_features) == 1
     pocket = normalized.prismatic_features[0]
     assert pocket.kind == "pocket"
@@ -298,6 +350,114 @@ def test_recognizes_rectangular_pocket_and_generates_rough_finish_operations() -
     assert [operation.type for operation in pocket_operations] == [
         "pocket_roughing", "pocket_finishing",
     ]
+
+
+def test_pairs_non_circular_face_wires_and_plans_internal_profile() -> None:
+    analysis = sample_analysis()
+    analysis.cylindrical_features = []
+    bounds = analysis.measurements["bounding_box"]
+    bounds.maximum.z = 3
+    bounds.size.z = 3
+    analysis.measurements["volume"] = 15000
+    analysis.planar_features[0].center.z = 3
+    analysis.planar_features[0].wire_count = 2
+    analysis.planar_features.append(type(analysis.planar_features[0]).model_validate({
+        "id": "PF-BOTTOM", "area": 5800,
+        "center": {"x": 50, "y": 30, "z": 0},
+        "normal": {"x": 0, "y": 0, "z": -1}, "wire_count": 2,
+    }))
+    shared = {
+        "wire_index": 2, "edge_count": 8, "perimeter": 72,
+        "bounds": {
+            "minimum": {"x": 35, "y": 20, "z": 3},
+            "maximum": {"x": 65, "y": 40, "z": 3},
+            "size": {"x": 30, "y": 20, "z": 0},
+        },
+        "circular": False,
+    }
+    analysis.internal_profile_features = [InternalProfileFeature.model_validate(item) for item in [
+        {
+            "id": "RAW-TOP", "source_face_id": "PF-1", "source_face_index": 1,
+            "center": {"x": 50, "y": 30, "z": 3},
+            "access_direction": {"x": 0, "y": 0, "z": 1}, **shared,
+        },
+        {
+            "id": "RAW-BOTTOM", "source_face_id": "PF-BOTTOM", "source_face_index": 2,
+            "center": {"x": 50, "y": 30, "z": 0},
+            "access_direction": {"x": 0, "y": 0, "z": -1},
+            **{**shared, "bounds": {
+                "minimum": {"x": 35, "y": 20, "z": 0},
+                "maximum": {"x": 65, "y": 40, "z": 0},
+                "size": {"x": 30, "y": 20, "z": 0},
+            }},
+        },
+    ]]
+
+    normalized = normalize_manufacturing_features(analysis)
+    assert len(normalized.internal_profile_features) == 1
+    profile = normalized.internal_profile_features[0]
+    assert profile.end_type == "through"
+    assert profile.paired_profile_id != profile.id
+    assert profile.review_state == "accepted"
+    assert profile.depth == 3
+
+    plan = build_process_plan(normalized, "6061-T6", "VMC")
+    profile_operations = [
+        operation for setup in plan.setups for operation in setup.operations
+        if profile.id in operation.feature_ids
+    ]
+    assert [operation.type for operation in profile_operations] == [
+        "internal_profile_roughing", "internal_profile_finishing",
+    ]
+    operation_types = [operation.type for setup in plan.setups for operation in setup.operations]
+    assert operation_types.index("internal_profile_finishing") < operation_types.index("profile_roughing")
+    assert plan.automation_status == "review"
+    assert plan.coverage is not None
+    target = next(item for item in plan.coverage.targets if item.source_feature_ids == [profile.id])
+    assert target.state == "covered"
+
+
+def test_shallow_internal_profile_with_matching_floor_becomes_engraving() -> None:
+    analysis = sample_analysis()
+    analysis.cylindrical_features = []
+    analysis.planar_features.append(type(analysis.planar_features[0]).model_validate({
+        "id": "PF-MARK-FLOOR", "area": 1.6,
+        "center": {"x": 20, "y": 15, "z": 19.95},
+        "normal": {"x": 0, "y": 0, "z": 1},
+        "bounds": {
+            "minimum": {"x": 16, "y": 14.9, "z": 19.95},
+            "maximum": {"x": 24, "y": 15.1, "z": 19.95},
+            "size": {"x": 8, "y": 0.2, "z": 0},
+        },
+    }))
+    analysis.internal_profile_features = [InternalProfileFeature.model_validate({
+        "id": "RAW-MARK", "source_face_id": "PF-1", "source_face_index": 1,
+        "wire_index": 2, "center": {"x": 20, "y": 15, "z": 20},
+        "bounds": {
+            "minimum": {"x": 16, "y": 14.9, "z": 20},
+            "maximum": {"x": 24, "y": 15.1, "z": 20},
+            "size": {"x": 8, "y": 0.2, "z": 0},
+        },
+        "access_direction": {"x": 0, "y": 0, "z": 1},
+        "edge_count": 4, "perimeter": 16.4,
+    })]
+
+    normalized = normalize_manufacturing_features(analysis)
+    feature = normalized.internal_profile_features[0]
+    assert feature.end_type == "blind"
+    assert feature.machining_kind == "engraving"
+    assert feature.bottom_face_id == "PF-MARK-FLOOR"
+    assert feature.depth == pytest.approx(0.05)
+    assert feature.review_state == "accepted"
+
+    plan = build_process_plan(normalized, "6061-T6", "VMC")
+    operations = [operation for setup in plan.setups for operation in setup.operations]
+    engraving = next(operation for operation in operations if feature.id in operation.feature_ids)
+    assert engraving.type == "engraving"
+    assert engraving.parameters["depth_mm"] == 0.05
+    assert plan.coverage is not None
+    target = next(item for item in plan.coverage.targets if item.source_feature_ids == [feature.id])
+    assert target.state == "covered"
 
 
 def test_review_pocket_is_not_planned_until_operator_accepts_it() -> None:

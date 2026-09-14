@@ -113,14 +113,31 @@ def _surface_for_setup(setup_id: str, axis: dict[str, float], segments: list[dic
             previous = current
         return inside
 
-    usable_boundaries = [boundary for boundary in boundaries if len(boundary.get("points", [])) >= 3]
-    if usable_boundaries:
-        boundary_points = [_local(point, frame) for point in usable_boundaries[0]["points"]]
+    outer_boundaries = [
+        boundary for boundary in boundaries
+        if boundary.get("remove_side", "outside") == "outside"
+        and len(boundary.get("points", [])) >= 3
+    ]
+    if outer_boundaries:
+        boundary_points = [_local(point, frame) for point in outer_boundaries[0]["points"]]
         for row in range(rows):
             cell_y = min_y + row * resolution
             for column in range(columns):
                 cell_x = min_x + column * resolution
                 if not inside_polygon(cell_x, cell_y, boundary_points):
+                    heights[row * columns + column] = bottom
+    internal_boundaries = [
+        [_local(point, frame) for point in boundary["points"]]
+        for boundary in boundaries
+        if boundary.get("remove_side") == "inside"
+        and len(boundary.get("points", [])) >= 3
+    ]
+    for points in internal_boundaries:
+        for row in range(rows):
+            cell_y = min_y + row * resolution
+            for column in range(columns):
+                cell_x = min_x + column * resolution
+                if inside_polygon(cell_x, cell_y, points):
                     heights[row * columns + column] = bottom
 
     cell_area = resolution * resolution
@@ -275,10 +292,14 @@ def _cumulative_surface(
         return inside
 
     candidate_boundaries = []
+    internal_boundaries = []
     for boundary in boundaries:
         points = [_local(point, frame) for point in boundary.get("points", [])]
         if len(points) >= 3:
-            candidate_boundaries.append((polygon_area(points), points))
+            if boundary.get("remove_side") == "inside":
+                internal_boundaries.append(points)
+            else:
+                candidate_boundaries.append((polygon_area(points), points))
     if candidate_boundaries:
         _, outer_profile = max(candidate_boundaries, key=lambda item: item[0])
         for row in range(rows):
@@ -286,6 +307,14 @@ def _cumulative_surface(
             for column in range(columns):
                 cell_x = min_x + column * resolution
                 if not inside_polygon(cell_x, cell_y, outer_profile):
+                    index = row * columns + column
+                    upper[index] = lower[index]
+    for internal_profile in internal_boundaries:
+        for row in range(rows):
+            cell_y = min_y + row * resolution
+            for column in range(columns):
+                cell_x = min_x + column * resolution
+                if inside_polygon(cell_x, cell_y, internal_profile):
                     index = row * columns + column
                     upper[index] = lower[index]
 
@@ -400,7 +429,7 @@ def simulate_material_removal(
     if unsupported_tools:
         warnings.append(f"未支持的刀具已跳过：{', '.join(unsupported_tools)}")
     if boundaries:
-        warnings.append("闭合外轮廓切透后隐藏外侧废料；桥位与废料实际脱落仍需现场复核。")
+        warnings.append("闭合轮廓切透后按内外侧属性移除废料；桥位与废料实际脱落仍需现场复核。")
     return {
         "schema_version": "1.0.0", "engine": "Seksun CNC cumulative double-sided height-field simulator",
         "status": "completed" if cut_count else "warning", "method": "cumulative_double_sided_height_field",

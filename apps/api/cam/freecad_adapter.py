@@ -234,8 +234,8 @@ def referenced_planar_feature(operation, features):
     """Resolve an operation feature to the planar STEP face it came from."""
     feature_ids = operation.get("feature_ids", [])
     feature = features.get(feature_ids[0]) if feature_ids else None
-    if feature and feature.get("source_face_id"):
-        feature = features.get(feature["source_face_id"])
+    if feature and (feature.get("bottom_face_id") or feature.get("source_face_id")):
+        feature = features.get(feature.get("bottom_face_id") or feature["source_face_id"])
     return feature if feature and feature.get("normal") else None
 
 
@@ -301,6 +301,76 @@ def create_profile(document, job, operation, controller, model, bounds, clearanc
     return obj
 
 
+def internal_profile_wire(model, feature):
+    planar_feature = feature.get("source_planar_feature")
+    if not planar_feature:
+        raise RuntimeError("Internal profile has no source planar feature")
+    face_number = planar_face_number(model, planar_feature)
+    face = model.Shape.Faces[face_number - 1]
+    expected = feature.get("bounds") or {}
+    expected_center = feature.get("center") or {}
+    expected_perimeter = max(float(feature.get("perimeter", 0.0)), 1e-9)
+    diagonal = max(float(model.Shape.BoundBox.DiagonalLength), 1.0)
+    candidates = []
+    for wire in face.Wires:
+        if wire.isSame(face.OuterWire):
+            continue
+        center = wire.CenterOfMass
+        center_error = math.sqrt(sum(
+            (float(value) - float(expected_center.get(axis, value))) ** 2
+            for axis, value in zip("xyz", (center.x, center.y, center.z))
+        )) / diagonal
+        perimeter_error = abs(math.log(max(float(wire.Length), 1e-9) / expected_perimeter))
+        box = wire.BoundBox
+        expected_size = expected.get("size") or {}
+        size_error = sum(
+            abs(float(actual) - float(expected_size.get(axis, actual)))
+            for axis, actual in zip("xyz", (box.XLength, box.YLength, box.ZLength))
+        ) / diagonal
+        candidates.append((center_error * 8 + perimeter_error + size_error, wire))
+    if not candidates:
+        raise RuntimeError("Referenced planar face has no internal wire")
+    score, wire = min(candidates, key=lambda item: item[0])
+    if score > 1.0:
+        raise RuntimeError("Internal profile does not match a STEP wire (score %.3f)" % score)
+    return wire
+
+
+def create_internal_profile(document, job, operation, controller, model, features, bounds, clearance_z):
+    feature_ids = operation.get("feature_ids", [])
+    feature = features.get(feature_ids[0]) if feature_ids else None
+    if not feature:
+        return None
+    source = features.get(feature.get("source_face_id"))
+    if not source:
+        raise RuntimeError("Internal profile source face is unavailable")
+    feature = {**feature, "source_planar_feature": source}
+    wire = internal_profile_wire(model, feature)
+    outline = document.addObject("Part::Feature", operation["id"] + "_INTERNAL_OUTLINE")
+    outline.Label = operation["id"] + " STEP internal profile"
+    outline.Shape = Part.Face(wire)
+    obj = PathProfile.Create(operation["id"] + "_INTERNAL_PROFILE", parentJob=job)
+    prepare_proxy(obj, job)
+    params = operation.get("parameters", {})
+    top_z = float(bounds["maximum"]["z"])
+    depth = max(float(params.get("depth_mm", feature.get("depth", 0.0))), 0.05)
+    common_parameters(obj, controller, params, top_z, top_z - depth, clearance_z)
+    obj.Base = face_reference(outline, 1)
+    is_engraving = operation.get("type") == "engraving"
+    obj.Side, obj.Direction = "Inside", "CCW"
+    obj.processHoles, obj.processPerimeter = False, True
+    set_if_present(obj, "UseComp", not is_engraving)
+    set_if_present(obj, "OffsetExtra", 0.0 if is_engraving else float(params.get("radial_allowance_mm", 0.0)))
+    obj.Proxy.execute(obj)
+    return obj
+
+
+def internal_profile_points(model, feature, frame):
+    wire = internal_profile_wire(model, feature)
+    points = wire.discretize(Deflection=0.12)
+    return [local_to_world({"x": point.x, "y": point.y, "z": point.z}, frame) for point in points]
+
+
 def create_deburr(document, job, operation, controller, model, bounds, clearance_z):
     """Create a deterministic shallow profile for a 90-degree chamfer tool.
 
@@ -340,14 +410,17 @@ def create_pocket(document, job, operation, controller, model, features, bounds,
     obj = PathPocketShape.Create(operation["id"] + "_POCKET", parentJob=job)
     prepare_proxy(obj, job)
     params = operation.get("parameters", {})
-    final_z = float(planar_feature["center"]["z"])
+    floor_z = float(planar_feature["center"]["z"])
     requested_depth = max(float(params.get("depth_mm", feature.get("depth", 0.0))), 0.05)
-    top_z = min(float(bounds["maximum"]["z"]), final_z + requested_depth)
+    top_z = min(float(bounds["maximum"]["z"]), floor_z + requested_depth)
+    final_z = min(top_z, floor_z + max(float(params.get("floor_allowance_mm", 0.0)), 0.0))
     if top_z - final_z < 0.05:
         raise RuntimeError("Pocket depth is outside the current setup stock bounds")
     common_parameters(obj, controller, params, top_z, final_z, clearance_z)
     obj.Base = face_reference(model, face_number)
     set_if_present(obj, "UseOutline", True)
+    set_if_present(obj, "StepOver", int(round(min(95.0, max(1.0, float(params.get("step_over_percent", 50.0)))))))
+    set_if_present(obj, "ExtraOffset", max(float(params.get("wall_allowance_mm", 0.0)), 0.0))
     obj.Proxy.execute(obj)
     return obj
 
@@ -469,8 +542,11 @@ def add_holding_tags(document, job, profile, operation):
     return dressup
 
 
-def linear_preview(path_object, frame, setup_id, work_axis, local_stock_top_z):
-    position, preview = {"x": 0.0, "y": 0.0, "z": 0.0}, []
+def linear_preview(path_object, frame, setup_id, work_axis, local_stock_top_z, clearance_z):
+    # G-code does not define a physical move from XYZ zero to its first modal
+    # position.  Starting the preview at the enforced clearance plane avoids
+    # inventing a retract through the stock and reporting a false collision.
+    position, preview = {"x": 0.0, "y": 0.0, "z": float(clearance_z)}, []
 
     def append_segment(start, end, motion):
         world_start, world_end = local_to_world(start, frame), local_to_world(end, frame)
@@ -674,6 +750,10 @@ def create_native_operation(document, job, operation, controller, model, feature
     if kind in {"profile_contouring", "profile_roughing", "profile_finishing", "tab_removal"}:
         profile = create_profile(document, job, operation, controller, model, bounds, clearance_z)
         return add_holding_tags(document, job, profile, operation) if operation.get("parameters", {}).get("tab_count") else profile
+    if kind in {"internal_profile_roughing", "internal_profile_finishing", "engraving"}:
+        return create_internal_profile(
+            document, job, operation, controller, model, features, bounds, clearance_z,
+        )
     if kind == "edge_chamfer":
         return create_deburr(document, job, operation, controller, model, bounds, clearance_z)
     if kind in {"pocket_roughing", "slot_roughing", "pocket_finishing", "slot_finishing"}:
@@ -707,15 +787,36 @@ def main():
     source_shape = Part.read(source)
     source_solids = list(source_shape.Solids)
     if source_solids:
-        # Geometry analysis currently uses the largest solid as the default
-        # workpiece.  Apply the same rule here so an assembly's pins, gasket or
-        # reference components are visible in the source model but never become
-        # accidental CAM stock/model geometry.
-        source_shape = max(source_solids, key=lambda solid: abs(float(solid.Volume)))
+        selected_solid_index = int(analysis.get("topology", {}).get("selected_solid_index", 0))
+        selected_candidate = next(
+            (item for item in analysis.get("solid_candidates", []) if item.get("selected")),
+            None,
+        )
+        if selected_candidate:
+            expected_volume = float(selected_candidate.get("volume", 0))
+            expected_size = (selected_candidate.get("bounds") or {}).get("size") or {}
+
+            def candidate_distance(solid):
+                box = solid.BoundBox
+                scale = max(expected_volume, 1.0)
+                volume_error = abs(abs(float(solid.Volume)) - expected_volume) / scale
+                size_error = sum(
+                    abs(float(actual) - float(expected_size.get(axis, actual)))
+                    for axis, actual in zip(("x", "y", "z"), (box.XLength, box.YLength, box.ZLength))
+                ) / max(box.DiagonalLength, 1.0)
+                return volume_error + size_error
+
+            source_shape = min(source_solids, key=candidate_distance)
+        elif 1 <= selected_solid_index <= len(source_solids):
+            source_shape = source_solids[selected_solid_index - 1]
+        else:
+            # Legacy analysis files do not contain an explicit selection.
+            source_shape = max(source_solids, key=lambda solid: abs(float(solid.Volume)))
     features = {item["id"]: item for item in [
         *analysis.get("planar_features", []),
         *analysis.get("cylindrical_features", []),
         *analysis.get("prismatic_features", []),
+        *analysis.get("internal_profile_features", []),
     ]}
     bounds = analysis["measurements"]["bounding_box"]
     configured_postprocessor = str((plan.get("machine_profile") or {}).get("postprocessor") or "grbl").lower()
@@ -795,8 +896,9 @@ def main():
                 completed_operation_count += 1
                 emit_progress(
                     "operation_skipped",
-                    "%s 生成失败" % operation["id"],
+                    "%s 生成失败：%s" % (operation["id"], error),
                     setup_id=setup["id"], operation_id=operation["id"],
+                    error=str(error),
                     current=completed_operation_count, total=len(operations),
                 )
                 continue
@@ -831,7 +933,7 @@ def main():
             setup_outputs.extend((controller, native))
             preview.extend({"operation_id": operation["id"], **segment}
                            for segment in linear_preview(native, frame, setup["id"], setup["work_axis"],
-                                                         float(local_stock_bounds["maximum"]["z"])))
+                                                         float(local_stock_bounds["maximum"]["z"]), clearance_z))
             generated.append(operation["id"])
             setup_generated.append(operation["id"])
             completed_operation_count += 1
@@ -850,6 +952,19 @@ def main():
                 if points:
                     profile_boundaries.append({"operation_id": operation["id"], "setup_id": setup["id"],
                         "work_axis": setup["work_axis"], "points": points})
+            elif operation["type"] in {"internal_profile_roughing", "internal_profile_finishing"}:
+                feature = local_features.get(operation.get("feature_ids", [None])[0])
+                source = local_features.get(feature.get("source_face_id")) if feature else None
+                if feature and source:
+                    points = internal_profile_points(
+                        model, {**feature, "source_planar_feature": source}, frame,
+                    )
+                    if points:
+                        profile_boundaries.append({
+                            "operation_id": operation["id"], "setup_id": setup["id"],
+                            "work_axis": setup["work_axis"], "points": points,
+                            "remove_side": "inside",
+                        })
         setup_program = None
         if setup_outputs:
             # ToolController path commands (T/M6, spindle and feed state) are

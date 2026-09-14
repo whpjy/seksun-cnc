@@ -42,10 +42,19 @@ def evaluate_case(root: Path, case: dict[str, object], analyzer: str) -> dict[st
         "status": "completed",
         "geometry": {
             "topology": analysis.topology,
+            "solid_candidate_count": len(analysis.solid_candidates),
+            "solid_candidates": [
+                candidate.model_dump(mode="json") for candidate in analysis.solid_candidates
+            ],
             "size_mm": bounds.size.model_dump(mode="json"),
             "planar_feature_count": len(analysis.planar_features),
             "cylindrical_feature_count": len(analysis.cylindrical_features),
             "prismatic_feature_count": len(analysis.prismatic_features),
+            "internal_profile_feature_count": len(analysis.internal_profile_features),
+            "internal_profile_kinds": {
+                kind: sum(feature.machining_kind == kind for feature in analysis.internal_profile_features)
+                for kind in ("through_profile", "blind_pocket", "engraving", "unknown")
+            },
         },
         "plan": {
             "process_kind": plan.process_kind,

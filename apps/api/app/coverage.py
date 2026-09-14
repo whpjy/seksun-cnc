@@ -80,6 +80,22 @@ def evaluate_plan_coverage(
         )
         add_feature_target(feature, feature.kind, required, f"{feature.kind} {feature.length:g}×{feature.width:g}")
 
+    for feature in analysis.internal_profile_features:
+        if feature.review_state == "excluded":
+            continue
+        if feature.machining_kind == "engraving":
+            required = {"engraving"}
+        elif feature.machining_kind == "blind_pocket":
+            required = {"pocket_roughing", "pocket_finishing"}
+        else:
+            required = {"internal_profile_roughing", "internal_profile_finishing"}
+        add_feature_target(
+            feature,
+            "internal_profile",
+            required,
+            f"{feature.machining_kind} {feature.length:g}×{feature.width:g}",
+        )
+
     surface_ids = sorted({
         feature_id
         for operation in operations
@@ -140,7 +156,16 @@ def evaluate_plan_coverage(
             and _axis_key(feature.access_direction) == profile_axis
             for feature in analysis.prismatic_features
         )
-        unresolved_loops = max(internal_loops - recognized_holes - recognized_prismatic, 0)
+        recognized_internal_profiles = sum(
+            feature.review_state != "excluded"
+            and _axis_key(feature.access_direction) == profile_axis
+            for feature in analysis.internal_profile_features
+        )
+        unresolved_loops = max(
+            internal_loops - recognized_holes - recognized_prismatic
+            - recognized_internal_profiles,
+            0,
+        )
         for index in range(unresolved_loops):
             targets.append(CoverageTarget(
                 id=f"TARGET-UNRESOLVED-INTERNAL-{index + 1}",
@@ -150,7 +175,8 @@ def evaluate_plan_coverage(
 
     issues: list[str] = []
     source_solids = int(analysis.topology.get("source_solids", 1))
-    if source_solids > 1:
+    selection_confirmed = bool(analysis.topology.get("selection_confirmed", 0))
+    if source_solids > 1 and not selection_confirmed:
         issues.append(f"输入包含 {source_solids} 个实体，目标实体尚未由用户确认")
     review_count = sum(target.state == "review" for target in targets)
     unresolved_count = sum(target.state == "unresolved" for target in targets)
