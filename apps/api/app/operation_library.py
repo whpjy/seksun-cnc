@@ -35,7 +35,7 @@ class ToolRequirement(BaseModel):
 
 
 class EngineBinding(BaseModel):
-    provider: Literal["freecad", "opencamlib"]
+    provider: Literal["freecad", "opencamlib", "turning"]
     operation: str
     modifiers: list[str] = Field(default_factory=list)
 
@@ -60,6 +60,12 @@ def number(key: str, label: str, default: float, unit: str = "mm", minimum: floa
                                minimum=minimum, maximum=maximum, group=group, required=required)
 
 
+def enum(key: str, label: str, default: str, choices: list[str], group: str = "strategy") -> ParameterDefinition:
+    return ParameterDefinition(
+        key=key, label=label, type="enum", default=default, choices=choices, group=group,
+    )
+
+
 COMMON_DEPTH = [
     number("depth_mm", "加工深度", 1.0, minimum=0.01, group="geometry", required=True),
     number("step_down_mm", "每层切深", 1.0, minimum=0.01, group="cutting"),
@@ -69,6 +75,12 @@ COMMON_MILLING = [
     number("feed_rate_mm_min", "切削进给", 600, unit="mm/min", minimum=1, group="cutting"),
     number("plunge_rate_mm_min", "下刀进给", 180, unit="mm/min", minimum=1, group="cutting"),
 ]
+COMMON_TURNING = [
+    enum("spindle_mode", "主轴模式", "constant_surface_speed", ["constant_surface_speed", "constant_rpm"], "cutting"),
+    number("cutting_speed_m_min", "切削速度", 100, unit="m/min", minimum=1, group="cutting"),
+    number("maximum_spindle_rpm", "最高主轴转速", 8000, unit="rpm", minimum=1, group="cutting"),
+    number("feed_per_revolution_mm", "每转进给", 0.12, unit="mm/rev", minimum=0.001, group="cutting"),
+]
 
 
 def definition(
@@ -76,6 +88,7 @@ def definition(
     accepts: list[str], tool_kinds: list[str], default_tool: str,
     parameters: list[ParameterDefinition], maturity: str = "generated",
     manual_enabled: bool = True, modifiers: list[str] | None = None,
+    provider: Literal["freecad", "opencamlib", "turning"] = "freecad",
 ) -> OperationDefinition:
     return OperationDefinition(
         id=identifier, name=name, category=category, description=description,
@@ -83,7 +96,7 @@ def definition(
         geometry=GeometryRequirement(accepts=accepts),
         tool=ToolRequirement(accepts=tool_kinds, default_tool_id=default_tool),
         parameters=parameters,
-        engine=EngineBinding(provider="freecad", operation=operation, modifiers=modifiers or []),
+        engine=EngineBinding(provider=provider, operation=operation, modifiers=modifiers or []),
     )
 
 
@@ -161,6 +174,36 @@ OPERATION_DEFINITIONS = [
                 number("depth_offset_mm", "曲面余量", 0.0, minimum=0), *COMMON_MILLING], "experimental", False),
     definition("waterline", "等高/水线加工", "三维加工", "按固定Z层加工陡峭曲面。", "Waterline",
                ["surface_set", "solid"], ["ball_end_mill", "bull_end_mill", "end_mill"], "EM-6", [*COMMON_DEPTH, *COMMON_MILLING], "planned", False),
+    definition("turn_facing", "车端面", "车削", "沿径向加工棒料或零件端面。", "Facing",
+               ["rotational_face", "rotational_profile"], ["turning_od"], "TURN-OD-R",
+               [number("stock_allowance_mm", "轴向余量", 0.0), number("depth_of_cut_mm", "切深", 0.5, minimum=0.01, group="cutting"), *COMMON_TURNING], "experimental", False, provider="turning"),
+    definition("turn_od_roughing", "外圆粗车", "车削", "按 Z-R 外轮廓分层去除外圆余量。", "ODRoughing",
+               ["outer_rotational_profile"], ["turning_od"], "TURN-OD-R",
+               [number("radial_allowance_mm", "径向余量", 0.3), number("axial_allowance_mm", "轴向余量", 0.15), number("depth_of_cut_mm", "径向切深", 1.0, minimum=0.01, group="cutting"), *COMMON_TURNING], "experimental", False, provider="turning"),
+    definition("turn_od_finishing", "外圆精车", "车削", "精加工外圆、锥面和回转圆弧轮廓。", "ODFinishing",
+               ["outer_rotational_profile"], ["turning_od"], "TURN-OD-F",
+               [number("radial_allowance_mm", "径向余量", 0.0), number("axial_allowance_mm", "轴向余量", 0.0), *COMMON_TURNING], "experimental", False, provider="turning"),
+    definition("turn_id_roughing", "内孔粗车", "车削", "按内轮廓分层去除镗孔余量。", "IDRoughing",
+               ["inner_rotational_profile"], ["turning_id"], "TURN-ID-R",
+               [number("radial_allowance_mm", "径向余量", 0.25), number("depth_of_cut_mm", "径向切深", 0.5, minimum=0.01, group="cutting"), *COMMON_TURNING], "experimental", False, provider="turning"),
+    definition("turn_id_finishing", "内孔精车", "车削", "精加工内孔回转轮廓。", "IDFinishing",
+               ["inner_rotational_profile"], ["turning_id"], "TURN-ID-F",
+               [number("radial_allowance_mm", "径向余量", 0.0), *COMMON_TURNING], "experimental", False, provider="turning"),
+    definition("turn_grooving", "车槽", "槽加工", "加工外槽、内槽或端面槽。", "Grooving",
+               ["od_groove", "id_groove", "face_groove"], ["grooving"], "TURN-GROOVE-2",
+               [number("groove_width_mm", "槽宽", 2.0, minimum=0.01, group="geometry", required=True), number("peck_depth_mm", "分层切入量", 0.5, minimum=0.01, group="cutting"), *COMMON_TURNING], "experimental", False, provider="turning"),
+    definition("turn_threading", "车螺纹", "螺纹加工", "加工内外回转螺纹。", "Threading",
+               ["external_thread", "internal_thread"], ["threading"], "TURN-THREAD-60",
+               [number("start_z_mm", "螺纹起点", 0.0, group="geometry", required=True), number("end_z_mm", "螺纹终点", -10.0, minimum=None, group="geometry", required=True), number("major_diameter_mm", "大径", 10.0, minimum=0.01, group="geometry", required=True), number("minor_diameter_mm", "小径", 8.8, minimum=0, group="geometry", required=True), number("pitch_mm", "螺距", 1.0, minimum=0.01, group="geometry", required=True), number("thread_depth_mm", "牙深", 0.6, minimum=0.01, group="geometry", required=True), number("pass_count", "切削次数", 6, unit="次", minimum=1, group="strategy"), *COMMON_TURNING], "experimental", False, provider="turning"),
+    definition("axial_drilling", "轴向钻孔", "孔加工", "使用正面或背面固定刀位沿回转轴钻孔。", "AxialDrilling",
+               ["axial_hole"], ["drill"], "DRILL-6.0",
+               [number("depth_mm", "编程深度", 5.0, minimum=0.01, group="geometry", required=True), number("peck_depth_mm", "啄钻深度", 1.0, minimum=0.01, group="cutting"), *COMMON_TURNING], "experimental", False, provider="turning"),
+    definition("axial_tapping", "轴向攻丝", "螺纹加工", "使用正面或背面固定刀位沿回转轴攻丝。", "AxialTapping",
+               ["axial_thread"], ["tap"], "TAP-M6",
+               [number("depth_mm", "螺纹深度", 5.0, minimum=0.01, group="geometry", required=True), number("pitch_mm", "螺距", 1.0, minimum=0.01, group="geometry", required=True), *COMMON_TURNING], "experimental", False, provider="turning"),
+    definition("turn_cutoff", "切断", "切断", "将成品从棒料切离，并为后续接料状态提供明确语义。", "Cutoff",
+               ["cutoff_plane"], ["cutoff"], "TURN-CUTOFF-2",
+               [number("cutting_width_mm", "刀宽", 2.0, minimum=0.01, group="geometry", required=True), number("breakthrough_radius_mm", "中心越过量", 0.1, minimum=0, group="geometry"), *COMMON_TURNING], "experimental", False, provider="turning"),
 ]
 
 _BY_ID = {item.id: item for item in OPERATION_DEFINITIONS}

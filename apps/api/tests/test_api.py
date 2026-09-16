@@ -13,6 +13,52 @@ from app.models import GeometryAnalysis, JobResponse
 client = TestClient(app)
 
 
+def test_device_library_contains_citizen_l32() -> None:
+    response = client.get("/api/v1/device-library")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] == "1.0.0"
+    assert len(payload["devices"]) == 2
+    device = next(item for item in payload["devices"] if item["id"] == "citizen-cincom-l32")
+    assert device["id"] == "citizen-cincom-l32"
+    assert device["workpiece"]["maximum_diameter_mm"] == 32
+    assert device["system_integration"]["direct_nc_output"] is False
+    assert device["configuration_status"] == "unconfirmed"
+
+    virtual_device = next(item for item in payload["devices"] if item["id"] == "seksun-freecad-cam-standard")
+    assert virtual_device["record_kind"] == "virtual"
+    assert len(virtual_device["operation_bindings"]) == 19
+    assert virtual_device["system_integration"]["production_release_requires_physical_machine"] is True
+
+
+def test_unknown_device_library_item_returns_404() -> None:
+    response = client.get("/api/v1/device-library/unknown")
+
+    assert response.status_code == 404
+
+
+def test_job_start_rejects_unknown_device_before_processing() -> None:
+    response = client.post(
+        "/api/v1/jobs/start",
+        files={
+            "step": ("part.step", b"STEP", "application/octet-stream"),
+            "drawing": ("drawing.pdf", b"PDF", "application/pdf"),
+        },
+        data={"device_id": "unknown-device"},
+    )
+
+    assert response.status_code == 400
+    assert "未知设备" in response.json()["detail"]
+
+
+def test_device_names_resolve_to_matching_machine_profiles() -> None:
+    assert main.resolve_machine("SEKSUN FreeCAD CAM 标准虚拟设备").id == "vmc-850"
+    l32 = main.resolve_machine("Citizen Cincom L32")
+    assert l32.id == "citizen-cincom-l32"
+    assert l32.max_spindle_rpm == 8000
+
+
 def test_volume_conformance_is_based_on_finished_part_not_oversized_stock() -> None:
     status, target_error, stock_error = main.volume_conformance(243.74, 196.72, 11496.49)
 
@@ -117,6 +163,76 @@ def test_cam_stream_emits_incremental_progress(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert '"operation_id": "OP10"' in response.text
+    assert '"stage": "completed"' in response.text
+
+
+def test_job_history_lists_latest_jobs_first(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    for job_id, filename, created_at in (
+        ("1" * 32, "older.step", "2026-01-01T08:00:00+00:00"),
+        ("2" * 32, "latest.step", "2026-01-02T08:00:00+00:00"),
+    ):
+        directory = tmp_path / job_id
+        directory.mkdir()
+        main.save_job(directory, JobResponse(
+            id=job_id, status="completed", filename=filename,
+            created_at=created_at, material="6061-T6", machine="VMC-850",
+        ))
+
+    response = client.get("/api/v1/jobs")
+
+    assert response.status_code == 200
+    assert [item["filename"] for item in response.json()] == ["latest.step", "older.step"]
+    assert response.json()[0]["operation_count"] == 0
+
+
+def test_clear_job_history_preserves_current_job(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    preserved_id = "3" * 32
+    deleted_id = "4" * 32
+    for job_id, filename in ((preserved_id, "current.step"), (deleted_id, "old.step")):
+        directory = tmp_path / job_id
+        directory.mkdir()
+        main.save_job(directory, JobResponse(
+            id=job_id, status="completed", filename=filename,
+            created_at="2026-01-01T08:00:00+00:00", material="6061-T6", machine="VMC-850",
+        ))
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "keep.txt").write_text("keep", encoding="utf-8")
+    with main.JOB_EVENT_CONDITION:
+        main.JOB_EVENT_LOGS[deleted_id] = [{"stage": "completed"}]
+
+    response = client.delete("/api/v1/jobs", params={"preserve_job_id": preserved_id})
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted_count": 1}
+    assert (tmp_path / preserved_id / "job.json").is_file()
+    assert not (tmp_path / deleted_id).exists()
+    assert (unrelated / "keep.txt").is_file()
+    assert deleted_id not in main.JOB_EVENT_LOGS
+
+
+def test_job_progress_stream_replays_structured_events(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "e" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    main.save_job(directory, JobResponse(
+        id=job_id, status="processing", filename="stream.step",
+        created_at=main.utc_now(), material="6061-T6", machine="VMC-850",
+    ))
+    with main.JOB_EVENT_CONDITION:
+        main.JOB_EVENT_LOGS[job_id] = []
+    main.publish_job_event(job_id, "geometry_analysis", "三维几何分析完成", 34, feature_count=12)
+    main.publish_job_event(job_id, "completed", "工艺方案已生成", 100, operation_count=4)
+
+    response = client.get(f"/api/v1/jobs/{job_id}/events")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert '"feature_count": 12' in response.text
+    assert '"operation_count": 4' in response.text
     assert '"stage": "completed"' in response.text
 
 
@@ -245,7 +361,7 @@ def test_catalogs_expose_versioned_material_machine_and_tool_data() -> None:
     payload = response.json()
     assert payload["schema_version"] == "0.8.0"
     assert len(payload["materials"]) == 4
-    assert len(payload["machines"]) == 3
+    assert len(payload["machines"]) == 4
     assert any(tool["id"] == "FM-50" for tool in payload["tools"])
     assert any(operation["id"] == "profile_finishing" for operation in payload["operations"])
 
@@ -591,7 +707,7 @@ def test_unsupported_plan_cannot_be_approved(tmp_path, monkeypatch) -> None:
     assert "不可批准" in response.json()["detail"]
 
 
-def test_cam_requires_approval_and_returns_artifact_links(tmp_path, monkeypatch) -> None:
+def test_cam_without_approval_returns_artifact_links(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
     job_id = "c" * 32
     directory = tmp_path / job_id
@@ -629,8 +745,6 @@ def test_cam_requires_approval_and_returns_artifact_links(tmp_path, monkeypatch)
     main.write_json(directory / "plan.json", plan.model_dump(mode="json"))
     (directory / "cam.step").write_text("STEP", encoding="utf-8")
 
-    assert client.post(f"/api/v1/jobs/{job_id}/cam").status_code == 409
-    assert client.post(f"/api/v1/jobs/{job_id}/approve").status_code == 200
     safety_response = client.patch(
         f"/api/v1/jobs/{job_id}/safety",
         json={"clearance_mm": 4, "vise_grip_height_mm": 2},
@@ -642,9 +756,6 @@ def test_cam_requires_approval_and_returns_artifact_links(tmp_path, monkeypatch)
         for setup in safety_response.json()["plan"]["setups"]
         for operation in setup["operations"]
     )
-    assert client.post(f"/api/v1/jobs/{job_id}/cam").status_code == 409
-    assert client.post(f"/api/v1/jobs/{job_id}/approve").status_code == 200
-
     monkeypatch.setattr(main, "resolve_executable", lambda command: "/usr/bin/FreeCADCmd" if "FreeCAD" in command else None)
 
     def fake_freecad(command, adapter_script, arguments, timeout_seconds=600):

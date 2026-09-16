@@ -28,9 +28,15 @@ def _part_family(analysis: GeometryAnalysis, plan: ProcessPlan) -> str:
     non_hole_cylinders = [
         item for item in analysis.cylindrical_features if item.kind in {"boss", "cylinder"}
     ]
+    operation_types = {operation.type for setup in plan.setups for operation in setup.operations}
+    if operation_types & {
+        "turn_facing", "turn_od_roughing", "turn_od_finishing",
+        "turn_id_roughing", "turn_id_finishing", "turn_grooving",
+        "turn_threading", "turn_cutoff",
+    }:
+        return "rotational"
     if non_hole_cylinders and sizes[-1] >= max(sizes[1] * 2.5, 20):
         return "mixed" if analysis.prismatic_features or analysis.internal_profile_features else "rotational"
-    operation_types = {operation.type for setup in plan.setups for operation in setup.operations}
     if operation_types & {"surface_roughing", "surface_3d", "waterline"}:
         return "freeform"
     axes = {
@@ -52,6 +58,7 @@ def build_manufacturing_route(
     by_code = {item["code"]: item for item in library["processes"]}
     operation_mapping: dict[str, str] = library["cam_operation_mapping"]
     operations = [operation for setup in plan.setups for operation in setup.operations if operation.enabled]
+    operation_types = {operation.type for operation in operations}
     requirements = plan.manufacturing_requirements
     recognized_requirements = requirements.requirements if requirements else []
     matched_requirements = [
@@ -145,7 +152,10 @@ def build_manufacturing_route(
                         "由回转体上的已识别孔或边缘特征得到。",
                         source_operations=grouped[code],
                     )
-            capability_gaps.append("当前 CAM 执行层尚未接入数控车削；回转体路线只能规划，不能自动生成车削刀路")
+            if operation_types & {"turn_facing", "turn_od_roughing", "turn_od_finishing", "turn_cutoff"}:
+                capability_gaps.append("L32 车削执行层当前只生成 DRAFT Toolpath IR；MELDAS 后处理与生产放行尚未认证")
+            else:
+                capability_gaps.append("当前 CAM 执行层尚未接入数控车削；回转体路线只能规划，不能自动生成车削刀路")
         else:
             if family == "mixed":
                 add(

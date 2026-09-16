@@ -10,6 +10,7 @@ from .models import GeometryAnalysis, ManufacturingRequirements, Operation, Proc
 from .manufacturing_knowledge import assess_plan_knowledge
 from .route_planner import build_manufacturing_route
 from .operation_library import create_operation_instance
+from .l32_planner import build_l32_process_plan
 
 
 def _dot(left: Vec3, right: Vec3) -> float:
@@ -132,6 +133,7 @@ def _sheet_forming_plan(
 ) -> ProcessPlan:
     bounds = analysis.measurements["bounding_box"]
     assert not isinstance(bounds, float)
+
     material_profile = resolve_material(material)
     machine_profile = resolve_machine(machine)
     nominal_thickness = round(max(0.05, round(equivalent_thickness / 0.05) * 0.05), 3)
@@ -270,11 +272,17 @@ def build_process_plan(
     machine: str,
     safety: SafetyConfiguration | None = None,
     requirements: ManufacturingRequirements | None = None,
+    process_kind_hint: str | None = None,
 ) -> ProcessPlan:
     material_profile = resolve_material(material)
     machine_profile = resolve_machine(machine)
     bounds = analysis.measurements["bounding_box"]
     assert not isinstance(bounds, float)
+
+    if machine_profile.id == "citizen-cincom-l32":
+        return build_l32_process_plan(
+            analysis, material=material, machine=machine, requirements=requirements,
+        )
 
     usable_holes = [
         feature for feature in analysis.cylindrical_features
@@ -334,7 +342,7 @@ def build_process_plan(
         and fill_ratio <= 0.15
         and ordered_sizes[0] >= max(1.5, equivalent_sheet_thickness * 4.0)
     )
-    if formed_sheet_candidate:
+    if formed_sheet_candidate or process_kind_hint == "sheet_forming":
         plan = _sheet_forming_plan(
             analysis, material, machine, equivalent_sheet_thickness,
         )

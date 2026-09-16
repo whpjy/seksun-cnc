@@ -99,6 +99,22 @@ class SolidCandidate(BaseModel):
     selected: bool = False
 
 
+class RotationalSectionPoint(BaseModel):
+    z: float
+    radius: float = Field(ge=0)
+
+
+class RotationalSectionCandidate(BaseModel):
+    source_feature_id: str
+    axis_origin: Vec3
+    axis: Vec3
+    plane_normal: Vec3
+    outer_profile: list[RotationalSectionPoint]
+    inner_profile: list[RotationalSectionPoint] = Field(default_factory=list)
+    tolerance_mm: float = Field(gt=0)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class GeometryAnalysis(BaseModel):
     schema_version: str
     source_file: str
@@ -109,6 +125,8 @@ class GeometryAnalysis(BaseModel):
     prismatic_features: list[PrismaticFeature] = Field(default_factory=list)
     internal_profile_features: list[InternalProfileFeature] = Field(default_factory=list)
     solid_candidates: list[SolidCandidate] = Field(default_factory=list)
+    rotational_sections: list[RotationalSectionCandidate] = Field(default_factory=list)
+    rotational_profile_reviews: dict[str, Literal["accepted", "review", "excluded"]] = Field(default_factory=dict)
     visual_edges: list[list[Vec3]] = Field(default_factory=list)
 
 
@@ -123,6 +141,11 @@ class Tool(BaseModel):
     flute_length_mm: float = 20
     stickout_mm: float = 35
     holder_diameter_mm: float = 32
+    nose_radius_mm: float | None = Field(default=None, ge=0)
+    cutting_width_mm: float | None = Field(default=None, gt=0)
+    insert_shape: str | None = None
+    hand: Literal["left", "right", "neutral"] | None = None
+    orientation_code: int | None = Field(default=None, ge=1, le=9)
 
 
 class MaterialProfile(BaseModel):
@@ -179,6 +202,10 @@ class Operation(BaseModel):
     enabled: bool = True
     generation_state: Literal["dirty", "generating", "generated", "failed"] = "dirty"
     manufacturing_code: str | None = None
+    channel_id: Literal["main", "sub"] | None = None
+    spindle_id: Literal["main", "sub"] | None = None
+    workpiece_side: Literal["front", "back"] | None = None
+    synchronization_group: str | None = None
 
 
 class Setup(BaseModel):
@@ -262,6 +289,19 @@ class ManufacturingRouteProposal(BaseModel):
     alternative_process_codes: list[str] = Field(default_factory=list)
 
 
+class ThreadSpecification(BaseModel):
+    designation: str
+    standard: Literal["UNF", "UNC", "UNEF", "BSPP"]
+    side: Literal["external", "internal", "unknown"] = "unknown"
+    nominal_size: str
+    major_diameter_mm: float = Field(gt=0)
+    threads_per_inch: float = Field(gt=0)
+    pitch_mm: float = Field(gt=0)
+    form_angle_degrees: float = Field(gt=0)
+    class_fit: str | None = None
+    handedness: Literal["right", "left", "unknown"] = "right"
+
+
 class ManufacturingRequirement(BaseModel):
     id: str
     type: str
@@ -279,6 +319,7 @@ class ManufacturingRequirement(BaseModel):
     verification_status: str
     confidence: float = Field(default=0, ge=0, le=1)
     raw_text: str | None = None
+    thread: ThreadSpecification | None = None
     source: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -297,6 +338,42 @@ class ManufacturingRequirements(BaseModel):
 class ManufacturingRequirementsImportRequest(BaseModel):
     source_system: str = "seksun-meas"
     specification: dict[str, Any]
+
+
+class ThreadBindingConfirmRequest(BaseModel):
+    thread_feature_id: str = Field(min_length=1)
+    requirement_id: str = Field(min_length=1)
+
+
+class ThreadOperationReviewRequest(BaseModel):
+    start_z_mm: float
+    end_z_mm: float
+    thread_depth_mm: float = Field(gt=0)
+    pass_count: int = Field(ge=1, le=20)
+    relief_strategy: Literal["groove", "runout", "thread_to_end"]
+    relief_width_mm: float = Field(default=0, ge=0)
+    tool_insert_id: str = Field(min_length=1, max_length=64)
+    controller_cycle_id: str = Field(min_length=1, max_length=64)
+    reviewer: str = Field(min_length=1, max_length=100)
+
+
+class BoringOperationReviewRequest(BaseModel):
+    initial_bore_diameter_mm: float = Field(gt=0)
+    confirmed_stickout_mm: float = Field(gt=0, le=200)
+    assembly_clearance_mm: float = Field(default=0.2, ge=0, le=5)
+    boring_bar_inventory_id: str = Field(min_length=1, max_length=64)
+    reviewer: str = Field(min_length=1, max_length=100)
+
+
+class AxialDrillingOperationReviewRequest(BaseModel):
+    drill_tool_id: str = Field(min_length=1, max_length=64)
+    confirmed_stickout_mm: float = Field(gt=0, le=200)
+    drill_point_angle_deg: float = Field(default=118, ge=90, le=150)
+    peck_depth_mm: float = Field(gt=0, le=50)
+    bottom_condition: Literal["through", "blind_tip_allowance_confirmed"]
+    tip_overtravel_allowance_mm: float = Field(default=0, ge=0, le=50)
+    drill_inventory_id: str = Field(min_length=1, max_length=64)
+    reviewer: str = Field(min_length=1, max_length=100)
 
 
 class ProcessPlan(BaseModel):
@@ -319,6 +396,7 @@ class ProcessPlan(BaseModel):
     manufacturing_requirements: ManufacturingRequirements | None = None
     manufacturing_route: ManufacturingRouteProposal | None = None
     knowledge_assessment: ProcessKnowledgeAssessment | None = None
+    ai_planning: dict[str, Any] | None = None
 
 
 class JobResponse(BaseModel):
@@ -328,6 +406,9 @@ class JobResponse(BaseModel):
     created_at: str
     material: str
     machine: str
+    device_id: str | None = None
+    machine_instance_id: str | None = None
+    machine_configuration_hash: str | None = None
     analysis: GeometryAnalysis | None = None
     plan: ProcessPlan | None = None
     model_url: str | None = None
@@ -335,6 +416,18 @@ class JobResponse(BaseModel):
     drawing_url: str | None = None
     measurement_job_id: str | None = None
     error: str | None = None
+
+
+class JobHistoryItem(BaseModel):
+    id: str
+    status: Literal["processing", "completed", "failed"]
+    filename: str
+    created_at: str
+    material: str
+    machine: str
+    process_kind: Literal["subtractive", "sheet_forming"] | None = None
+    setup_count: int = 0
+    operation_count: int = 0
 
 
 class FeatureReviewRequest(BaseModel):

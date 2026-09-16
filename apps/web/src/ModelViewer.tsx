@@ -6,6 +6,8 @@ import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import type { FixtureComponent, FormingPreview, ManufacturingFeature, SimulationResult, SpatialDefectRegion, SpatialDefectSample, ToolpathSegment, Vec3 } from "./types";
 
+type ViewMode = "特征" | "工艺" | "刀路" | "仿真";
+
 type Props = {
   modelUrl: string;
   features: ManufacturingFeature[];
@@ -29,6 +31,9 @@ type Props = {
   formingPreview?: FormingPreview | null;
   spatialDefects?: { regions: SpatialDefectRegion[]; samples: SpatialDefectSample[] } | null;
   onSelectDefect?: (region: SpatialDefectRegion) => void;
+  viewMode?: ViewMode;
+  workAxis?: Vec3 | null;
+  activeOperationLabel?: string;
 };
 
 // Siemens NX/UG-style neutral blue-gray: dark enough to preserve the part's
@@ -37,8 +42,16 @@ const UG_PART_COLOR = 0x6f7b7d;
 const UG_TARGET_COLOR = 0x788689;
 const UG_EDGE_COLOR = 0x303a3d;
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect }: Props) {
+function featureMarkerColor(feature: ManufacturingFeature) {
+  if (feature.kind === "hole") return 0x4f7cff;
+  if (feature.kind === "pocket") return 0xf0a23b;
+  if (feature.kind === "slot") return 0xa66be0;
+  return 0x18b89a;
+}
+
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", workAxis = null, activeOperationLabel = "" }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
   const onSelectRef = useRef(onSelectFeature);
   const onSelectDefectRef = useRef(onSelectDefect);
@@ -111,17 +124,23 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     for (const [featureId, marker] of markersRef.current) {
       const selected = selectedFeatureIds.includes(featureId);
       const material = marker.material as THREE.MeshBasicMaterial;
-      material.color.set(selected ? 0x52d8af : 0xf0b35c);
-      material.opacity = selected ? 0.48 : 0.07;
+      material.color.set(viewMode === "工艺" ? 0x21c997 : Number(marker.userData.baseColor ?? 0x4f7cff));
+      material.opacity = selected ? 0.68 : viewMode === "特征" ? 0.26 : 0.05;
       marker.renderOrder = selected ? 5 : 3;
     }
-  }, [selectedFeatureIds]);
+  }, [selectedFeatureIds, viewMode]);
 
   useEffect(() => {
     const host = hostRef.current;
-    if (!host) return;
+    const axisHost = axisHostRef.current;
+    if (!host || !axisHost) return;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xc9cdd0);
+    scene.background = new THREE.Color(
+      viewMode === "特征" ? 0xdce7f1
+        : viewMode === "工艺" ? 0xe4e9ec
+          : viewMode === "刀路" ? 0xd6e1e8
+            : 0xc9cdd0,
+    );
     const camera = new THREE.OrthographicCamera(-100, 100, 100, -100, 0.1, 100000);
     camera.up.set(0, 0, 1);
     camera.position.set(120, -140, 150);
@@ -133,6 +152,55 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     host.appendChild(renderer.domElement);
+
+    const axisRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    axisRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    axisRenderer.setSize(72, 72, false);
+    axisRenderer.setClearColor(0x000000, 0);
+    axisRenderer.domElement.setAttribute("aria-hidden", "true");
+    axisHost.appendChild(axisRenderer.domElement);
+    const axisScene = new THREE.Scene();
+    const axisCamera = new THREE.OrthographicCamera(-1.4, 1.4, 1.4, -1.4, 0.1, 10);
+    axisCamera.position.set(0, 0, 5);
+    const axisGroup = new THREE.Group();
+    const axisLength = 0.92;
+    axisGroup.add(
+      new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), axisLength, 0xe34b4b, 0.2, 0.11),
+      new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(), axisLength, 0x35a85b, 0.2, 0.11),
+      new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), axisLength, 0x3978e8, 0.2, 0.11),
+    );
+    const axisLabelResources: { sprite: THREE.Sprite; texture: THREE.CanvasTexture }[] = [];
+    const addAxisLabel = (text: string, color: string, position: THREE.Vector3) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 64;
+      canvas.height = 64;
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      context.font = "700 38px Arial";
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.fillStyle = "#ffffff";
+      context.lineWidth = 8;
+      context.strokeStyle = "#ffffff";
+      context.strokeText(text, 32, 34);
+      context.fillStyle = color;
+      context.fillText(text, 32, 34);
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false }));
+      sprite.position.copy(position);
+      sprite.scale.setScalar(0.38);
+      axisGroup.add(sprite);
+      axisLabelResources.push({ sprite, texture });
+    };
+    addAxisLabel("X", "#d93636", new THREE.Vector3(1.15, 0, 0));
+    addAxisLabel("Y", "#218b46", new THREE.Vector3(0, 1.15, 0));
+    addAxisLabel("Z", "#2868d7", new THREE.Vector3(0, 0, 1.15));
+    axisGroup.add(new THREE.Mesh(
+      new THREE.SphereGeometry(0.075, 16, 12),
+      new THREE.MeshBasicMaterial({ color: 0x657287 }),
+    ));
+    axisScene.add(axisGroup);
 
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
     const environmentTarget = pmremGenerator.fromScene(new RoomEnvironment(), 0.04);
@@ -256,15 +324,15 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       model = new THREE.Mesh(
         renderGeometry,
         new THREE.MeshPhysicalMaterial({
-          color: simulation ? UG_TARGET_COLOR : UG_PART_COLOR,
+          color: simulation ? UG_TARGET_COLOR : viewMode === "特征" ? 0x768793 : viewMode === "刀路" ? 0x87969d : UG_PART_COLOR,
           roughness: 0.56,
           metalness: 0.06,
           clearcoat: 0.04,
           clearcoatRoughness: 0.68,
           envMapIntensity: 0.5,
-          transparent: Boolean(simulation || formingPreview),
-          opacity: simulation ? 0.16 : 1,
-          depthWrite: !simulation,
+          transparent: Boolean(simulation || formingPreview || viewMode === "特征" || viewMode === "刀路"),
+          opacity: simulation ? 0.16 : viewMode === "特征" ? 0.58 : viewMode === "刀路" ? 0.34 : 1,
+          depthWrite: !simulation && viewMode !== "刀路",
           // Keep coplanar CAD edge overlays stable when zoomed in. Without a
           // small depth bias the edge and surface alternate at sub-pixel depth,
           // producing the broken/dotted outlines visible at high zoom.
@@ -392,7 +460,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         new THREE.LineBasicMaterial({
           color: UG_EDGE_COLOR,
           transparent: true,
-          opacity: simulation ? 0.24 : 0.64,
+          opacity: simulation ? 0.24 : viewMode === "刀路" ? 0.2 : viewMode === "特征" ? 0.38 : 0.64,
           depthTest: true,
           depthWrite: false,
         }),
@@ -670,13 +738,14 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           cylinderMarker = true;
         }
         const selected = selectedIdsRef.current.includes(feature.id);
+        const baseColor = viewMode === "工艺" ? 0x21c997 : featureMarkerColor(feature);
         const marker = new THREE.Mesh(
           markerGeometry,
           new THREE.MeshBasicMaterial({
-            color: selected ? 0x52d8af : 0xf0b35c,
+            color: baseColor,
             wireframe: true,
             transparent: true,
-            opacity: selected ? 0.48 : 0.07,
+            opacity: selected ? 0.68 : viewMode === "特征" ? 0.26 : 0.05,
             depthTest: false,
           }),
         );
@@ -688,6 +757,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         );
         if (cylinderMarker) marker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis);
         marker.userData.featureId = feature.id;
+        marker.userData.baseColor = baseColor;
         marker.renderOrder = selected ? 5 : 3;
         markerGroup.add(marker);
         markersRef.current.set(feature.id, marker);
@@ -1325,6 +1395,8 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       if (camoticsMesh) camoticsMesh.visible = playbackRef.current.progress >= 0.999;
       controls.update();
       renderer.render(scene, camera);
+      axisGroup.quaternion.copy(camera.quaternion).invert();
+      axisRenderer.render(axisScene, axisCamera);
       animation = requestAnimationFrame(animate);
     };
     resetMaterial();
@@ -1345,6 +1417,18 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       renderer.domElement.removeEventListener("pointerup", pickFeature);
       controls.dispose();
       renderer.dispose();
+      axisRenderer.dispose();
+      axisGroup.traverse((object) => {
+        if (object instanceof THREE.Mesh || object instanceof THREE.Line) {
+          object.geometry.dispose();
+          const materials = Array.isArray(object.material) ? object.material : [object.material];
+          for (const material of materials) material.dispose();
+        }
+      });
+      for (const resource of axisLabelResources) {
+        resource.sprite.material.dispose();
+        resource.texture.dispose();
+      }
       environmentTarget.dispose();
       pmremGenerator.dispose();
       model?.geometry.dispose();
@@ -1398,8 +1482,9 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       markersRef.current.clear();
       viewApiRef.current = null;
       host.removeChild(renderer.domElement);
+      axisHost.removeChild(axisRenderer.domElement);
     };
-  }, [activeOperationId, animateToolpath, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, modelUrl, operationTools, profileBoundaries, simulation, spatialDefects, toolpathSegments, topologyEdges]);
+  }, [activeOperationId, animateToolpath, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, modelUrl, operationTools, profileBoundaries, simulation, spatialDefects, toolpathSegments, topologyEdges, viewMode, workAxis]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
   const activeFormingStage = formingPreview?.stages.length
@@ -1432,11 +1517,23 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const visibleActiveDefect = activeDefect
     ? spatialDefects?.regions.find((region) => region.id === activeDefect.id) ?? null
     : null;
+  const modeClass = { "特征": "features", "工艺": "process", "刀路": "toolpath", "仿真": "simulation" }[viewMode];
+  const modeTitle = { "特征": "特征识别", "工艺": "工艺规划", "刀路": "刀路结果", "仿真": "加工仿真" }[viewMode];
+  const modeDetail = viewMode === "特征"
+    ? `${features.length} 个制造特征 · 点击彩色区域查看`
+    : viewMode === "工艺"
+      ? activeOperationId ? `${activeOperationId} · ${activeOperationLabel || "当前工序"}` : "请选择一道工序"
+      : viewMode === "刀路"
+        ? toolpathLoaded ? `${toolpathSegments.length} 段运动轨迹` : "正在加载刀路数据"
+        : simulation || formingPreview ? "材料去除过程与安全校验" : "等待刀路与仿真结果";
 
   return (
-    <div className="model-viewer" ref={hostRef}>
-      <div className="viewer-badge">{formingPreview ? progress >= 0.999 ? "FORMING · 当前工序终态" : "FORMING · 薄板成形过程" : camoticsSurface ? progress >= 0.999 ? "CAMOTICS · 装夹最终去除结果" : "CAMOTICS 刀路 · 最终结果在 100% 显示" : simulation ? progress >= 0.999 ? simulation.surface.is_cumulative ? "CUMULATIVE · 多装夹累计余料" : "HEIGHT-FIELD · 加工后毛坯" : progress > 0 ? simulation.surface.is_cumulative ? "CUMULATIVE · 累计材料去除" : "HEIGHT-FIELD · 动态材料去除" : playbackMode === "single" && initialToolpathSegments.length ? "SINGLE STEP · 前序余料已就绪" : "HEIGHT-FIELD · 完整毛坯" : "OCCT MODEL · 空间特征可点击"}</div>
-      <div className="viewer-legend">{formingPreview ? <>原始板料 <i className="selected" />落料件 → 预成形 → 终成形样品</> : <><i />快速移动 <i className="selected" />切削轨迹 · 已完成轨迹自动淡化</>}</div>
+    <div className={`model-viewer mode-${modeClass}`} ref={hostRef}>
+      <div className="orientation-axis" ref={axisHostRef} aria-label="视图坐标轴"><small>视图坐标</small></div>
+      <div className="viewer-badge"><strong>{modeTitle}</strong><small>{modeDetail}</small></div>
+      {viewMode === "特征" && <div className="feature-view-legend"><span><i className="hole" />孔</span><span><i className="pocket" />型腔</span><span><i className="slot" />槽</span><span><i className="profile" />内轮廓</span></div>}
+      {viewMode === "工艺" && <div className="process-view-legend"><i />当前工序加工区域{workAxis && <small>方向 X{workAxis.x.toFixed(0)} Y{workAxis.y.toFixed(0)} Z{workAxis.z.toFixed(0)}</small>}</div>}
+      {(viewMode === "刀路" || viewMode === "仿真") && <div className="viewer-legend">{formingPreview ? <>原始板料 <i className="selected" />落料件 → 预成形 → 终成形样品</> : <><i />快速移动 <i className="selected" />切削轨迹 · 已完成轨迹自动淡化</>}</div>}
       {spatialDefects && spatialDefects.regions.length > 0 && <div className="defect-legend"><span><i className="overcut" />过切</span><span><i className="rest" />残料</span><small>点击色块定位责任工序</small></div>}
       {visibleActiveDefect && <div className={`defect-focus-card ${visibleActiveDefect.kind}`}>
         <button aria-label="关闭缺陷详情" onClick={() => setActiveDefect(null)}>×</button>

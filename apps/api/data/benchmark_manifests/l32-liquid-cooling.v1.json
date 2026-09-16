@@ -1,0 +1,346 @@
+{
+  "schema_version": "1.0.0",
+  "id": "l32-liquid-cooling",
+  "version": "1.0.0",
+  "dataset_root": "液冷项目典型结构图纸",
+  "machine": "Citizen Cincom L32",
+  "description": "液冷项目典型阀芯、阀体、接头和边界反例的 L32 专项回归集",
+  "cases": [
+    {
+      "id": "BUQD0017",
+      "label": "UQD02 公头阀芯",
+      "model": "BUQD0017-ACC_E UQD02 公头阀芯.stp",
+      "drawing": "BUQD0017-ACC_E UQD02 公头阀芯.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["golden", "basic_turning"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "material": "SUS316L",
+        "specified_bar_diameter_mm": 6,
+        "required_features": ["outer_turn_profile", "external_groove", "cutoff_boundary"]
+      }
+    },
+    {
+      "id": "BUQD0035",
+      "label": "UQD04 外壳C",
+      "model": "BUQD00XX-ACC_B UQD04 外殼C.stp",
+      "drawing": "BUQD0035_F UQD04 外壳C.pdf",
+      "pairing_status": "needs_review",
+      "tags": ["radial_holes", "pairing_review"],
+      "expected": {
+        "part_family": "rotational_mill_turn",
+        "machine_capability": "standard",
+        "required_features": ["outer_turn_profile", "inner_turn_profile", "radial_hole"]
+      }
+    },
+    {
+      "id": "BUQD0094",
+      "label": "UQD08 母头阀芯",
+      "model": "BUQD0094-ACC UQD08 母頭閥芯 ocp2.0  2.62密封圈.STEP",
+      "drawing": "BUQD0094-ACC_E UQD08 母头阀芯.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["golden", "bore", "seal_groove"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "material": "SUS316L",
+        "specified_bar_diameter_mm": 21,
+        "required_features": ["outer_turn_profile", "inner_turn_profile", "seal_groove", "axial_hole"]
+      }
+    },
+    {
+      "id": "BUQD0172",
+      "label": "NVQD03 解锁外壳",
+      "model": "BUQD0172;AL6063.stp",
+      "drawing": "BUQD0172_C NVQD03 解锁外壳.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["thin_wall", "short_part"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "material": "AL6063",
+        "required_features": ["outer_turn_profile", "inner_turn_profile"]
+      }
+    },
+    {
+      "id": "BUQD0292",
+      "label": "UQD06 公头主体 3/4-16 UNF",
+      "model": "BUQD0292_A UQD06 公頭主體;3 4-16 UNF螺紋 修改外径.step",
+      "drawing": "BUQD0292_A3 UQD06 公头主体;3 4-16 UNF螺纹;v2.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["golden", "external_thread", "seal_groove"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "material": "SUS316L",
+        "specified_bar_diameter_mm": 25,
+        "thread_designation": "3/4-16 UNF",
+        "required_features": ["outer_turn_profile", "inner_turn_profile", "seal_groove", "external_thread"]
+      }
+    },
+    {
+      "id": "BUQD0296",
+      "label": "UQDB06 母头主体 7/8-14 UNF",
+      "model": "BUQD0296 UQDB06 母頭主體 OCP2.0 - 设变版.step",
+      "drawing": "BUQD0296_A3 UQDB06 母头主体;7 8-14UNF螺纹;v2.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["golden", "external_thread", "deep_bore"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "material": "SUS316L",
+        "specified_bar_diameter_mm": 28,
+        "thread_designation": "7/8-14 UNF",
+        "required_features": ["outer_turn_profile", "inner_turn_profile", "external_thread"]
+      }
+    },
+    {
+      "id": "BUQD0302",
+      "label": "MQD03 母头主体",
+      "model": "BUQD0302.stp",
+      "drawing": "BUQD0302_C MQD03 母頭主體 V08.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["golden", "radial_holes", "one_tool_bore"],
+      "expected": {
+        "part_family": "rotational_mill_turn",
+        "machine_capability": "standard",
+        "material": "SUS304",
+        "required_features": ["outer_turn_profile", "inner_turn_profile", "radial_hole", "circular_hole_pattern"]
+      }
+    },
+    {
+      "id": "BUQD0303",
+      "label": "MQD03 母头阀芯",
+      "model": "BUQD0303.stp",
+      "drawing": "BUQD0303_A MQD03 母头阀芯 V08.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["small_diameter", "bore"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "material": "SUS304",
+        "required_features": ["outer_turn_profile", "axial_hole"]
+      }
+    },
+    {
+      "id": "BUQD0322",
+      "label": "MQD QDB03 公头阀芯",
+      "model": "BUQD0322(1).stp",
+      "drawing": "BUQD0322_B MQD QDB03 公头阀芯.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["small_diameter", "groove"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "material": "SUS304",
+        "specified_bar_diameter_mm": 8,
+        "required_features": ["outer_turn_profile", "external_groove", "cutoff_boundary"]
+      }
+    },
+    {
+      "id": "BUQD0325",
+      "label": "MQD03 L型公头主体",
+      "model": "BUQD0325.stp",
+      "drawing": "BUQD0325_A MQD03 L型公頭主體.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["golden", "negative", "non_rotational"],
+      "expected": {
+        "part_family": "non_rotational",
+        "machine_capability": "unsupported",
+        "required_blocking_codes": ["not_rotational"]
+      }
+    },
+    {
+      "id": "BUQD0330",
+      "label": "UQD04 快插头",
+      "model": "BUQD0330-ACC_UQD04 快插頭C_預設.stp",
+      "drawing": "BUQD0330_B UQD04 快插頭v2.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["golden", "radial_holes", "milled_flats", "thread"],
+      "expected": {
+        "part_family": "rotational_mill_turn",
+        "machine_capability": "standard",
+        "material": "SUS316L",
+        "required_features": ["outer_turn_profile", "inner_turn_profile", "radial_hole", "milled_flat", "external_thread"]
+      }
+    },
+    {
+      "id": "BUQD0331",
+      "label": "UQD04 3/8 宝塔头",
+      "model": "BUQD0331.stp",
+      "drawing": "BUQD0331_A UQD04八分之三寶塔頭v2.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["long_bore", "stepped_profile"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "material": "SUS316L",
+        "required_features": ["outer_turn_profile", "inner_turn_profile"]
+      }
+    },
+    {
+      "id": "BUQD0400",
+      "label": "UQD02 G1/8 螺纹接头",
+      "model": "BUQD0400_A UQD02 母頭G1 8螺紋;SUS316L.STEP",
+      "drawing": "BUQD0400_A UQD02 母头G1 8螺纹.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["pipe_thread", "small_bore"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "material": "SUS316L",
+        "specified_bar_diameter_mm": 17,
+        "thread_designation": "G1/8",
+        "required_features": ["outer_turn_profile", "inner_turn_profile", "external_thread"]
+      }
+    },
+    {
+      "id": "QD028-FIX-VALVE-PIN",
+      "label": "QD028 固定阀针",
+      "model": "qd028-pbmc-socket-fix-valve-pin.stp",
+      "drawing": "QD028-PBMC-SOCKET-FIX-VALVE-PIN.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["slender", "guide_bushing"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "required_features": ["outer_turn_profile", "cutoff_boundary"]
+      }
+    },
+    {
+      "id": "QD028-INNER-BASE",
+      "label": "QD028 内座",
+      "model": "qd028-pbmc-socket-inner-base.stp",
+      "drawing": "QD028-PBMC-SOCKET-INNER-BASE.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["deep_bore", "multi_bore"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "required_features": ["outer_turn_profile", "inner_turn_profile", "axial_hole"]
+      }
+    },
+    {
+      "id": "QD028-LOCK",
+      "label": "QD028 锁套",
+      "model": "qd028-pbmc-socket-lock.stp",
+      "drawing": "QD028-PBMC-SOCKET-LOCK.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["bar_38_option", "large_diameter"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "bar_diameter_38mm_option",
+        "specified_bar_diameter_mm": 38,
+        "required_features": ["outer_turn_profile", "inner_turn_profile"]
+      }
+    },
+    {
+      "id": "QD028-OUT-BASE",
+      "label": "QD028 外座",
+      "model": "qd028-pbmc-socket-out-base.stp",
+      "drawing": "QD028-PBMC-SOCKET-OUT-BASE.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["negative", "over_diameter"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "unsupported",
+        "required_blocking_codes": ["bar_diameter_over_38mm"]
+      }
+    },
+    {
+      "id": "QD028-RETAINER",
+      "label": "QD028 保持环",
+      "model": "QD028-pbmc-socket-retainer.stp",
+      "drawing": "QD028-pbmc-socket-retainer.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["golden", "bar_38_option", "short_part"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "bar_diameter_38mm_option",
+        "material": "SUS304",
+        "required_features": ["outer_turn_profile", "inner_turn_profile", "cutoff_boundary"]
+      }
+    },
+    {
+      "id": "QD028-VALVE",
+      "label": "QD028 阀芯",
+      "model": "qd028-pbmc-socket-valve.stp",
+      "drawing": "QD028-PBMC-SOCKET-VALVE.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["short_part", "bore"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "required_features": ["outer_turn_profile", "inner_turn_profile"]
+      }
+    },
+    {
+      "id": "QD028-WASHER-ROTATE",
+      "label": "QD028 旋转垫片",
+      "model": "QD028-PBMC-SOCKET-WASHER-ROTATE.stp",
+      "drawing": "QD028-PBMC-SOCKET-WASHER-ROTATE.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["negative", "multi_solid"],
+      "expected": {
+        "part_family": "requires_solid_selection",
+        "machine_capability": "review",
+        "required_blocking_codes": ["solid_selection_required"]
+      }
+    },
+    {
+      "id": "QD035-PLUG-BASE",
+      "label": "QD035 公头主体",
+      "model": "QD035-PBMC-PLUG-BASE.stp",
+      "drawing": "QD035-PBMC-PLUG-BASE.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["long_part", "deep_bore"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "required_features": ["outer_turn_profile", "inner_turn_profile"]
+      }
+    },
+    {
+      "id": "QD035-PLUG-VALVE",
+      "label": "QD035 公头阀芯",
+      "model": "QD035-PBMC-PLUG-VALVE.stp",
+      "drawing": "QD035-PBMC-PLUG-VALVE.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["small_diameter", "short_part"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "required_features": ["outer_turn_profile", "cutoff_boundary"]
+      }
+    },
+    {
+      "id": "QD900-FIX-VALVE-CNC",
+      "label": "QD900 固定阀 CNC",
+      "model": "QD900-UQDB08-FIX-VALVE-CNC.stp",
+      "drawing": "QD900-UQDB08-FIX-VALVE-CNC.pdf",
+      "pairing_status": "confirmed",
+      "tags": ["weak_pdf_text", "multi_bore"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "required_features": ["outer_turn_profile", "inner_turn_profile"]
+      }
+    },
+    {
+      "id": "BUQD0078",
+      "label": "UQD06 公头阀芯",
+      "model": "UQD06 公頭閥芯.step",
+      "drawing": "BUQD0078-ACC_D UQD06 公头阀芯.pdf",
+      "pairing_status": "needs_review",
+      "tags": ["pairing_review", "small_diameter"],
+      "expected": {
+        "part_family": "rotational",
+        "machine_capability": "standard",
+        "material": "SUS316L",
+        "specified_bar_diameter_mm": 12,
+        "required_features": ["outer_turn_profile", "external_groove", "cutoff_boundary"]
+      }
+    }
+  ]
+}

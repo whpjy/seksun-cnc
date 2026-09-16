@@ -16,6 +16,7 @@ services:
       CNC_MEAS_API_BASE_URL: http://measurement:8080
       CNC_MEAS_TIMEOUT_SECONDS: ${CNC_MEAS_TIMEOUT_SECONDS:-600}
       CNC_EXAMPLE_ROOT: /var/lib/seksun-cnc/examples
+      CNC_EXAMPLE_MANIFEST: /app/data/benchmark_manifests/l32-liquid-cooling.v1.json
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       QWEN_BASE_URL: ${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       QWEN_MODEL: ${QWEN_MODEL:-qwen3.8-max-0902}
@@ -23,7 +24,7 @@ services:
       QWEN_PLANNING_THINKING: ${QWEN_PLANNING_THINKING:-false}
     volumes:
       - ./.seksun-cnc:/var/lib/seksun-cnc
-      - "../example/用于2d图纸识别_ 10份对应2d和3d:/var/lib/seksun-cnc/examples:ro"
+      - "../example:/var/lib/seksun-cnc/examples:ro"
     depends_on:
       - measurement
     ports:

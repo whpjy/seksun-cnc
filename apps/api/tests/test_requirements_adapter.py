@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from app.models import GeometryAnalysis
 from app.planner import build_process_plan
-from app.requirements_adapter import import_measurement_specification, reconcile_requirement_bindings
+from app.requirements_adapter import (
+    import_measurement_specification, parse_thread_specification, reconcile_requirement_bindings,
+)
 
 
 def measurement_specification() -> dict:
@@ -165,3 +167,64 @@ def test_foreign_linear_dimension_binding_is_not_treated_as_verified() -> None:
     assert requirement.mapping_status == "ambiguous"
     assert requirement.verification_status == "needs_cross_system_rebinding"
     assert reconciled.status == "incomplete"
+
+
+def test_parses_unf_ocr_and_g_pipe_thread_designations() -> None:
+    unf = parse_thread_specification("外螺纹 3 4-16 UNF-2A")
+    bspp = parse_thread_specification("内螺纹 G1/8")
+
+    assert unf is not None
+    assert unf.designation == "3/4-16 UNF-2A"
+    assert unf.side == "external"
+    assert unf.major_diameter_mm == 19.05
+    assert unf.pitch_mm == 1.5875
+    assert unf.form_angle_degrees == 60
+    assert bspp is not None
+    assert bspp.designation == "G1/8"
+    assert bspp.standard == "BSPP"
+    assert bspp.side == "internal"
+    assert bspp.major_diameter_mm == 9.728
+    assert bspp.pitch_mm == 0.907143
+    assert bspp.form_angle_degrees == 55
+
+
+def test_thread_requirement_rebinds_by_side_and_major_diameter() -> None:
+    analysis = GeometryAnalysis.model_validate({
+        "schema_version": "0.8.0", "source_file": "threaded.step",
+        "topology": {"solids": 1},
+        "measurements": {
+            "surface_area": 100, "volume": 100,
+            "bounding_box": {
+                "minimum": {"x": -10, "y": -10, "z": -20},
+                "maximum": {"x": 10, "y": 10, "z": 20},
+                "size": {"x": 20, "y": 20, "z": 40},
+            },
+        },
+        "planar_features": [],
+        "cylindrical_features": [{
+            "id": "HF-THREAD", "kind": "boss", "radius": 9.525,
+            "diameter": 19.05, "length": 15,
+            "center": {"x": 0, "y": 0, "z": 0},
+            "axis": {"x": 0, "y": 0, "z": 1},
+            "confidence": 0.9, "review_state": "accepted",
+        }],
+    })
+    requirements = import_measurement_specification({
+        "comparison_rows": [{
+            "drawing_entity": {
+                "id": "THREAD-1", "semantic_type": "thread",
+                "source": {"raw_text": "外螺纹 3/4-16 UNF-2A"},
+            },
+            "mapping_status": "matched", "verification_status": "verified_geometry",
+            "cad_feature_ids": ["FOREIGN-THREAD"], "confidence": 0.95,
+        }],
+    })
+
+    reconciled = reconcile_requirement_bindings(requirements, analysis)
+    requirement = reconciled.requirements[0]
+
+    assert requirement.thread is not None
+    assert requirement.cad_feature_ids == ["HF-THREAD"]
+    assert requirement.mapping_status == "matched"
+    assert requirement.verification_status == "verified_geometry"
+    assert requirement.source["binding_method"] == "cnc_thread_major_diameter_rebind"

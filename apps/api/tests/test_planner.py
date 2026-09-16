@@ -78,6 +78,18 @@ def test_groups_equal_holes_into_one_operation() -> None:
     assert plan.material_profile.id == "al-6061-t6"
 
 
+def test_ai_process_kind_hint_can_route_plan_to_sheet_forming() -> None:
+    plan = build_process_plan(
+        sample_analysis(), "6061-T6", "VMC-850", process_kind_hint="sheet_forming",
+    )
+
+    assert plan.process_kind == "sheet_forming"
+    assert [operation.type for operation in plan.setups[0].operations] == [
+        "sheet_flat_pattern", "sheet_blanking", "sheet_preforming",
+        "sheet_final_forming", "sheet_deburring", "sheet_inspection",
+    ]
+
+
 def test_through_drill_depth_includes_point_and_breakthrough() -> None:
     analysis = sample_analysis()
     for feature in analysis.cylindrical_features:

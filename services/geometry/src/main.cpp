@@ -1,5 +1,6 @@
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepAlgoAPI_Section.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
@@ -29,6 +30,7 @@
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Vec.hxx>
 
 #include <algorithm>
 #include <cmath>
@@ -37,6 +39,8 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <numeric>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -102,6 +106,22 @@ struct SolidCandidate {
     Vec3 bounds_maximum;
 };
 
+struct RotationalSectionPoint {
+    double z{};
+    double radius{};
+};
+
+struct RotationalSectionCandidate {
+    std::string source_feature_id;
+    Vec3 axis_origin;
+    Vec3 axis;
+    Vec3 plane_normal;
+    std::vector<RotationalSectionPoint> outer_profile;
+    std::vector<RotationalSectionPoint> inner_profile;
+    double tolerance_mm{};
+    std::vector<std::string> warnings;
+};
+
 using EdgePolyline = std::vector<Vec3>;
 
 double shape_diagonal(const TopoDS_Shape& shape) {
@@ -110,6 +130,51 @@ double shape_diagonal(const TopoDS_Shape& shape) {
     double x_min, y_min, z_min, x_max, y_max, z_max;
     box.Get(x_min, y_min, z_min, x_max, y_max, z_max);
     return std::hypot(std::hypot(x_max - x_min, y_max - y_min), z_max - z_min);
+}
+
+double dot(const Vec3& left, const Vec3& right) {
+    return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+Vec3 subtract(const Vec3& left, const Vec3& right) {
+    return {left.x - right.x, left.y - right.y, left.z - right.z};
+}
+
+Vec3 cross(const Vec3& left, const Vec3& right) {
+    return {
+        left.y * right.z - left.z * right.y,
+        left.z * right.x - left.x * right.z,
+        left.x * right.y - left.y * right.x,
+    };
+}
+
+Vec3 normalize(const Vec3& value) {
+    const double length = std::sqrt(dot(value, value));
+    if (length <= 1e-12) throw std::runtime_error("Cannot normalize zero vector");
+    return {value.x / length, value.y / length, value.z / length};
+}
+
+std::vector<RotationalSectionPoint> simplify_rotational_profile(
+    const std::vector<RotationalSectionPoint>& points,
+    double tolerance) {
+    if (points.size() <= 2) return points;
+    std::vector<RotationalSectionPoint> result{points.front()};
+    for (std::size_t index = 1; index + 1 < points.size(); ++index) {
+        const auto& previous = result.back();
+        const auto& current = points[index];
+        const auto& following = points[index + 1];
+        const double left_z = current.z - previous.z;
+        const double right_z = following.z - current.z;
+        if (std::abs(left_z) <= tolerance || std::abs(right_z) <= tolerance) {
+            result.push_back(current);
+            continue;
+        }
+        const double left_slope = (current.radius - previous.radius) / left_z;
+        const double right_slope = (following.radius - current.radius) / right_z;
+        if (std::abs(left_slope - right_slope) > tolerance) result.push_back(current);
+    }
+    result.push_back(points.back());
+    return result;
 }
 
 std::vector<EdgePolyline> collect_visual_edges(const TopoDS_Shape& shape) {
@@ -365,6 +430,123 @@ std::vector<CylindricalFeature> collect_cylindrical_features(
     return features;
 }
 
+std::optional<RotationalSectionCandidate> collect_rotational_section(
+    const TopoDS_Shape& shape,
+    const std::vector<CylindricalFeature>& cylinders) {
+    if (cylinders.empty()) return std::nullopt;
+    const auto reference = std::max_element(
+        cylinders.begin(), cylinders.end(),
+        [](const CylindricalFeature& left, const CylindricalFeature& right) {
+            const auto score = [](const CylindricalFeature& item) {
+                const double kind_factor = item.kind == "hole" ? 0.25 : 1.0;
+                const double span_factor = std::max(item.angular_span_degrees / 360.0, 0.1);
+                return kind_factor * item.radius * std::max(item.length, 0.1) * span_factor;
+            };
+            return score(left) < score(right);
+        });
+    if (reference == cylinders.end()) return std::nullopt;
+
+    const Vec3 axis = normalize(reference->axis);
+    const Vec3 helper = std::abs(axis.x) < 0.8 ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+    const Vec3 plane_normal = normalize(cross(axis, helper));
+    const Vec3 radial_direction = normalize(cross(plane_normal, axis));
+    const gp_Pln plane(
+        gp_Pnt(reference->center.x, reference->center.y, reference->center.z),
+        gp_Dir(plane_normal.x, plane_normal.y, plane_normal.z));
+    BRepAlgoAPI_Section section(shape, plane, Standard_False);
+    section.Approximation(Standard_True);
+    section.Build();
+    if (!section.IsDone()) return std::nullopt;
+
+    const double diagonal = shape_diagonal(shape);
+    const double sampling_tolerance = std::clamp(diagonal / 20000.0, 0.001, 0.01);
+    std::vector<RotationalSectionPoint> samples;
+    TopTools_IndexedMapOfShape section_edges;
+    TopExp::MapShapes(section.Shape(), TopAbs_EDGE, section_edges);
+    for (int edge_index = 1; edge_index <= section_edges.Extent(); ++edge_index) {
+        const TopoDS_Edge edge = TopoDS::Edge(section_edges(edge_index));
+        BRepAdaptor_Curve curve(edge);
+        GCPnts_QuasiUniformDeflection points(curve, sampling_tolerance);
+        if (!points.IsDone() || points.NbPoints() < 2) continue;
+        const int stride = std::max(1, static_cast<int>(std::ceil(points.NbPoints() / 1024.0)));
+        for (int index = 1; index <= points.NbPoints(); index += stride) {
+            const Vec3 point = point_to_vec(points.Value(index));
+            const Vec3 delta = subtract(point, reference->center);
+            samples.push_back({dot(delta, axis), std::abs(dot(delta, radial_direction))});
+        }
+        const Vec3 point = point_to_vec(points.Value(points.NbPoints()));
+        const Vec3 delta = subtract(point, reference->center);
+        samples.push_back({dot(delta, axis), std::abs(dot(delta, radial_direction))});
+    }
+    if (samples.size() < 2) return std::nullopt;
+
+    std::sort(samples.begin(), samples.end(), [](const auto& left, const auto& right) {
+        if (std::abs(left.z - right.z) > 1e-12) return left.z < right.z;
+        return left.radius < right.radius;
+    });
+    const double z_tolerance = std::max(sampling_tolerance, diagonal * 1e-6);
+    const double radius_tolerance = std::max(sampling_tolerance, diagonal * 1e-6);
+    std::vector<std::vector<RotationalSectionPoint>> groups;
+    for (const auto& sample : samples) {
+        if (groups.empty()) {
+            groups.push_back({sample});
+            continue;
+        }
+        const double mean_z = std::accumulate(
+            groups.back().begin(), groups.back().end(), 0.0,
+            [](double sum, const RotationalSectionPoint& item) { return sum + item.z; })
+            / static_cast<double>(groups.back().size());
+        if (std::abs(sample.z - mean_z) > z_tolerance) groups.push_back({sample});
+        else groups.back().push_back(sample);
+    }
+
+    std::vector<RotationalSectionPoint> outer;
+    std::vector<RotationalSectionPoint> inner;
+    int inner_groups = 0;
+    for (const auto& group : groups) {
+        const double z = std::accumulate(
+            group.begin(), group.end(), 0.0,
+            [](double sum, const RotationalSectionPoint& item) { return sum + item.z; })
+            / static_cast<double>(group.size());
+        std::vector<double> radii;
+        for (const auto& item : group) {
+            if (item.radius <= radius_tolerance) continue;
+            if (radii.empty() || std::all_of(radii.begin(), radii.end(), [&](double radius) {
+                    return std::abs(radius - item.radius) > radius_tolerance;
+                })) {
+                radii.push_back(item.radius);
+            }
+        }
+        if (radii.empty()) continue;
+        const auto [minimum, maximum] = std::minmax_element(radii.begin(), radii.end());
+        outer.push_back({z, *maximum});
+        if (*maximum - *minimum > radius_tolerance * 2) {
+            inner.push_back({z, *minimum});
+            ++inner_groups;
+        }
+    }
+    if (outer.size() < 2) return std::nullopt;
+    outer = simplify_rotational_profile(outer, sampling_tolerance);
+    if (inner_groups < 2) inner.clear();
+    else inner = simplify_rotational_profile(inner, sampling_tolerance);
+
+    RotationalSectionCandidate result{
+        reference->id,
+        reference->center,
+        axis,
+        plane_normal,
+        std::move(outer),
+        std::move(inner),
+        sampling_tolerance,
+        {},
+    };
+    if (!result.inner_profile.empty()) {
+        result.warnings.push_back(
+            "Inner section envelope may include grooves or radial-hole intersections and requires review");
+    }
+    return result;
+}
+
 std::vector<InternalProfileFeature> collect_internal_profiles(
     const TopoDS_Shape& shape,
     const std::vector<PlanarFeature>& planes) {
@@ -453,6 +635,7 @@ std::string make_json(
     const std::vector<PlanarFeature>& planes,
     const std::vector<CylindricalFeature>& cylinders,
     const std::vector<InternalProfileFeature>& internal_profiles,
+    const std::optional<RotationalSectionCandidate>& rotational_section,
     const std::vector<EdgePolyline>& visual_edges) {
     Bnd_Box box;
     BRepBndLib::AddOptimal(shape, box, Standard_False, Standard_False);
@@ -587,6 +770,38 @@ std::string make_json(
     }
     json << "  ],\n";
 
+    json << "  \"rotational_sections\": [";
+    if (rotational_section.has_value()) {
+        const auto& section = rotational_section.value();
+        json << '\n'
+             << "    {\"source_feature_id\":\"" << json_escape(section.source_feature_id)
+             << "\",\"axis_origin\":";
+        append_vec(json, section.axis_origin);
+        json << ",\"axis\":";
+        append_vec(json, section.axis);
+        json << ",\"plane_normal\":";
+        append_vec(json, section.plane_normal);
+        json << ",\"outer_profile\":[";
+        for (std::size_t index = 0; index < section.outer_profile.size(); ++index) {
+            const auto& point = section.outer_profile[index];
+            json << "{\"z\":" << point.z << ",\"radius\":" << point.radius << '}';
+            if (index + 1 < section.outer_profile.size()) json << ',';
+        }
+        json << "],\"inner_profile\":[";
+        for (std::size_t index = 0; index < section.inner_profile.size(); ++index) {
+            const auto& point = section.inner_profile[index];
+            json << "{\"z\":" << point.z << ",\"radius\":" << point.radius << '}';
+            if (index + 1 < section.inner_profile.size()) json << ',';
+        }
+        json << "],\"tolerance_mm\":" << section.tolerance_mm << ",\"warnings\":[";
+        for (std::size_t index = 0; index < section.warnings.size(); ++index) {
+            json << '\"' << json_escape(section.warnings[index]) << '\"';
+            if (index + 1 < section.warnings.size()) json << ',';
+        }
+        json << "]}\n";
+    }
+    json << "  ],\n";
+
     json << "  \"visual_edges\": [";
     for (std::size_t edge_index = 0; edge_index < visual_edges.size(); ++edge_index) {
         if (edge_index == 0) json << '\n';
@@ -665,15 +880,17 @@ int main(int argc, char* argv[]) {
         const auto planes = collect_planar_features(shape);
         const auto cylinders = collect_cylindrical_features(shape);
         const auto internal_profiles = collect_internal_profiles(shape, planes);
+        const auto rotational_section = collect_rotational_section(shape, cylinders);
         const auto visual_edges = collect_visual_edges(shape);
         write_file(output, make_json(
             input, shape, source_solid_count, selected_solid_index,
             requested_solid_index > 0, solid_candidates,
-            planes, cylinders, internal_profiles, visual_edges));
+            planes, cylinders, internal_profiles, rotational_section, visual_edges));
         std::cout << "Analyzed " << input.filename().string() << ": "
                   << planes.size() << " planes, " << cylinders.size()
                   << " cylinders, " << internal_profiles.size()
-                  << " internal profiles, " << visual_edges.size() << " visual edges\n";
+                  << " internal profiles, " << (rotational_section.has_value() ? 1 : 0)
+                  << " rotational sections, " << visual_edges.size() << " visual edges\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "ERROR: " << error.what() << '\n';

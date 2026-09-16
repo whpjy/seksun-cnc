@@ -115,6 +115,31 @@ def evaluate_plan_coverage(
             covered_by=[item.id for item in matching], source_feature_ids=[feature_id],
         ))
 
+    if plan.stock.get("type") == "round_bar":
+        profile_id = str(plan.stock.get("rotational_profile_id", ""))
+        turning_required = {"turn_od_roughing", "turn_od_finishing"}
+        profile_operations = [
+            operation for operation in by_feature.get(profile_id, [])
+            if operation.type in turning_required
+        ]
+        found_types = {operation.type for operation in profile_operations}
+        review_state = str(plan.stock.get("profile_review_state", "review"))
+        if review_state == "accepted" and profile_id and turning_required <= found_types:
+            state = "covered"
+        elif review_state == "review":
+            state = "review"
+        else:
+            state = "uncovered"
+        targets.append(CoverageTarget(
+            id=f"TARGET-{profile_id or 'ROTATIONAL-PROFILE'}",
+            kind="outer_profile",
+            label="L32 outer rotational profile",
+            state=state,
+            required_operation_types=sorted(turning_required),
+            covered_by=[operation.id for operation in profile_operations],
+            source_feature_ids=[profile_id] if profile_id else [],
+        ))
+
     bounds = analysis.measurements.get("bounding_box")
     profile_plane = None
     profile_axis = (0, 0, 1)

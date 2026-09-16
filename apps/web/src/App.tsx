@@ -7,47 +7,61 @@ import {
   Bot,
   Box,
   Check,
-  ChevronLeft,
+  ChevronDown,
   ChevronRight,
   CircleDot,
-  Clock3,
-  Download,
+  Cog,
   FileUp,
+  FolderOpen,
+  History,
+  Info,
   Layers3,
   Library,
-  Link2,
   LoaderCircle,
   Pencil,
   Play,
-  RefreshCw,
   Rotate3D,
-  Settings2,
   ShieldCheck,
   Trash2,
+  UserRound,
   Wrench,
   X,
 } from "lucide-react";
 import { ModelViewer } from "./ModelViewer";
-import type { AIProcessReviewResult, CamResult, Catalogs, Job, ManufacturingFeature, Operation, OperationDefinition, SpatialDefectRegion, ToolpathSegment, Vec3 } from "./types";
+import { L32Workbench } from "./L32Workbench";
+import type { CamResult, Catalogs, DeviceLibrary, Job, ManufacturingFeature, Operation, SpatialDefectRegion, ToolpathSegment, Vec3 } from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
 const EMPTY_PROFILE_BOUNDARIES: { operation_id: string; setup_id: string; work_axis: Vec3; points: Vec3[] }[] = [];
-const PROCESS_PHASES = ["基准", "粗加工", "孔加工", "精加工", "切断", "完成"] as const;
-
-function processPhase(operationType: string): typeof PROCESS_PHASES[number] {
-  if (operationType === "face_milling" || operationType.includes("preform")) return "基准";
-  if (operationType.includes("roughing") || operationType === "adaptive_clearing") return "粗加工";
-  if (["drilling", "helical_boring", "tapping", "reaming"].includes(operationType)) return "孔加工";
-  if (operationType === "internal_profile_finishing") return "精加工";
-  if (operationType.includes("profile") || operationType === "tab_removal") return "切断";
-  if (["edge_chamfer", "deburring", "inspection"].includes(operationType)) return "完成";
-  return "精加工";
-}
-
 function apiUrl(path: string) {
   return `${API_BASE}${path}`;
 }
+
+type PlanningProgressEvent = {
+  stage: string;
+  message: string;
+  percent: number;
+  feature_count?: number;
+  hole_count?: number;
+  requirement_count?: number;
+  matched_count?: number;
+  setup_count?: number;
+  operation_count?: number;
+  coverage_score?: number;
+  warning?: string;
+};
+
+const PLANNING_STAGE_ORDER = [
+  "uploading", "geometry_analysis", "draft_planning", "drawing_analysis", "ai_planning",
+  "process_generation", "coverage_validation", "completed",
+];
+const DEVICE_OPERATION_GROUP_ALIASES: Record<string, string[]> = {
+  "钻孔": ["孔加工"],
+  "倒角": ["边加工"],
+  "小型型腔": ["型腔加工"],
+  "雕刻": ["engraving"],
+};
 
 function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   open: boolean;
@@ -57,10 +71,27 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
 }) {
   const stepInputRef = useRef<HTMLInputElement>(null);
   const drawingInputRef = useRef<HTMLInputElement>(null);
+  const planningStreamRef = useRef<EventSource | null>(null);
   const [stepFile, setStepFile] = useState<File | null>(null);
   const [drawingFile, setDrawingFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [progressEvents, setProgressEvents] = useState<PlanningProgressEvent[]>([]);
+  const [newJobDevices, setNewJobDevices] = useState<DeviceLibrary["devices"]>([]);
+  const [selectedNewJobDeviceId, setSelectedNewJobDeviceId] = useState("");
+
+  useEffect(() => () => planningStreamRef.current?.close(), []);
+
+  useEffect(() => {
+    if (!open || newJobDevices.length) return;
+    fetch(apiUrl("/api/v1/device-library"))
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((payload: DeviceLibrary) => {
+        setNewJobDevices(payload.devices);
+        setSelectedNewJobDeviceId((current) => current || payload.devices[0]?.id || "");
+      })
+      .catch(() => setError("加工设备暂时无法加载"));
+  }, [newJobDevices.length, open]);
 
   useEffect(() => {
     if (!open || !canClose) return;
@@ -72,22 +103,56 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   }, [busy, canClose, onClose, open]);
 
   const submit = async () => {
-    if (!stepFile || !drawingFile) return;
+    if (!stepFile || !drawingFile || !selectedNewJobDeviceId) return;
     setBusy(true);
     setError("");
+    setProgressEvents([{ stage: "uploading", message: "正在上传二维图纸和三维模型", percent: 2 }]);
     const form = new FormData();
     form.append("step", stepFile);
     form.append("drawing", drawingFile);
+    form.append("device_id", selectedNewJobDeviceId);
     try {
-      const response = await fetch(apiUrl("/api/v1/jobs"), { method: "POST", body: form });
+      const response = await fetch(apiUrl("/api/v1/jobs/start"), { method: "POST", body: form });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "分析失败");
-      onCreated(payload as Job);
-      setStepFile(null);
-      setDrawingFile(null);
+      const pendingJob = payload as Job;
+      const stream = new EventSource(apiUrl(`/api/v1/jobs/${pendingJob.id}/events`));
+      planningStreamRef.current = stream;
+      stream.onmessage = async (event) => {
+        const update = JSON.parse(event.data) as PlanningProgressEvent;
+        setProgressEvents((current) => {
+          const withoutStage = current.filter((item) => item.stage !== update.stage);
+          return [...withoutStage, update].sort(
+            (left, right) => PLANNING_STAGE_ORDER.indexOf(left.stage) - PLANNING_STAGE_ORDER.indexOf(right.stage),
+          );
+        });
+        if (update.stage === "error") {
+          stream.close();
+          planningStreamRef.current = null;
+          setError(update.message);
+          setBusy(false);
+          return;
+        }
+        if (update.stage === "completed") {
+          stream.close();
+          planningStreamRef.current = null;
+          try {
+            const jobResponse = await fetch(apiUrl(`/api/v1/jobs/${pendingJob.id}`));
+            const completedJob = await jobResponse.json();
+            if (!jobResponse.ok || completedJob.status !== "completed") {
+              throw new Error(completedJob.detail || completedJob.error || "无法加载生成结果");
+            }
+            setStepFile(null);
+            setDrawingFile(null);
+            onCreated(completedJob as Job);
+          } catch (reason) {
+            setError(reason instanceof Error ? reason.message : "无法加载生成结果");
+            setBusy(false);
+          }
+        }
+      };
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法连接分析服务");
-    } finally {
       setBusy(false);
     }
   };
@@ -101,7 +166,20 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
           <div><span className="dialog-icon"><FileUp size={18} /></span><div><strong id="new-job-title">新建工艺任务</strong><small>同时上传工程图和三维模型，自动规划工序</small></div></div>
           {canClose && <button aria-label="关闭新建任务" disabled={busy} onClick={onClose}><X size={17} /></button>}
         </header>
-        <div className="upload-pair">
+        {busy ? <div className="planning-progress" aria-live="polite">
+          <div className="planning-progress-head">
+            <div><LoaderCircle className="spin" size={18} /><strong>{progressEvents.at(-1)?.message ?? "正在分析并生成工艺"}</strong></div>
+            <span>{Math.round(progressEvents.at(-1)?.percent ?? 0)}%</span>
+          </div>
+          <div className="planning-progress-track"><i style={{ width: `${progressEvents.at(-1)?.percent ?? 0}%` }} /></div>
+          <div className="planning-progress-stages">
+            {progressEvents.filter((item) => item.stage !== "completed").slice(-5).map((item, index, items) => <div className={index === items.length - 1 ? "active" : "done"} key={item.stage}>
+              {index === items.length - 1 ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
+              <span>{item.message}</span>
+              {item.operation_count !== undefined && <small>{item.setup_count} 次装夹 · {item.operation_count} 道工序</small>}
+            </div>)}
+          </div>
+        </div> : <><div className="upload-pair">
           <button
             className={`drop-zone upload-pdf ${drawingFile ? "has-file" : ""}`}
             onClick={() => drawingInputRef.current?.click()}
@@ -141,29 +219,136 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
             <input ref={stepInputRef} type="file" accept=".step,.stp" hidden onChange={(event) => { setError(""); setStepFile(event.target.files?.[0] ?? null); }} />
             <span className="upload-type">STEP</span>
             <Box size={28} />
-            <strong>{stepFile ? stepFile.name : "三维零件模型"}</strong>
+            <strong>{stepFile ? stepFile.name : "三维模型"}</strong>
             <small>{stepFile ? `${(stepFile.size / 1024 / 1024).toFixed(2)} MB · 点击重新选择` : "精确 B-Rep 几何与制造特征"}</small>
           </button>
         </div>
+        <section className="new-job-device-picker" aria-label="选择加工设备">
+          <div><strong>加工设备</strong><small>工艺将按照所选设备能力生成</small></div>
+          <div>
+            {newJobDevices.map((device) => <button className={selectedNewJobDeviceId === device.id ? "active" : ""} key={device.id} onClick={() => setSelectedNewJobDeviceId(device.id)}>
+              <Cog size={16} />
+              <span><strong>{device.display_name}</strong><small>{device.category_label}</small></span>
+              <em className={device.library_status}>{device.library_status === "supported" ? "已支持" : "适配中"}</em>
+            </button>)}
+          </div>
+        </section>
         {error && <div className="inline-error"><AlertTriangle size={15} />{error}</div>}
-        <button className="primary-action" disabled={!stepFile || !drawingFile || busy} onClick={submit}>
-          {busy ? <><LoaderCircle className="spin" size={17} /> 正在分析并生成工艺…</> : <>分析并生成工艺 <ChevronRight size={17} /></>}
+        <button className="primary-action" disabled={!stepFile || !drawingFile || !selectedNewJobDeviceId || busy} onClick={submit}>
+          分析并生成工艺 <ChevronRight size={17} />
         </button>
+        </>}
+        {busy && error && <div className="inline-error"><AlertTriangle size={15} />{error}</div>}
       </section>
     </div>
   );
 }
 
-function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; onNew: () => void; readOnly?: boolean }) {
+type JobHistoryItem = {
+  id: string;
+  status: "processing" | "completed" | "failed";
+  filename: string;
+  created_at: string;
+  material: string;
+  machine: string;
+  process_kind: "subtractive" | "sheet_forming" | null;
+  setup_count: number;
+  operation_count: number;
+};
+
+function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId: string; onClose: () => void; onSelected: (job: Job) => void }) {
+  const [items, setItems] = useState<JobHistoryItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [openingId, setOpeningId] = useState("");
+  const [clearing, setClearing] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    fetch(apiUrl("/api/v1/jobs"))
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || "历史记录加载失败");
+        setItems((payload as JobHistoryItem[]).filter((item) => item.id !== activeJobId));
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "历史记录加载失败"))
+      .finally(() => setLoading(false));
+  }, [activeJobId]);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => event.key === "Escape" && onClose();
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  const openHistoryJob = async (item: JobHistoryItem) => {
+    setOpeningId(item.id);
+    setError("");
+    try {
+      const response = await fetch(apiUrl(`/api/v1/jobs/${item.id}`));
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "任务加载失败");
+      onSelected(payload as Job);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "任务加载失败");
+    } finally {
+      setOpeningId("");
+    }
+  };
+
+  const clearHistory = async () => {
+    if (!items.length || !window.confirm(`确定清空 ${items.length} 条历史记录吗？当前打开的任务会保留。`)) return;
+    setClearing(true);
+    setError("");
+    try {
+      const response = await fetch(apiUrl(`/api/v1/jobs?preserve_job_id=${encodeURIComponent(activeJobId)}`), { method: "DELETE" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "历史记录清空失败");
+      setItems([]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "历史记录清空失败");
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  return <div className="history-backdrop" onMouseDown={onClose}>
+    <section className="history-dialog" role="dialog" aria-modal="true" aria-labelledby="history-title" onMouseDown={(event) => event.stopPropagation()}>
+      <header>
+        <div><History size={17} /><strong id="history-title">历史记录</strong></div>
+        <div className="history-header-actions">
+          <button className="history-clear" disabled={loading || clearing || items.length === 0} onClick={clearHistory}>
+            {clearing ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}清空历史记录
+          </button>
+          <button aria-label="关闭历史记录" onClick={onClose}><X size={16} /></button>
+        </div>
+      </header>
+      <div className="history-list">
+        {loading && <p className="history-empty"><LoaderCircle className="spin" size={17} />正在加载历史任务…</p>}
+        {!loading && error && <p className="history-error"><AlertTriangle size={16} />{error}</p>}
+        {!loading && !error && items.length === 0 && <p className="history-empty">暂无历史任务</p>}
+        {!loading && items.map((item) => <button key={item.id} disabled={Boolean(openingId)} onClick={() => openHistoryJob(item)}>
+          <span className={`history-status ${item.status}`} />
+          <div><strong>{item.filename}</strong><small>{new Date(item.created_at).toLocaleString("zh-CN", { hour12: false })}</small></div>
+          <div><span>{item.setup_count} 次装夹 · {item.operation_count} 道工序</span><small>{item.material} · {item.machine}</small></div>
+          {openingId === item.id ? <LoaderCircle className="spin" size={15} /> : <ChevronRight size={15} />}
+        </button>)}
+      </div>
+    </section>
+  </div>;
+}
+
+function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initialJob: Job; onNew: () => void; onHistory: () => void; readOnly?: boolean }) {
   const [job, setJob] = useState(initialJob);
+  const fileMenuRef = useRef<HTMLDivElement>(null);
+  const operationPopoverRef = useRef<HTMLElement>(null);
+  const [showFileMenu, setShowFileMenu] = useState(false);
   const [selectedOperation, setSelectedOperation] = useState<Operation | null>(job.plan?.setups[0]?.operations[0] ?? null);
   const [selectedFeatureIds, setSelectedFeatureIds] = useState<string[]>(selectedOperation?.feature_ids ?? []);
   const [activeMode, setActiveMode] = useState("工艺");
-  const [approving, setApproving] = useState(false);
   const [generatingCam, setGeneratingCam] = useState(false);
   const [loadingCam, setLoadingCam] = useState(readOnly);
   const [camResult, setCamResult] = useState<CamResult | null>(null);
-  const [camError, setCamError] = useState("");
+  const [, setCamError] = useState("");
   const [camProgress, setCamProgress] = useState<{
     stage: string;
     message: string;
@@ -177,22 +362,18 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
   const [viseGripHeight, setViseGripHeight] = useState(job.plan?.safety?.vise_grip_height_mm ?? 1.5);
   const [supportThickness, setSupportThickness] = useState(job.plan?.safety?.support_thickness_mm ?? 3);
   const [safetyMessage, setSafetyMessage] = useState("");
-  const [shareBaseUrl, setShareBaseUrl] = useState(window.location.origin);
-  const [shareMessage, setShareMessage] = useState("");
-  const [reanalyzing, setReanalyzing] = useState(false);
   const [showSimulationChecks, setShowSimulationChecks] = useState(false);
   const [applyingRemediation, setApplyingRemediation] = useState(false);
-  const [showWarnings, setShowWarnings] = useState(false);
+  const [inspectionPanel, setInspectionPanel] = useState<"drawing" | "coverage" | null>(null);
+  const inspectionPanelRef = useRef<HTMLElement>(null);
   const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
-  const [showOperationLibrary, setShowOperationLibrary] = useState(false);
-  const [libraryFeatureIds, setLibraryFeatureIds] = useState<string[]>([]);
+  const [deviceLibrary, setDeviceLibrary] = useState<DeviceLibrary | null>(null);
+  const [showResourceLibrary, setShowResourceLibrary] = useState(false);
+  const [selectedLibraryDeviceId, setSelectedLibraryDeviceId] = useState("");
+  const [deviceInfoId, setDeviceInfoId] = useState<string | null>(null);
   const [operationMessage, setOperationMessage] = useState("");
   const [operationBusy, setOperationBusy] = useState(false);
   const [solidBusy, setSolidBusy] = useState(false);
-  const [aiReview, setAiReview] = useState<AIProcessReviewResult | null>(null);
-  const [aiReviewBusy, setAiReviewBusy] = useState(false);
-  const [aiReviewError, setAiReviewError] = useState("");
-  const [showAiReview, setShowAiReview] = useState(false);
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
   const [structureExpanded, setStructureExpanded] = useState(true);
   const [showOperationDetails, setShowOperationDetails] = useState(false);
@@ -200,6 +381,22 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
   const [toolDraftId, setToolDraftId] = useState(selectedOperation?.tool.id ?? "");
   const [operationPopoverPosition, setOperationPopoverPosition] = useState({ top: 110, left: 326, anchorY: 28 });
   const [playbackMode, setPlaybackMode] = useState<"single" | "cumulative">("single");
+  const [showL32Workbench, setShowL32Workbench] = useState(false);
+
+  useEffect(() => {
+    if (!showFileMenu) return;
+    const closeMenu = (event: MouseEvent) => {
+      if (!fileMenuRef.current?.contains(event.target as Node)) setShowFileMenu(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => event.key === "Escape" && setShowFileMenu(false);
+    window.addEventListener("mousedown", closeMenu);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("mousedown", closeMenu);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [showFileMenu]);
+
   const operations = useMemo(
     () => job.plan?.setups.flatMap((setup) => setup.operations) ?? [],
     [job.plan?.setups],
@@ -223,11 +420,9 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
     const samples = camResult?.verification.metrics.defect_samples ?? [];
     return regions.length ? { regions, samples } : null;
   }, [camResult]);
-  const enabledOperations = operations.filter((operation) => operation.enabled !== false);
   const isSheetForming = job.plan?.process_kind === "sheet_forming";
-  const planApproved = enabledOperations.length > 0 && enabledOperations.every((operation) => operation.status === "approved");
+  const isL32 = job.device_id === "citizen-cincom-l32";
   const automationBlocked = job.plan?.automation_status === "unsupported";
-  const aiApprovalBlocked = aiReview?.review.approval_blocked === true;
   const holes = useMemo(
     () => job.analysis?.cylindrical_features.filter((item) => item.kind === "hole" && item.review_state !== "excluded") ?? [],
     [job.analysis?.cylindrical_features],
@@ -251,14 +446,6 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
   const firstReviewFeature = manufacturingFeatures.find((item) => item.review_state === "review");
   const coverage = job.plan?.coverage;
   const drawingRequirements = job.plan?.manufacturing_requirements;
-  const warningMessages = [
-    ...(drawingRequirements?.unresolved_requirement_ids.length
-      ? [`图纸要求：${drawingRequirements.unresolved_requirement_ids.length} 项尚未唯一绑定到三维特征，不得直接用于确定性工艺决策。`] : []),
-    ...(coverage?.issues.map((item) => `覆盖检查：${item}`) ?? []),
-    ...(coverage?.capability_gaps.map((item) => `能力缺口：${item}`) ?? []),
-    ...(job.plan?.warnings ?? []),
-  ];
-  const warningCount = warningMessages.length;
   const sourceSolids = Number(job.analysis?.topology.source_solids ?? job.analysis?.topology.solids ?? 1);
   const solidCandidates = job.analysis?.solid_candidates ?? [];
   const selectedSolidIndex = Number(job.analysis?.topology.selected_solid_index ?? solidCandidates.find((item) => item.selected)?.index ?? 1);
@@ -277,29 +464,49 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
       : camResult?.preview_segments.filter((segment) => segment.motion === "cut").map((segment) => segment.operation_id) ?? []),
     [camResult?.generated_operations, camResult?.preview_segments, isSheetForming],
   );
-  const processPhases = useMemo(
-    () => PROCESS_PHASES.map((name) => ({
-      name,
-      operations: operations.filter((operation) => processPhase(operation.type) === name),
-    })).filter((phase) => phase.operations.length > 0),
-    [operations],
-  );
-
   useEffect(() => {
     if (!showOperationDetails) return undefined;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!operationPopoverRef.current?.contains(event.target as Node)) {
+        setEditingOperationDetails(false);
+        setShowOperationDetails(false);
+      }
+    };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setEditingOperationDetails(false);
         setShowOperationDetails(false);
       }
     };
+    window.addEventListener("pointerdown", closeOnOutsideClick);
     window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutsideClick);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
   }, [showOperationDetails]);
+
+  useEffect(() => {
+    if (!inspectionPanel) return undefined;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!inspectionPanelRef.current?.contains(event.target as Node)) setInspectionPanel(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => event.key === "Escape" && setInspectionPanel(null);
+    window.addEventListener("pointerdown", closeOnOutsideClick);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutsideClick);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [inspectionPanel]);
 
   const selectedFeatures = useMemo(
     () => manufacturingFeatures.filter((feature) => selectedFeatureIds.includes(feature.id)),
     [manufacturingFeatures, selectedFeatureIds],
+  );
+  const viewerFeatures = useMemo(
+    () => activeMode === "特征" ? manufacturingFeatures : activeMode === "工艺" ? selectedFeatures : [],
+    [activeMode, manufacturingFeatures, selectedFeatures],
   );
   const selectedSetup = useMemo(
     () => job.plan?.setups.find((setup) => setup.operations.some((operation) => operation.id === selectedOperation?.id)) ?? job.plan?.setups[0],
@@ -315,17 +522,6 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
   const parameterDraft = selectedOperation
     ? parameterEdits[selectedOperation.id] ?? selectedOperation.parameters
     : {};
-  const selectableGeometry = useMemo(() => [
-    ...(job.analysis?.planar_features ?? []).map((feature) => ({ id: feature.id, type: "planar_face", label: `平面 ${feature.id} · ${feature.area.toFixed(1)} mm²` })),
-    ...(job.analysis?.cylindrical_features ?? []).filter((feature) => feature.kind === "hole" && feature.review_state !== "excluded").map((feature) => ({ id: feature.id, type: "cylindrical_hole", label: `孔 ${feature.id} · Ø${feature.diameter.toFixed(2)} × ${feature.length.toFixed(2)}` })),
-    ...(job.analysis?.prismatic_features ?? []).filter((feature) => feature.review_state !== "excluded").map((feature) => ({ id: feature.id, type: `prismatic_${feature.kind}`, label: `${feature.kind === "pocket" ? "型腔" : "槽"} ${feature.id} · ${feature.length.toFixed(1)} × ${feature.width.toFixed(1)}` })),
-    ...(job.analysis?.internal_profile_features ?? []).filter((feature) => feature.review_state !== "excluded").map((feature) => ({
-      id: feature.id,
-      type: "internal_profile",
-      label: `${feature.machining_kind === "engraving" ? "浅雕刻" : feature.machining_kind === "blind_pocket" ? "异形盲型腔" : "异形贯通孔"} ${feature.id} · ${feature.length.toFixed(1)} × ${feature.width.toFixed(1)}`,
-    })),
-  ], [job.analysis?.cylindrical_features, job.analysis?.internal_profile_features, job.analysis?.planar_features, job.analysis?.prismatic_features]);
-
   useEffect(() => {
     fetch(apiUrl("/api/v1/catalogs"))
       .then((response) => response.ok ? response.json() : Promise.reject())
@@ -334,29 +530,33 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
   }, []);
 
   useEffect(() => {
-    fetch(apiUrl(`/api/v1/jobs/${job.id}/ai/plan`))
-      .then((response) => response.ok ? response.json() : null)
-      .then((payload: AIProcessReviewResult | null) => {
-        if (payload) setAiReview(payload);
+    fetch(apiUrl("/api/v1/device-library"))
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((payload: DeviceLibrary) => {
+        setDeviceLibrary(payload);
+        setSelectedLibraryDeviceId((current) => current || payload.devices[0]?.id || "");
       })
-      .catch(() => undefined);
-  }, [job.id]);
+      .catch(() => setDeviceLibrary({ schema_version: "1.0.0", devices: [] }));
+  }, []);
 
-  const runAiReview = async () => {
-    setAiReviewBusy(true);
-    setAiReviewError("");
-    setShowAiReview(true);
-    try {
-      const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/ai/plan`), { method: "POST" });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || "AI 工艺审查失败");
-      setAiReview(payload as AIProcessReviewResult);
-    } catch (reason) {
-      setAiReviewError(reason instanceof Error ? reason.message : "无法连接 Qwen 工艺中枢");
-    } finally {
-      setAiReviewBusy(false);
-    }
-  };
+  useEffect(() => {
+    if (!showResourceLibrary) return undefined;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowResourceLibrary(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [showResourceLibrary]);
+
+  useEffect(() => {
+    if (!deviceInfoId) return undefined;
+    const closeDeviceInfo = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element) || !target.closest(".device-info-popover, .operation-device-info")) setDeviceInfoId(null);
+    };
+    window.addEventListener("click", closeDeviceInfo);
+    return () => window.removeEventListener("click", closeDeviceInfo);
+  }, [deviceInfoId]);
 
   const visibleToolpathSegments = useMemo(() => {
     if (activeMode === "刀路") return camResult?.preview_segments ?? [];
@@ -398,6 +598,28 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
     () => job.plan?.setups.find((setup) => setup.operations.some((operation) => operation.id === selectedOperation?.id))?.id,
     [job.plan?.setups, selectedOperation?.id],
   );
+  const selectedLibraryDevice = useMemo(
+    () => deviceLibrary?.devices.find((device) => device.id === selectedLibraryDeviceId) ?? deviceLibrary?.devices[0] ?? null,
+    [deviceLibrary, selectedLibraryDeviceId],
+  );
+  const infoLibraryDevice = useMemo(
+    () => deviceLibrary?.devices.find((device) => device.id === deviceInfoId) ?? null,
+    [deviceInfoId, deviceLibrary],
+  );
+  const libraryOperations = useMemo(() => {
+    if (!selectedLibraryDevice) return [];
+    const bindings = selectedLibraryDevice.operation_bindings;
+    if (bindings?.length) {
+      const bindingIds = new Set(bindings.map((binding) => binding.operation_id));
+      return (catalogs?.operations ?? []).filter((operation) => bindingIds.has(operation.id));
+    }
+    const compatibleGroups = new Set(selectedLibraryDevice.system_integration.compatible_operation_groups);
+    return (catalogs?.operations ?? []).filter((operation) =>
+      compatibleGroups.has(operation.category)
+      || [...compatibleGroups].some((group) => DEVICE_OPERATION_GROUP_ALIASES[group]?.includes(operation.category)
+        || DEVICE_OPERATION_GROUP_ALIASES[group]?.includes(operation.id)),
+    );
+  }, [catalogs?.operations, selectedLibraryDevice]);
   const simulationResult = camResult?.simulation;
   const usesCumulativeStock = Boolean(simulationResult?.surface.is_cumulative && (job.plan?.setups.length ?? 0) > 1);
   const visibleCamoticsSurface = useMemo(() => {
@@ -434,17 +656,8 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
   );
 
   useEffect(() => {
-    fetch(apiUrl("/api/v1/config"))
-      .then((response) => response.ok ? response.json() : Promise.reject())
-      .then((config: { public_base_url?: string }) => {
-        if (config.public_base_url) setShareBaseUrl(config.public_base_url);
-      })
-      .catch(() => undefined);
-  }, [job.id]);
-
-  useEffect(() => {
     const needsCam = readOnly || activeMode === "刀路" || activeMode === "仿真";
-    if (!needsCam || camResult) return;
+    if (!needsCam || camResult || isL32) return;
     let cancelled = false;
     fetch(apiUrl(`/api/v1/jobs/${job.id}/cam`))
       .then((response) => response.ok ? response.json() : null)
@@ -469,28 +682,7 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
     return () => {
       cancelled = true;
     };
-  }, [activeMode, camResult, job.id, operations, readOnly]);
-
-  const copyShareLink = async () => {
-    const shareUrl = `${shareBaseUrl}/jobs/${job.id}?view=1`;
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(shareUrl);
-      } else {
-        const input = document.createElement("textarea");
-        input.value = shareUrl;
-        input.style.position = "fixed";
-        input.style.opacity = "0";
-        document.body.appendChild(input);
-        input.select();
-        document.execCommand("copy");
-        input.remove();
-      }
-      setShareMessage(`已复制：${shareUrl}`);
-    } catch {
-      setShareMessage(`复制失败，请手动复制：${shareUrl}`);
-    }
-  };
+  }, [activeMode, camResult, isL32, job.id, operations, readOnly]);
 
   const chooseOperation = (operation: Operation) => {
     if (activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id)) return;
@@ -541,7 +733,7 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
         setSelectedFeatureIds(playable.feature_ids);
       }
     }
-    setLoadingCam((mode === "刀路" || mode === "仿真") && !camResult);
+    setLoadingCam((mode === "刀路" || mode === "仿真") && !camResult && !isL32);
     setActiveMode(mode);
   };
 
@@ -562,53 +754,11 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
   };
 
   const openReviewQueue = () => {
+    setInspectionPanel(null);
     setActiveMode("特征");
     setOperationPopoverPosition({ top: 110, left: Math.min(326, Math.max(12, window.innerWidth - 372)), anchorY: 28 });
     setShowOperationDetails(true);
     if (firstReviewFeature) chooseFeature(firstReviewFeature.id);
-  };
-
-  const navigateOperation = (direction: -1 | 1) => {
-    if (!selectedOperation) return;
-    const index = operations.findIndex((operation) => operation.id === selectedOperation.id);
-    const target = operations[index + direction];
-    if (target) chooseOperation(target);
-  };
-
-  const approve = async () => {
-    setApproving(true);
-    setSafetyMessage("");
-    const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/approve`), { method: "POST" });
-    const payload = await response.json();
-    if (response.ok) setJob(payload as Job);
-    else setSafetyMessage(payload.detail || "方案批准失败");
-    setApproving(false);
-  };
-
-  const reanalyze = async () => {
-    setReanalyzing(true);
-    setSafetyMessage("");
-    try {
-      const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/reanalyze`), { method: "POST" });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || "重新分析失败");
-      const updatedJob = payload as Job;
-      const updatedOperations = updatedJob.plan?.setups.flatMap((setup) => setup.operations) ?? [];
-      setJob(updatedJob);
-      setAiReview(null);
-      setCamResult(null);
-      setLoadingCam(activeMode === "刀路" || activeMode === "仿真");
-      setSelectedOperation(updatedOperations[0] ?? null);
-      setSelectedFeatureIds(updatedOperations[0]?.feature_ids ?? []);
-      setClearance(updatedJob.plan?.safety?.clearance_mm ?? 3);
-      setViseGripHeight(updatedJob.plan?.safety?.vise_grip_height_mm ?? 1.5);
-      setSupportThickness(updatedJob.plan?.safety?.support_thickness_mm ?? 3);
-      setSafetyMessage("已使用最新识别规则重新分析");
-    } catch (reason) {
-      setSafetyMessage(reason instanceof Error ? reason.message : "重新分析失败");
-    } finally {
-      setReanalyzing(false);
-    }
   };
 
   const generateCam = async () => {
@@ -686,7 +836,6 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
     if (!response.ok) return;
     const updatedJob = await response.json() as Job;
     setJob(updatedJob);
-    setAiReview(null);
     setCamResult(null);
     setLoadingCam(activeMode === "刀路" || activeMode === "仿真");
     const updatedOperations = updatedJob.plan?.setups.flatMap((setup) => setup.operations) ?? [];
@@ -699,7 +848,6 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
     const updatedOperations = updatedJob.plan?.setups.flatMap((setup) => setup.operations) ?? [];
     const preferred = updatedOperations.find((operation) => operation.id === preferredOperationId) ?? updatedOperations[0] ?? null;
     setJob(updatedJob);
-    setAiReview(null);
     setCamResult(null);
     setLoadingCam(activeMode === "刀路" || activeMode === "仿真");
     setSelectedOperation(preferred);
@@ -757,7 +905,6 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
       if (!jobResponse.ok) throw new Error(jobPayload.detail || "工艺方案刷新失败");
       const updatedJob = jobPayload as Job;
       setJob(updatedJob);
-      setAiReview(null);
       setCamResult(camPayload as CamResult);
       setClearance(updatedJob.plan?.safety?.clearance_mm ?? clearance);
       setViseGripHeight(updatedJob.plan?.safety?.vise_grip_height_mm ?? viseGripHeight);
@@ -799,32 +946,6 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
       setSafetyMessage(reason instanceof Error ? reason.message : "切换目标实体失败");
     } finally {
       setSolidBusy(false);
-    }
-  };
-
-  const createLibraryOperation = async (definition: OperationDefinition) => {
-    if (!selectedSetup || !definition.manual_enabled) return;
-    setOperationBusy(true);
-    setOperationMessage("");
-    try {
-      const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/setups/${selectedSetup.id}/operations`), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ definition_id: definition.id, feature_ids: libraryFeatureIds }),
-      });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || "创建工序失败");
-      const updatedJob = payload as Job;
-      const created = updatedJob.plan?.setups
-        .find((setup) => setup.id === selectedSetup.id)
-        ?.operations.at(-1);
-      applyUpdatedJob(updatedJob, created?.id);
-      setShowOperationLibrary(false);
-      setOperationMessage(`已创建${definition.name}，请检查几何、刀具和参数`);
-    } catch (reason) {
-      setOperationMessage(reason instanceof Error ? reason.message : "创建工序失败");
-    } finally {
-      setOperationBusy(false);
     }
   };
 
@@ -917,65 +1038,103 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
       <header className="topbar app-header">
         <div className="brand compact"><span>S</span> SEKSUN CNC</div>
         <div className="project-title"><small>当前零件</small><strong>{job.filename}</strong></div>
-        <div className="top-meta"><span>{job.material}</span>{readOnly && <span className="readonly-badge">只读分享</span>}</div>
+        <div className="top-meta">
+          {sourceSolids > 1 && solidCandidates.length > 0 && <label className="header-solid-selector">
+            <select aria-label="选择目标加工实体" disabled={readOnly || solidBusy} value={selectedSolidIndex} onChange={(event) => selectSolid(Number(event.target.value))}>
+              {solidCandidates.map((candidate) => <option key={candidate.index} value={candidate.index}>实体 {candidate.index} · {candidate.bounds.size.x.toFixed(1)}×{candidate.bounds.size.y.toFixed(1)}×{candidate.bounds.size.z.toFixed(1)} mm</option>)}
+            </select>
+          </label>}
+          {readOnly && <span className="readonly-badge">只读模式</span>}
+        </div>
         <div className="header-actions">
-          <button className="ghost share-button" onClick={copyShareLink}><Link2 size={14} />分享</button>
-          {!readOnly && <button className="ghost reanalyze-button" onClick={reanalyze} disabled={reanalyzing}><RefreshCw className={reanalyzing ? "spin" : ""} size={14} />{reanalyzing ? "分析中" : "重新分析"}</button>}
-          <button className="ghost new-job-button" onClick={onNew}><FileUp size={14} />新建</button>
-          {!readOnly && <button className={`approve ${automationBlocked || aiApprovalBlocked ? "blocked" : ""}`} onClick={approve} disabled={approving || applyingRemediation || automationBlocked || aiApprovalBlocked || planApproved}>{automationBlocked || aiApprovalBlocked ? <AlertTriangle size={15} /> : <Check size={15} />}{automationBlocked ? "无法自动规划" : aiApprovalBlocked ? "AI 阻止批准" : applyingRemediation ? "自动纠错中" : approving ? "确认中" : planApproved ? "工艺已批准" : "批准方案"}</button>}
+          <div className="file-menu" ref={fileMenuRef}>
+            <button className={`file-menu-trigger ${showFileMenu ? "open" : ""}`} aria-haspopup="menu" aria-expanded={showFileMenu} onClick={() => setShowFileMenu((value) => !value)}><FolderOpen size={14} />文件<ChevronDown size={13} /></button>
+            {showFileMenu && <div className="file-menu-dropdown" role="menu">
+              <button role="menuitem" onClick={() => { setShowFileMenu(false); onNew(); }}><FileUp size={15} />新建</button>
+              <button role="menuitem" onClick={() => { setShowFileMenu(false); onHistory(); }}><History size={15} />历史记录</button>
+            </div>}
+          </div>
+          <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
         </div>
       </header>
-      <nav className="mode-tabs workspace-toolbar">
-        <div className="mode-switcher">
-          {["特征", "工艺", "刀路", "仿真"].map((mode) => <button key={mode} className={activeMode === mode ? "active" : ""} onClick={() => chooseMode(mode)}>{isSheetForming && mode === "刀路" ? "成形" : mode}</button>)}
-        </div>
-        <div className={`plan-state ${reviewCount > 0 ? "needs-review" : ""}`}>
-          <i />
-          {sourceSolids > 1 && solidCandidates.length > 0 ? <label className="solid-selector">
-            <span>{sourceSolids} 个实体</span>
-            <select
-              aria-label="选择目标加工实体"
-              disabled={readOnly || solidBusy}
-              value={selectedSolidIndex}
-              onChange={(event) => selectSolid(Number(event.target.value))}
-            >
-              {solidCandidates.map((candidate) => <option key={candidate.index} value={candidate.index}>
-                实体 {candidate.index} · {candidate.bounds.size.x.toFixed(1)}×{candidate.bounds.size.y.toFixed(1)}×{candidate.bounds.size.z.toFixed(1)} mm · {candidate.volume.toFixed(0)} mm³
-              </option>)}
-            </select>
-          </label> : null}
-          <span>{solidBusy ? "重新规划中…" : `${job.plan.setups.length} 次装夹 · ${operations.length} 道工序`}</span>
-        </div>
-        <div className="context-actions">
-          {drawingRequirements && <button className={`drawing-requirements-button ${drawingRequirements.status}`} onClick={() => setShowWarnings(true)} title="查看图纸要求绑定状态"><FileUp size={14} />图纸 {drawingRequirements.summary.matched}/{drawingRequirements.summary.total}</button>}
-          {coverage && <button className={`coverage-button ${coverage.status}`} onClick={() => setShowWarnings(true)}><CircleDot size={14} />覆盖 {Math.round(coverage.score * 100)}%{coverage.unresolved_count > 0 ? ` · ${coverage.unresolved_count} 未识别` : ""}</button>}
-          {!readOnly && <button className="ai-review-button" disabled={aiReviewBusy} onClick={runAiReview}><Bot className={aiReviewBusy ? "spin" : ""} size={15} />{aiReviewBusy ? "AI 审查中" : "AI 工艺审查"}</button>}
-          {readOnly && aiReview && <button className="ai-review-button" onClick={() => setShowAiReview(true)}><Bot size={15} />AI 审查结果</button>}
-          {reviewCount > 0 && <button className="review-queue-button" onClick={openReviewQueue}><AlertTriangle size={15} />{reviewCount} 项待复核</button>}
-          {!readOnly && !isSheetForming && <button onClick={() => { setLibraryFeatureIds(selectedFeatureIds); setShowOperationLibrary(true); }}><Library size={15} />工序库</button>}
-          {!readOnly && <button className="primary" disabled={automationBlocked || !planApproved || generatingCam || applyingRemediation} onClick={generateCam}><Play size={15} />{generatingCam ? `生成中 ${Math.round(camProgress?.percent ?? 0)}%` : applyingRemediation ? `纠错中 ${Math.round(camProgress?.percent ?? 0)}%` : isSheetForming ? "生成成形仿真" : "生成刀路"}</button>}
-        </div>
+      <nav className="compact-mode-toolbar" aria-label="工作模式">
+        {["特征", "工艺", "刀路", "仿真"].map((mode) => <button key={mode} className={activeMode === mode ? "active" : ""} onClick={() => chooseMode(mode)}>{isSheetForming && mode === "刀路" ? "成形" : mode}</button>)}
+        {isL32 && <button className="l32-mode-entry" onClick={() => setShowL32Workbench(true)}>L32 适配</button>}
       </nav>
 
-      {showOperationLibrary && <div className="operation-library-backdrop" onMouseDown={() => setShowOperationLibrary(false)}>
-        <section className="operation-library-dialog" onMouseDown={(event) => event.stopPropagation()}>
-          <header><div><Library size={18} /><strong>工序库</strong><small>FREECAD CAM · 选择工序后使用当前几何创建</small></div><button onClick={() => setShowOperationLibrary(false)}><X size={16} /></button></header>
-          <div className="operation-library-summary">
-            <span>当前装夹 <strong>{selectedSetup?.id}</strong></span>
-            <span>已选几何 <strong>{libraryFeatureIds.length}</strong></span>
-            <span>可人工创建 <strong>{catalogs?.operations.filter((item) => item.manual_enabled).length ?? 0}</strong></span>
+      {showL32Workbench && <L32Workbench
+        jobId={job.id}
+        catalogs={catalogs}
+        plannedOperations={job.plan.setups.flatMap((setup) => setup.operations)}
+        manufacturingRequirements={job.plan.manufacturing_requirements ?? null}
+        boundMachineInstanceId={job.machine_instance_id}
+        readOnly={readOnly}
+        onPlanChanged={async () => {
+          const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}`));
+          if (response.ok) applyUpdatedJob(await response.json() as Job, selectedOperation?.id);
+        }}
+        onClose={() => setShowL32Workbench(false)}
+      />}
+
+      {showResourceLibrary && <div className="operation-library-backdrop" onMouseDown={() => setShowResourceLibrary(false)}>
+        <section className={`operation-library-dialog resource-library-dialog ${infoLibraryDevice ? "has-device-info" : ""}`} onMouseDown={(event) => event.stopPropagation()}>
+          <header><div><small>OPERATION LIBRARY</small><strong>工序库</strong></div><span>{libraryOperations.length} 道工序</span><button aria-label="关闭工序库" onClick={() => setShowResourceLibrary(false)}><X size={16} /></button></header>
+          <div className="operation-library-body">
+          <div className="operation-library-content">
+            <section className="operation-device-picker" aria-label="选择设备">
+              <div><strong>选择设备</strong><small>左右滑动查看更多设备</small></div>
+              <div className="operation-device-scroll">
+                {(deviceLibrary?.devices ?? []).map((device) => <div className={`operation-device-option ${selectedLibraryDevice?.id === device.id ? "active" : ""}`} key={device.id}>
+                  <button className="operation-device-select" onClick={() => setSelectedLibraryDeviceId(device.id)}>
+                    <Cog size={15} /><span><strong>{device.display_name}</strong><small>{device.category_label}</small></span>
+                  </button>
+                  <button className={`operation-device-info ${deviceInfoId === device.id ? "active" : ""}`} aria-label={`查看 ${device.display_name} 设备详情`} title="设备详情" onClick={() => setDeviceInfoId((current) => current === device.id ? null : device.id)}><Info size={11} strokeWidth={2} /></button>
+                </div>)}
+              </div>
+            </section>
+            <div className="operation-library-grid">
+              {libraryOperations.map((definition) => {
+                const binding = selectedLibraryDevice?.operation_bindings?.find((item) => item.operation_id === definition.id);
+                const adapting = binding?.status === "adapting" || definition.maturity === "planned" || selectedLibraryDevice?.library_status === "adapting";
+                return <article key={definition.id}>
+                  <div><span>{definition.category}</span><i className={adapting ? "adapting" : "supported"}>{adapting ? "适配中" : "已支持"}</i></div>
+                  <strong>{definition.name}</strong>
+                  <p>{definition.description}</p>
+                  <small>{definition.engine.provider} / {definition.engine.operation}{definition.engine.modifiers.length ? ` + ${definition.engine.modifiers.join("+")}` : ""}</small>
+                </article>;
+              })}
+              {selectedLibraryDevice && libraryOperations.length === 0 && <p className="device-library-empty">该设备暂未绑定可用工序。</p>}
+            </div>
           </div>
-          {operationMessage && <p className="operation-library-message"><AlertTriangle size={14} />{operationMessage}</p>}
-          <div className="operation-library-geometry"><strong>加工几何</strong><span>先选择面、孔或型腔，再创建适用工序</span><div>{selectableGeometry.map((geometry) => <button key={geometry.id} className={libraryFeatureIds.includes(geometry.id) ? "selected" : ""} onClick={() => setLibraryFeatureIds((current) => current.includes(geometry.id) ? current.filter((id) => id !== geometry.id) : [...current, geometry.id])}><i>{geometry.type}</i>{geometry.label}</button>)}</div></div>
-          <div className="operation-library-grid">
-            {(catalogs?.operations ?? []).map((definition) => <button key={definition.id} disabled={!definition.manual_enabled || operationBusy} onClick={() => createLibraryOperation(definition)}>
-              <div><span>{definition.category}</span><i className={definition.maturity}>{definition.maturity}</i></div>
-              <strong>{definition.name}</strong>
-              <p>{definition.description}</p>
-              <small>{definition.engine.provider} / {definition.engine.operation}{definition.engine.modifiers.length ? ` + ${definition.engine.modifiers.join("+")}` : ""}</small>
-              {!definition.manual_enabled && <em>尚未接入当前执行适配器</em>}
-            </button>)}
           </div>
+
+          {infoLibraryDevice && <aside className="device-info-popover" aria-label={`${infoLibraryDevice.model} 设备详情`}>
+              <header><div><small>{infoLibraryDevice.manufacturer} · {infoLibraryDevice.record_kind === "virtual" ? "虚拟设备" : "实体设备"}</small><strong>{infoLibraryDevice.name}</strong><span>{infoLibraryDevice.category_label}</span></div><button aria-label="关闭设备详情" onClick={() => setDeviceInfoId(null)}><X size={14} /></button></header>
+              <div className="device-profile-metrics">
+                {infoLibraryDevice.record_kind === "virtual"
+                  ? <div><small>工作空间</small><strong>{infoLibraryDevice.workpiece.working_envelope_mm?.join("×")}</strong><span>XYZ mm</span></div>
+                  : <div><small>最大直径</small><strong>Ø{infoLibraryDevice.workpiece.maximum_diameter_mm}</strong><span>选配 Ø{infoLibraryDevice.workpiece.optional_maximum_diameter_mm ?? "—"} mm</span></div>}
+                <div><small>主轴转速</small><strong>{infoLibraryDevice.spindles.find((spindle) => spindle.id === "main")?.maximum_rpm.toLocaleString()}</strong><span>rpm</span></div>
+                {infoLibraryDevice.record_kind === "virtual"
+                  ? <div><small>运动轴</small><strong>{infoLibraryDevice.axes.length}</strong><span>轴</span></div>
+                  : <div><small>一次夹持</small><strong>{infoLibraryDevice.workpiece.maximum_length_per_chucking_mm}</strong><span>mm</span></div>}
+              </div>
+              <section className="device-profile-section"><h4>设备身份</h4><dl>
+                <div><dt>型号范围</dt><dd>{infoLibraryDevice.variants.join(" / ")}</dd></div>
+                <div><dt>控制系统</dt><dd>{infoLibraryDevice.controller.model}</dd></div>
+                <div><dt>运动轴</dt><dd>{infoLibraryDevice.axes.map((axis) => axis.id).join(" / ")}</dd></div>
+                <div><dt>实际配置</dt><dd className="pending">{infoLibraryDevice.configuration_status === "confirmed" ? "已确认" : "待确认"}</dd></div>
+              </dl></section>
+              <section className="device-profile-section"><h4>加工能力</h4><div className="device-capabilities">{infoLibraryDevice.capabilities.map((capability) => <span className={capability.status} key={capability.code}>{capability.name}<i>{capability.status === "supported" ? "支持" : capability.status === "conditional" ? "条件支持" : "待确认"}</i></span>)}</div></section>
+              <section className="device-profile-section integration"><h4>系统接入</h4><dl>
+                <div><dt>机床运动学</dt><dd className="pending">{infoLibraryDevice.system_integration.kinematics_adapter ?? "待适配"}</dd></div>
+                <div><dt>NC 后处理</dt><dd className="pending">{infoLibraryDevice.system_integration.postprocessor ?? "待适配"}</dd></div>
+                <div><dt>CAM 程序输出</dt><dd>{infoLibraryDevice.system_integration.direct_nc_output ? "可生成" : "未接入"}</dd></div>
+                {infoLibraryDevice.system_integration.production_release_requires_physical_machine && <div><dt>生产放行</dt><dd className="pending">需绑定实体设备</dd></div>}
+              </dl></section>
+              {infoLibraryDevice.required_confirmation.length > 0 && <section className="device-profile-section required"><h4>建档待补充</h4><ul>{infoLibraryDevice.required_confirmation.map((item) => <li key={item}>{item}</li>)}</ul></section>}
+              <footer>资料来源：{infoLibraryDevice.source.document} · {infoLibraryDevice.source.document_date}{infoLibraryDevice.source.pages.length > 0 ? ` · 第 ${infoLibraryDevice.source.pages.join("、")} 页` : ""}</footer>
+          </aside>}
         </section>
       </div>}
 
@@ -999,12 +1158,11 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
             </div>}
           </section>
 
-          {showOperationDetails && selectedOperation && <section className="operation-popover inspector panel" style={{ top: operationPopoverPosition.top, left: operationPopoverPosition.left, "--operation-anchor-y": `${operationPopoverPosition.anchorY}px` } as CSSProperties}>
+          {showOperationDetails && selectedOperation && <section ref={operationPopoverRef} className="operation-popover inspector panel" style={{ top: operationPopoverPosition.top, left: operationPopoverPosition.left, "--operation-anchor-y": `${operationPopoverPosition.anchorY}px` } as CSSProperties}>
             <header className="operation-popover-heading"><div><Bot size={16} /><span>工序详情</span><small>{selectedOperation.id}</small></div><div className="operation-popover-actions">{!readOnly && !editingOperationDetails && <button className="edit-operation-button" aria-label="编辑工序" title="编辑" onClick={() => { setEditingOperationDetails(true); setToolDraftId(selectedOperation.tool.id); setOperationMessage(""); }}><Pencil size={13} /></button>}<button aria-label="关闭工序详情" title="关闭" onClick={() => { setEditingOperationDetails(false); setShowOperationDetails(false); }}><X size={15} /></button></div></header>
             <div className="panel-content">
               {selectedOperation ? (
                 <>
-                  <div className="confidence"><span>建议置信度</span><strong>{Math.round(selectedOperation.confidence * 100)}%</strong><div><i style={{ width: `${selectedOperation.confidence * 100}%` }} /></div></div>
                   <div className="inspector-block"><label>工序</label><h3>{selectedOperation.name}</h3><p>{selectedOperation.id} · {selectedOperation.type}</p></div>
                   <div className="inspector-block"><label>{isSheetForming ? "工艺装备" : "刀具"}</label><div className="tool-card"><Wrench size={18} /><div><strong>{displayedTool?.name}</strong><small>{isSheetForming ? displayedTool?.kind : `${displayedTool?.kind} · 伸出 ${displayedTool?.stickout_mm} mm · 刀柄 Ø${displayedTool?.holder_diameter_mm}`}</small></div></div>
                     {selectedDefinition && !readOnly && editingOperationDetails && <select className="tool-selector" disabled={operationBusy} value={toolDraftId} onChange={(event) => setToolDraftId(event.target.value)}>{(catalogs?.tools ?? []).filter((tool) => selectedDefinition.tool.accepts.includes(tool.kind)).map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select>}
@@ -1054,18 +1212,21 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
                 </>
               ) : <p className="empty-panel">选择一道工序查看规划依据。</p>}
             </div>
-            {!readOnly && editingOperationDetails && <footer className="operation-edit-footer"><button onClick={cancelOperationEdit} disabled={operationBusy}>取消</button><button className="primary" onClick={saveOperationEdits} disabled={operationBusy}>{operationBusy ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} />}{operationBusy ? "保存并校核中…" : "保存并重新检验"}</button></footer>}
+            <footer className={`operation-edit-footer ${!readOnly && editingOperationDetails ? "editing" : ""}`}>
+              <span className="compact-confidence">置信度 <strong>{Math.round(selectedOperation.confidence * 100)}%</strong></span>
+              {!readOnly && editingOperationDetails && <><button onClick={cancelOperationEdit} disabled={operationBusy}>取消</button><button className="primary" onClick={saveOperationEdits} disabled={operationBusy}>{operationBusy ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} />}{operationBusy ? "保存并校核中…" : "保存并重新检验"}</button></>}
+            </footer>
           </section>}
         </aside>
 
-        <section className="viewport panel">
+        <section className={`viewport panel inspection-rail-host ${activeMode === "刀路" || activeMode === "仿真" ? "show-toolpath-legend" : ""}`}>
           {automationBlocked && <div className="capability-blocker">
             <div><AlertTriangle size={17} /><strong>已阻止生成不完整工艺</strong></div>
             {job.plan.blocking_reasons.map((reason) => <p key={reason}>{reason}</p>)}
           </div>}
           <ModelViewer
             modelUrl={`${apiUrl(job.model_url)}?solid=${selectedSolidIndex}`}
-            features={manufacturingFeatures}
+            features={viewerFeatures}
             selectedFeatureIds={selectedFeatureIds}
             onSelectFeature={chooseFeature}
             toolpathSegments={visibleToolpathSegments}
@@ -1086,7 +1247,90 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
             formingPreview={activeMode === "仿真" ? camResult?.forming_preview ?? null : null}
             spatialDefects={activeMode === "仿真" ? spatialDefects : null}
             onSelectDefect={chooseSpatialDefect}
+            viewMode={activeMode as "特征" | "工艺" | "刀路" | "仿真"}
+            workAxis={selectedSetup?.work_axis}
+            activeOperationLabel={selectedOperation?.name}
           />
+          <nav className="inspection-rail" aria-label="工程检查与工艺工具">
+            {drawingRequirements && <button className={`inspection-card ${drawingRequirements.status} ${inspectionPanel === "drawing" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => setInspectionPanel((current) => current === "drawing" ? null : "drawing")} title="查看图纸要求绑定状态">
+              {drawingRequirements.unresolved_requirement_ids.length > 0 && <em>{drawingRequirements.unresolved_requirement_ids.length}</em>}
+              <FileUp size={19} />
+              <strong>图纸要求</strong>
+              <small>{drawingRequirements.summary.matched}/{drawingRequirements.summary.total}</small>
+            </button>}
+            {coverage && <button className={`inspection-card ${coverage.status} ${inspectionPanel === "coverage" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => setInspectionPanel((current) => current === "coverage" ? null : "coverage")} title="查看制造特征与工序覆盖状态">
+              {coverage.unresolved_count > 0 && <em>{coverage.unresolved_count}</em>}
+              <CircleDot size={19} />
+              <strong>工艺覆盖</strong>
+              <small>{Math.round(coverage.score * 100)}%</small>
+            </button>}
+            {reviewCount > 0 && <button className="inspection-card review" onClick={openReviewQueue} title="查看待人工复核的制造特征">
+              <em>{reviewCount}</em>
+              <AlertTriangle size={19} />
+              <strong>待复核</strong>
+              <small>{reviewCount} 项</small>
+            </button>}
+            <button className={`inspection-card tool ${showResourceLibrary ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setDeviceInfoId(null); setShowResourceLibrary(true); }} title="打开工序库">
+              <Library size={19} />
+              <strong>工序库</strong>
+              <small>{catalogs?.operations.length ?? 0} 项工序</small>
+            </button>
+            {isL32 && <button className="inspection-card l32" onClick={() => setShowL32Workbench(true)} title="打开 L32 车削适配工作台">
+              <Cog size={19} />
+              <strong>L32 适配</strong>
+              <small>草案模式</small>
+            </button>}
+          </nav>
+          {inspectionPanel && <section ref={inspectionPanelRef} className={`inspection-popover ${inspectionPanel}`} aria-label={inspectionPanel === "drawing" ? "图纸要求详情" : "工艺覆盖详情"}>
+            <header>
+              <div><small>{inspectionPanel === "drawing" ? "DRAWING REQUIREMENTS" : "PROCESS COVERAGE"}</small><strong>{inspectionPanel === "drawing" ? "图纸要求" : "工艺覆盖"}</strong></div>
+              <span className={inspectionPanel === "drawing" ? drawingRequirements?.status : coverage?.status}>{inspectionPanel === "drawing" ? (drawingRequirements?.status === "complete" ? "已匹配" : "需处理") : `${Math.round((coverage?.score ?? 0) * 100)}%`}</span>
+              <button aria-label="关闭检查面板" onClick={() => setInspectionPanel(null)}><X size={15} /></button>
+            </header>
+            {inspectionPanel === "drawing" && drawingRequirements ? <>
+              <div className="inspection-overview">
+                <div><small>要求总数</small><strong>{drawingRequirements.summary.total}</strong></div>
+                <div><small>已绑定</small><strong>{drawingRequirements.summary.matched}</strong></div>
+                <div><small>待处理</small><strong>{drawingRequirements.unresolved_requirement_ids.length}</strong></div>
+              </div>
+              <div className="inspection-popover-list">
+                <article className={drawingRequirements.status}>
+                  <div><span>绑定状态</span><em>{drawingRequirements.status === "complete" ? "完整" : "需复核"}</em></div>
+                  <strong>二维要求与三维特征</strong>
+                  <dl><div><dt>模糊匹配</dt><dd>{drawingRequirements.summary.ambiguous}</dd></div><div><dt>未映射</dt><dd>{drawingRequirements.summary.unmapped}</dd></div><div><dt>仅识别</dt><dd>{drawingRequirements.summary.recognized_only}</dd></div></dl>
+                </article>
+                {drawingRequirements.unresolved_requirement_ids.length > 0 && <article className="incomplete">
+                  <div><span>决策限制</span><em>{drawingRequirements.unresolved_requirement_ids.length} 项</em></div>
+                  <strong>尚未唯一绑定到三维特征</strong>
+                  <p>这些要求仅作提示，不直接用于确定性工艺决策。</p>
+                </article>}
+                <article>
+                  <div><span>来源</span><em>{drawingRequirements.source_system}</em></div>
+                  <strong>{job.drawing_filename || "工程图"}</strong>
+                  <p>{[drawingRequirements.drawing_number && `图号 ${drawingRequirements.drawing_number}`, drawingRequirements.revision && `版本 ${drawingRequirements.revision}`].filter(Boolean).join(" · ") || "未提供图号与版本"}</p>
+                </article>
+              </div>
+            </> : coverage && <>
+              <div className="inspection-overview">
+                <div><small>加工特征</small><strong>{coverage.target_count}</strong></div>
+                <div><small>已覆盖</small><strong>{coverage.covered_count}</strong></div>
+                <div><small>待处理</small><strong>{coverage.unresolved_count + coverage.review_count}</strong></div>
+              </div>
+              <div className="inspection-popover-list">
+                {coverage.targets.map((target) => <article key={target.id} className={target.state}>
+                  <div><span>{target.kind}</span><em>{target.state === "covered" ? "已覆盖" : target.state === "review" ? "待复核" : "未覆盖"}</em></div>
+                  <strong>{target.label}</strong>
+                  <p>{target.covered_by.length ? `关联工序 ${target.covered_by.join("、")}` : `需要 ${target.required_operation_types.join("、")}`}</p>
+                </article>)}
+                {[...coverage.issues, ...coverage.capability_gaps].map((message, index) => <article className="incomplete" key={`${index}-${message}`}><div><span>检查提醒</span><em>注意</em></div><p>{message}</p></article>)}
+              </div>
+            </>}
+          </section>}
+          {!readOnly && activeMode === "刀路" && isL32 && <button className="viewport-generate-button l32-draft-button" onClick={() => setShowL32Workbench(true)}><Cog size={16} />打开 L32 车削草案</button>}
+          {!readOnly && activeMode === "刀路" && !isL32 && <button className="viewport-generate-button" disabled={automationBlocked || generatingCam || applyingRemediation} onClick={generateCam} title={automationBlocked ? "当前工艺不完整，暂时无法生成刀路" : undefined}>
+            {generatingCam || applyingRemediation ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}
+            {generatingCam ? `生成中 ${Math.round(camProgress?.percent ?? 0)}%` : applyingRemediation ? `纠错中 ${Math.round(camProgress?.percent ?? 0)}%` : isSheetForming ? "生成成形仿真" : camResult ? "重新生成刀路" : "生成刀路"}
+          </button>}
           {loadingCam && <div className="cam-loading-notice"><LoaderCircle className="spin" size={16} /><div><strong>{isSheetForming ? "正在加载成形仿真" : "正在加载刀路数据"}</strong><small>模型可以继续查看，结果就绪后会自动显示</small></div></div>}
           {(generatingCam || applyingRemediation) && camProgress && <div className="cam-loading-notice cam-stream-progress"><LoaderCircle className="spin" size={16} /><div><strong>{camProgress.message}</strong><small>{camProgress.operation_id ? `${camProgress.operation_id} · ` : ""}{camProgress.current != null && camProgress.total ? `${camProgress.current}/${camProgress.total} · ` : ""}{Math.round(camProgress.percent)}%</small><span><i style={{ width: `${camProgress.percent}%` }} /></span></div></div>}
           {activeMode === "仿真" && validationStatus === "failed" && camResult && !isSheetForming && <div className="simulation-failure-banner"><AlertTriangle size={18} /><div><strong>当前刀路未达到成品，禁止上机</strong><span>STEP 空间重合 {camResult.verification.metrics.target_overlap_percent?.toFixed(1) ?? "—"}% · 目标过切 {camResult.verification.metrics.missing_target_volume_mm3?.toFixed(2) ?? "—"} mm³ · 多余残料 {camResult.verification.metrics.excess_stock_volume_mm3?.toFixed(2) ?? "—"} mm³</span></div></div>}
@@ -1117,72 +1361,12 @@ function Workbench({ initialJob, onNew, readOnly = false }: { initialJob: Job; o
                 ? <div className="simulation-metrics"><strong>{camResult.forming_preview?.stages.length ?? 0}</strong><span>工艺阶段<br />完整覆盖</span><strong>{camResult.forming_preview?.nominal_thickness_mm.toFixed(2)}</strong><span>名义板厚<br />mm</span></div>
                 : <div className="simulation-metrics"><strong>{camResult.simulation.metrics.removed_percent}%</strong><span>材料去除<br />{camResult.simulation.metrics.removed_volume_mm3.toLocaleString()} mm³</span><strong>{camResult.simulation.metrics.resolution_mm}</strong><span>网格精度<br />mm</span></div>}
               <small>{isSheetForming ? "概念动画不包含应变、减薄、起皱、破裂和回弹有限元计算，不能用于模具生产放行" : `刀路估算 ${camResult.verification.metrics.estimated_cycle_minutes} min · 绿色为牺牲垫板，红色为硬限位禁入区；包络校核不替代机床级仿真`}</small>
-            </> : <p>批准方案并生成刀路后执行机床行程、参数范围、刀具直径和工序覆盖校验。</p>}
+            </> : <p>生成刀路后执行机床行程、参数范围、刀具直径和工序覆盖校验。</p>}
           </div>}
         </section>
 
       </section>
 
-      {showWarnings && <div className="warning-drawer">
-          <header><div><AlertTriangle size={15} /><strong>任务提醒</strong><span>{warningCount}</span></div><button aria-label="关闭任务提醒" onClick={() => setShowWarnings(false)}><X size={14} /></button></header>
-          <div>{warningMessages.map((warning, index) => <p key={`${index}-${warning}`}><span>{index + 1}</span>{warning}</p>)}</div>
-        </div>}
-      {showAiReview && <div className="ai-review-drawer">
-        <header><div><Bot size={16} /><strong>Qwen 工艺中枢</strong>{aiReview && <span className={aiReview.review.approval_blocked ? "blocked" : "ready"}>{aiReview.review.approval_blocked ? "阻止批准" : "建议复核"}</span>}</div><button aria-label="关闭 AI 审查" onClick={() => setShowAiReview(false)}><X size={14} /></button></header>
-        <div className="ai-review-content">
-          {aiReviewBusy && <div className="ai-review-loading"><LoaderCircle className="spin" size={18} /><div><strong>正在综合几何、工艺与仿真结果</strong><small>通常需要 20–60 秒，请勿重复提交</small></div></div>}
-          {aiReviewError && <div className="inline-error"><AlertTriangle size={15} />{aiReviewError}</div>}
-          {aiReview && !aiReviewBusy && <>
-            <div className="ai-review-summary"><div><small>制造意图</small><strong>{aiReview.review.manufacturing_intent}</strong></div><div><small>建议路线</small><strong>{aiReview.review.recommended_process_kind}</strong></div><div><small>置信度</small><strong>{Math.round(aiReview.review.confidence * 100)}%</strong></div><div><small>耗时</small><strong>{(aiReview.latency_ms / 1000).toFixed(1)}s</strong></div></div>
-            <p className="ai-review-conclusion">{aiReview.review.summary}</p>
-            <section><h4>装夹策略</h4>{aiReview.review.setup_strategy.map((item, index) => <p key={`${index}-${item}`}><span>{index + 1}</span>{item}</p>)}</section>
-            <section><h4>工序建议</h4>{aiReview.review.operation_recommendations.length ? [...aiReview.review.operation_recommendations].sort((a, b) => a.priority - b.priority).map((item, index) => <p key={`${index}-${item.operation_id}-${item.action}`}><span>{item.action}</span><b>{item.operation_id || item.operation_type}</b>{item.reason}</p>) : <small>当前没有新增或修改建议</small>}</section>
-            <section><h4>制造风险</h4>{aiReview.review.risks.map((risk) => <p className={`risk-${risk.severity}`} key={risk.code}><span>{risk.severity}</span><b>{risk.code}</b>{risk.description}；{risk.recommended_action}</p>)}</section>
-            {aiReview.review.missing_information.length > 0 && <section><h4>缺失信息</h4>{aiReview.review.missing_information.map((item) => <p key={item}><AlertTriangle size={12} />{item}</p>)}</section>}
-            <footer>{aiReview.model} · {aiReview.usage?.total_tokens?.toLocaleString() ?? "—"} tokens · AI 仅提供建议，仍需确定性校验和工程师批准</footer>
-          </>}
-        </div>
-      </div>}
-      <section className="operation-deck compact-operation-deck panel">
-        <div className="compact-route">
-          <div className="route-current"><Settings2 size={15} /><div><strong>{selectedOperation?.name ?? "未选择工序"}</strong><span>{selectedOperation ? `${selectedOperation.id} · ${operations.findIndex((operation) => operation.id === selectedOperation.id) + 1}/${operations.length}` : `0/${operations.length}`}</span></div></div>
-          <div className="deck-actions route-navigation">
-            <button aria-label="上一道工序" title="上一道工序" disabled={!selectedOperation || operations[0]?.id === selectedOperation.id} onClick={() => navigateOperation(-1)}><ChevronLeft size={14} /></button>
-            <button aria-label="下一道工序" title="下一道工序" disabled={!selectedOperation || operations[operations.length - 1]?.id === selectedOperation.id} onClick={() => navigateOperation(1)}><ChevronRight size={14} /></button>
-          </div>
-          <div className="process-phase-strip" aria-label="加工阶段">
-            {processPhases.map((phase) => {
-              const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation?.id);
-              const phaseIndices = phase.operations.map((operation) => operations.findIndex((item) => item.id === operation.id));
-              const active = phase.operations.some((operation) => operation.id === selectedOperation?.id);
-              const completed = selectedIndex >= 0 && Math.max(...phaseIndices) < selectedIndex;
-              const streamActive = phase.operations.some((operation) => operation.id === camProgress?.operation_id);
-              const target = activeMode === "仿真" && camResult
-                ? phase.operations.find((operation) => cutOperationIds.has(operation.id))
-                : phase.operations[0];
-              return <button
-                key={phase.name}
-                className={`${active ? "active" : ""} ${completed ? "completed" : ""} ${streamActive ? "stream-active" : ""}`}
-                disabled={!target}
-                onClick={() => target && chooseOperation(target)}
-                title={`${phase.name} · ${phase.operations.length} 道工序`}
-              ><i /><span>{phase.name}</span><small>{phase.operations.length}</small></button>;
-            })}
-          </div>
-          <span className="route-estimate"><Clock3 size={13} />{camResult ? "刀路" : "规划"} {camResult?.verification.metrics.estimated_cycle_minutes ?? job.plan.estimated_minutes} min</span>
-        </div>
-        <div className="warnings">
-          <AlertTriangle size={15} />
-          <span>{shareMessage || camError || safetyMessage || (generatingCam ? camProgress?.message : "") || (camResult ? isSheetForming ? `${camResult.engine} · ${camResult.generated_operations.length} 个阶段 · 工艺校验 ${validationStatus}` : `FreeCAD ${camResult.engine_version} 原生 CAM · ${camResult.path_command_count} 条指令 · 刀路校验 ${validationStatus}` : warningMessages[0])}</span>
-          {warningCount > 0 && <button className="warning-count-button" onClick={() => setShowWarnings((value) => !value)}><AlertTriangle size={14} />{warningCount} 条提醒</button>}
-          <button onClick={() => window.open(apiUrl(`/api/v1/jobs/${job.id}/files/plan.json`))}><Download size={14} />工艺 JSON</button>
-          {camResult && !isSheetForming && <button disabled={validationStatus === "failed"} title={validationStatus === "failed" ? "空间成品校验未通过，禁止下载上机程序" : "下载 G-code 草案"} onClick={() => window.open(apiUrl(camResult.files.gcode))}><Download size={14} />{validationStatus === "failed" ? "G-code 已拦截" : "G-code 草案"}</button>}
-          {camResult && !isSheetForming && <button onClick={() => window.open(apiUrl(camResult.files.freecad))}><Download size={14} />FreeCAD</button>}
-          {camResult && <button onClick={() => window.open(apiUrl(camResult.files.verification))}><ShieldCheck size={14} />预检报告</button>}
-          {camResult && <button onClick={() => window.open(apiUrl(camResult.files.collision))}><AlertTriangle size={14} />碰撞报告</button>}
-          {camResult && <button onClick={() => window.open(apiUrl(camResult.files.simulation))}><Box size={14} />仿真数据</button>}
-        </div>
-      </section>
     </main>
   );
 }
@@ -1193,6 +1377,7 @@ export default function App() {
   const [sessionError, setSessionError] = useState("");
   const [readOnly, setReadOnly] = useState(false);
   const [showNewJob, setShowNewJob] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
 
   useEffect(() => {
     const restoreFromLocation = async () => {
@@ -1229,17 +1414,19 @@ export default function App() {
     setReadOnly(false);
     setJob(createdJob);
     setShowNewJob(false);
+    setShowHistory(false);
     setSessionError("");
   };
 
   if (loadingSession) return <div className="fatal-state"><LoaderCircle className="spin" />正在加载任务会话…</div>;
   return <>
     {job
-      ? <Workbench key={job.id} initialJob={job} onNew={() => setShowNewJob(true)} readOnly={readOnly} />
+      ? <Workbench key={job.id} initialJob={job} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} readOnly={readOnly} />
       : <main className="empty-workspace">
           <header><div className="brand"><span>S</span> SEKSUN CNC</div></header>
           <section>{sessionError ? <AlertTriangle /> : <Box />}<strong>{sessionError || "尚未打开零件"}</strong><small>新任务将在当前工作台中创建</small><button onClick={() => setShowNewJob(true)}><FileUp size={15} />上传 STEP</button></section>
         </main>}
     <NewJobDialog open={showNewJob} canClose={Boolean(job)} onClose={() => setShowNewJob(false)} onCreated={openJob} />
+    {showHistory && job && <HistoryDialog activeJobId={job.id} onClose={() => setShowHistory(false)} onSelected={openJob} />}
   </>;
 }

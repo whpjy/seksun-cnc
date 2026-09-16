@@ -305,6 +305,334 @@ export type Catalogs = {
   operations: OperationDefinition[];
 };
 
+export type DeviceCapability = {
+  code: string;
+  name: string;
+  status: "supported" | "conditional" | "unverified";
+};
+
+export type DeviceProfile = {
+  id: string;
+  record_kind: "virtual" | "physical";
+  manufacturer: string;
+  brand: string;
+  model: string;
+  name: string;
+  display_name: string;
+  category: string;
+  category_label: string;
+  library_status: "supported" | "adapting";
+  configuration_status: "confirmed" | "unconfirmed";
+  variants: string[];
+  controller: { manufacturer: string; model: string };
+  workpiece: {
+    stock_form: string;
+    maximum_diameter_mm?: number;
+    optional_maximum_diameter_mm?: number;
+    maximum_length_per_chucking_mm?: number;
+    working_envelope_mm?: number[];
+  };
+  spindles: Array<{ id: string; name: string; maximum_rpm: number; rated_rpm?: number; motor_kw: number[] }>;
+  axes: Array<{ id: string; kind: "linear" | "rotary"; availability: "standard" | "variant"; variants?: string[] }>;
+  tooling: Record<string, unknown>;
+  capabilities: DeviceCapability[];
+  operation_bindings?: Array<{ operation_id: string; status: "supported" | "adapting" }>;
+  system_integration: {
+    status: "supported" | "adapting";
+    postprocessor: string | null;
+    kinematics_adapter: string | null;
+    direct_nc_output: boolean;
+    production_release_requires_physical_machine?: boolean;
+    compatible_operation_groups: string[];
+  };
+  source: { document: string; title: string; catalog_number: string; document_date: string; pages: number[] };
+  required_confirmation: string[];
+  machine_definition_id?: string;
+  variant_configurations?: Array<{
+    id: string;
+    model_code: string;
+    enabled_axes: string[];
+    minimum_tool_positions: number;
+    maximum_tool_positions: number;
+  }>;
+};
+
+export type DeviceLibrary = {
+  schema_version: string;
+  devices: DeviceProfile[];
+};
+
+export type L32MachineDefinition = {
+  id: string;
+  source_revision: string;
+  controller_family: string;
+  standard_bar_diameter_mm: number;
+  optional_bar_diameter_mm: number | null;
+  maximum_length_per_chucking_mm: number;
+  variants: Array<{
+    id: string;
+    model_code: string;
+    enabled_axes: string[];
+    minimum_tool_positions: number;
+    maximum_tool_positions: number;
+  }>;
+  modules: Array<{
+    id: string;
+    name: string;
+    station_group: "gang" | "opposed" | "back";
+    compatible_variants: string[];
+    required_axes: string[];
+    capabilities: string[];
+  }>;
+};
+
+export type L32MachineSnapshot = {
+  instance: {
+    id: string;
+    name: string;
+    serial_number?: string | null;
+    variant: string;
+    controller_revision?: string | null;
+    operation_mode: "guide_bushing" | "guide_bushing_less";
+    bar_diameter_mm: number;
+    installed_modules: string[];
+  };
+  definition_revision: string;
+  configuration_hash: string;
+  validation: {
+    valid: boolean;
+    production_ready: boolean;
+    enabled_axes: string[];
+    capabilities: string[];
+    issues: Array<{ code: string; severity: "blocking" | "warning"; field: string; message: string }>;
+  };
+};
+
+export type RotationalProfile = {
+  id: string;
+  axis_id: string;
+  side: "outer" | "inner";
+  extraction_method: "bounding_cylinder" | "edge_projection_envelope" | "exact_section";
+  points: Array<{ z: number; radius: number }>;
+  confidence: number;
+  review_state: "accepted" | "review" | "excluded";
+  review_reasons: string[];
+};
+
+export type RotationalFeatureAnalysis = {
+  schema_version: string;
+  source_file: string;
+  status: "candidate" | "not_detected" | "not_rotational" | "solid_selection_required";
+  evidence: Record<string, number | string | string[]>;
+  axes: Array<{
+    id: string;
+    origin: Vec3;
+    direction: Vec3;
+    confidence: number;
+    review_state: "accepted" | "review" | "excluded";
+    review_reasons: string[];
+  }>;
+  profiles: RotationalProfile[];
+  features: Array<{
+    id: string;
+    profile_id: string;
+    kind: "cylindrical_land" | "taper" | "radial_transition" | "external_groove_candidate" | "thread_form_candidate" | "inner_bore" | "inner_taper" | "cutoff_boundary";
+    z_start: number;
+    z_end: number;
+    radius_start: number;
+    radius_end: number;
+    width_mm: number;
+    depth_mm: number;
+    observed_repeat_mm?: number | null;
+    pitch_candidates_mm: number[];
+    repeat_count: number;
+    binding_state: "unbound" | "matched" | "ambiguous";
+    drawing_requirement_ids: string[];
+    resolved_pitch_mm?: number | null;
+    resolved_major_diameter_mm?: number | null;
+    thread_side?: "external" | "internal" | "unknown" | null;
+    thread_form_angle_degrees?: number | null;
+    thread_designation?: string | null;
+    source_point_indices: number[];
+    confidence: number;
+    review_state: "accepted" | "review" | "excluded";
+    review_reasons: string[];
+  }>;
+  warnings: string[];
+};
+
+export type TurningDraftResult = {
+  schema_version: string;
+  job_id: string;
+  release_status: "DRAFT";
+  nc_generated: false;
+  machine_instance_id: string;
+  machine_configuration_hash: string;
+  operation_id: string;
+  toolpath: {
+    coordinate_convention: "diameter-x_z";
+    channels: Array<{ id: string; commands: Array<{ sequence: number; type: string; axes: Record<string, number>; operation_id: string }> }>;
+  };
+  simulation: {
+    status: "completed" | "failed";
+    approximation: "tool_centerline" | "mixed_centerline_and_nose_circle" | "thread_root_envelope";
+    resolution_mm: number;
+    samples: Array<{ z: number; outer_radius: number; inner_radius: number }>;
+    metrics: {
+      initial_volume_mm3: number;
+      remaining_volume_mm3: number;
+      removed_volume_mm3: number;
+      removal_percent: number;
+    };
+    warnings: string[];
+  };
+  verification: {
+    status: "passed" | "warning" | "failed";
+    profile_id: string;
+    profile_side: "outer" | "inner";
+    tolerance_mm: number;
+    expected_allowance_mm: number;
+    metrics: {
+      evaluated_sample_count: number;
+      overcut_sample_count: number;
+      excess_stock_sample_count: number;
+      maximum_overcut_mm: number;
+      maximum_excess_stock_mm: number;
+      estimated_overcut_volume_mm3: number;
+      estimated_excess_stock_volume_mm3: number;
+    };
+    deviations: Array<{
+      z: number;
+      target_radius_mm: number;
+      actual_radius_mm: number;
+      deviation_mm: number;
+      kind: "overcut" | "excess_stock";
+    }>;
+    warnings: string[];
+  } | null;
+  thread_verification?: {
+    status: "passed" | "warning" | "failed";
+    operation_id: string;
+    metrics: {
+      start_z_mm: number;
+      end_z_mm: number;
+      thread_length_mm: number;
+      pitch_mm: number;
+      major_diameter_mm: number;
+      minor_diameter_mm: number;
+      radial_depth_mm: number;
+      pass_count: number;
+      emitted_pass_count: number;
+    };
+    checks: Array<{
+      id: string;
+      status: "passed" | "warning" | "failed";
+      message: string;
+    }>;
+    warnings: string[];
+  } | null;
+  reachability: {
+    status: "passed" | "warning" | "failed";
+    operation_id: string;
+    profile_id: string;
+    checks: Array<{
+      id: string;
+      status: "passed" | "warning" | "failed";
+      message: string;
+      measured_value: number | string | null;
+      limit_value: number | string | null;
+    }>;
+    blocking_reasons: string[];
+    warnings: string[];
+  } | null;
+  warnings: string[];
+};
+
+export type TurningTransferDraftResult = Omit<TurningDraftResult, "operation_id"> & {
+  cutoff_operation_id: string;
+  state_transitions: Array<{
+    sequence: number;
+    state: "main_spindle_held" | "dual_spindle_clamped" | "phase_synchronized" | "part_separated" | "sub_spindle_held";
+    holding_spindles: Array<"main" | "sub">;
+    barrier_id?: string | null;
+  }>;
+};
+
+export type BacksideDraftResult = {
+  schema_version: string;
+  release_status: "DRAFT";
+  nc_generated: false;
+  transform: {
+    source_frame: "main_spindle";
+    target_frame: "sub_spindle";
+    source_cutoff_z_mm: number;
+    target_datum_z_mm: number;
+    z_scale: -1;
+    radial_scale: 1;
+  };
+  derived_profile: RotationalProfile;
+  draft: TurningDraftResult;
+  warnings: string[];
+};
+
+export type WholePartDraftResult = {
+  schema_version: string;
+  job_id: string;
+  release_status: "DRAFT";
+  nc_generated: false;
+  machine_instance_id: string;
+  machine_configuration_hash: string;
+  program_hash: string;
+  toolpath: TurningDraftResult["toolpath"];
+  coordinate_frames: Array<{
+    channel_id: "main" | "sub";
+    spindle_id: "main" | "sub";
+    datum: string;
+    z_scale_from_main: -1 | 1;
+    source_cutoff_z_mm?: number | null;
+  }>;
+  stages: Array<{
+    sequence: number;
+    operation_id: string;
+    operation_name: string;
+    channel_id: "main" | "sub";
+    phase: "front_turning" | "synchronized_transfer" | "back_turning";
+    command_start: number;
+    command_end: number;
+    command_count: number;
+    verification_status: "passed" | "warning" | "failed" | "not_applicable";
+  }>;
+  state_transitions: TurningTransferDraftResult["state_transitions"];
+  timeline: {
+    status: "scheduled";
+    estimated_cycle_seconds: number;
+    channel_end_seconds: Record<string, number>;
+    barrier_order: string[];
+    events: Array<{
+      channel_id: string;
+      command_sequence: number;
+      operation_id: string;
+      command_type: string;
+      start_seconds: number;
+      end_seconds: number;
+      duration_seconds: number;
+      wait_seconds: number;
+      barrier_id?: string | null;
+    }>;
+    warnings: string[];
+  };
+  continuous_simulation: {
+    status: "passed" | "failed";
+    initial_volume_mm3: number;
+    transferred_volume_mm3: number;
+    final_volume_mm3: number;
+    total_removed_volume_mm3: number;
+    checks: Array<{ id: string; status: "passed" | "failed"; message: string; measured_value?: number | string | null }>;
+    warnings: string[];
+  };
+  warnings: string[];
+};
+
 export type OperationParameterDefinition = {
   key: string;
   label: string;
@@ -335,6 +663,8 @@ export type OperationDefinition = {
 export type Tool = {
   id: string; name: string; kind: string; diameter_mm: number; flute_count: number; max_rpm: number; catalog_match: boolean;
   flute_length_mm: number; stickout_mm: number; holder_diameter_mm: number;
+  nose_radius_mm?: number | null; cutting_width_mm?: number | null; insert_shape?: string | null;
+  hand?: "left" | "right" | "neutral" | null; orientation_code?: number | null;
 };
 
 export type Operation = {
@@ -353,6 +683,10 @@ export type Operation = {
   source: "manual" | "automatic" | "template" | "recommendation";
   enabled: boolean;
   generation_state: "dirty" | "generating" | "generated" | "failed";
+  channel_id?: "main" | "sub" | null;
+  spindle_id?: "main" | "sub" | null;
+  workpiece_side?: "front" | "back" | null;
+  synchronization_group?: string | null;
 };
 
 export type AIProcessReviewResult = {
@@ -449,6 +783,28 @@ export type ManufacturingRequirements = {
     unmapped: number;
     recognized_only: number;
   };
+  requirements?: Array<{
+    id: string;
+    type: string;
+    subtype?: string | null;
+    raw_text?: string | null;
+    cad_feature_ids: string[];
+    mapping_status: "matched" | "ambiguous" | "unmapped" | "not_applicable";
+    verification_status: string;
+    confidence: number;
+    thread?: {
+      designation: string;
+      standard: "UNF" | "UNC" | "UNEF" | "BSPP";
+      side: "external" | "internal" | "unknown";
+      nominal_size: string;
+      major_diameter_mm: number;
+      threads_per_inch: number;
+      pitch_mm: number;
+      form_angle_degrees: number;
+      class_fit?: string | null;
+      handedness: "right" | "left" | "unknown";
+    } | null;
+  }>;
 };
 
 export type Job = {
@@ -458,6 +814,9 @@ export type Job = {
   created_at: string;
   material: string;
   machine: string;
+  device_id?: string | null;
+  machine_instance_id?: string | null;
+  machine_configuration_hash?: string | null;
   model_url: string | null;
   drawing_filename?: string | null;
   drawing_url?: string | null;
@@ -497,5 +856,18 @@ export type Job = {
     blocking_reasons: string[];
     coverage?: ManufacturingCoverage | null;
     manufacturing_requirements?: ManufacturingRequirements | null;
+    ai_planning?: {
+      status?: "fallback";
+      provider?: string;
+      model?: string;
+      created_at?: string;
+      manufacturing_intent?: string;
+      recommended_process_kind?: string;
+      part_family?: string;
+      confidence?: number;
+      summary?: string;
+      message?: string;
+      requires_engineer_review?: boolean;
+    } | null;
   } | null;
 };

@@ -15,6 +15,7 @@ MATERIALS = [
 
 MACHINES = [
     MachineProfile(id="vmc-850", name="VMC850 三轴立式加工中心（FANUC 0i-MF Plus）", axes=3, travel_mm=[800, 500, 500], max_spindle_rpm=10000, max_feed_mm_min=10000, max_tool_diameter_mm=80, postprocessor="fanuc"),
+    MachineProfile(id="citizen-cincom-l32", name="Citizen Cincom L32", axes=7, travel_mm=[320, 32, 32], max_spindle_rpm=8000, max_feed_mm_min=10000, max_tool_diameter_mm=12, postprocessor=None),
     MachineProfile(id="vmc-850-4a", name="四轴加工中心", axes=4, travel_mm=[800, 500, 500], max_spindle_rpm=12000, max_feed_mm_min=12000, max_tool_diameter_mm=80, postprocessor=None),
     MachineProfile(id="u500-5x", name="五轴加工中心", axes=5, travel_mm=[600, 500, 450], max_spindle_rpm=18000, max_feed_mm_min=15000, max_tool_diameter_mm=63, postprocessor=None),
 ]
@@ -24,7 +25,7 @@ TOOL_DEFINITIONS = [
     {"id": "CM-6-90", "name": "Ø6 90°倒角刀", "kind": "chamfer_mill", "diameter_mm": 6.0, "flute_count": 3, "max_rpm": 12000, "flute_length_mm": 8, "stickout_mm": 20, "holder_diameter_mm": 20},
     *[
         {"id": f"DRILL-{diameter:.1f}", "name": f"Ø{diameter:.1f} 麻花钻", "kind": "drill", "diameter_mm": diameter, "flute_count": 2, "max_rpm": 12000, "flute_length_mm": max(15, diameter * 5), "stickout_mm": max(30, diameter * 6), "holder_diameter_mm": 25}
-        for diameter in (2.0, 3.0, 4.0, 5.0, 6.0, 6.5, 7.0, 8.0, 10.0, 12.0, 16.0, 20.0)
+        for diameter in (2.0, 3.0, 4.0, 5.0, 6.0, 6.5, 7.0, 8.0, 10.0, 10.5, 11.0, 12.0, 16.0, 20.0)
     ],
     *[
         {"id": f"EM-{diameter}", "name": f"Ø{diameter} 平底立铣刀", "kind": "end_mill", "diameter_mm": float(diameter), "flute_count": 3, "max_rpm": 16000, "flute_length_mm": max(12, diameter * 2.5), "stickout_mm": max(25, diameter * 3), "holder_diameter_mm": 32}
@@ -34,6 +35,14 @@ TOOL_DEFINITIONS = [
         {"id": f"BM-{diameter:g}", "name": f"Ø{diameter:g} 球头立铣刀", "kind": "ball_end_mill", "diameter_mm": float(diameter), "flute_count": 2, "max_rpm": 16000, "flute_length_mm": max(8, diameter * 4), "stickout_mm": max(18, diameter * 6), "holder_diameter_mm": 10 if diameter <= 2.5 else 16}
         for diameter in (1.5, 2.0, 2.5, 3.0, 4.0)
     ],
+    {"id": "TURN-OD-R", "name": "外圆粗车刀", "kind": "turning_od", "diameter_mm": 0.8, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.8, "stickout_mm": 20, "holder_diameter_mm": 16, "nose_radius_mm": 0.8, "insert_shape": "CNMG", "hand": "right", "orientation_code": 3},
+    {"id": "TURN-OD-F", "name": "外圆精车刀", "kind": "turning_od", "diameter_mm": 0.4, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.4, "stickout_mm": 20, "holder_diameter_mm": 16, "nose_radius_mm": 0.4, "insert_shape": "DCMT", "hand": "right", "orientation_code": 3},
+    {"id": "TURN-ID-R", "name": "内孔粗车刀", "kind": "turning_id", "diameter_mm": 0.4, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.4, "stickout_mm": 25, "holder_diameter_mm": 10, "nose_radius_mm": 0.4, "insert_shape": "CCMT", "hand": "right", "orientation_code": 2},
+    {"id": "TURN-ID-F", "name": "内孔精车刀", "kind": "turning_id", "diameter_mm": 0.2, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.2, "stickout_mm": 25, "holder_diameter_mm": 8, "nose_radius_mm": 0.2, "insert_shape": "DCGT", "hand": "right", "orientation_code": 2},
+    {"id": "TURN-GROOVE-2", "name": "2 mm 切槽刀", "kind": "grooving", "diameter_mm": 2.0, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 2.0, "stickout_mm": 20, "holder_diameter_mm": 16, "cutting_width_mm": 2.0, "hand": "neutral", "orientation_code": 4},
+    {"id": "TURN-THREAD-60", "name": "60°螺纹车刀", "kind": "threading", "diameter_mm": 0.2, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.2, "stickout_mm": 20, "holder_diameter_mm": 16, "nose_radius_mm": 0.1, "insert_shape": "60deg", "hand": "right", "orientation_code": 3},
+    {"id": "TURN-CUTOFF-2", "name": "2 mm 切断刀", "kind": "cutoff", "diameter_mm": 2.0, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 2.0, "stickout_mm": 25, "holder_diameter_mm": 16, "cutting_width_mm": 2.0, "hand": "neutral", "orientation_code": 4},
+    {"id": "TAP-M6", "name": "M6 丝锥", "kind": "tap", "diameter_mm": 6.0, "flute_count": 3, "max_rpm": 3000, "flute_length_mm": 15, "stickout_mm": 30, "holder_diameter_mm": 16},
 ]
 
 
@@ -48,13 +57,15 @@ def resolve_material(value: str) -> MaterialProfile:
 
 def resolve_machine(value: str) -> MachineProfile:
     normalized = value.strip().lower()
+    if normalized in {"seksun-freecad-cam-standard", "freecad cam standard", "seksun freecad cam 标准虚拟设备"}:
+        return MACHINES[0].model_copy(deep=True)
     for profile in MACHINES:
         if normalized in {profile.id.lower(), profile.name.lower()}:
             return profile.model_copy(deep=True)
     if "5" in normalized or "五轴" in value:
-        return MACHINES[2].model_copy(deep=True)
+        return MACHINES[3].model_copy(deep=True)
     if "4" in normalized or "四轴" in value:
-        return MACHINES[1].model_copy(deep=True)
+        return MACHINES[2].model_copy(deep=True)
     return MACHINES[0].model_copy(deep=True)
 
 

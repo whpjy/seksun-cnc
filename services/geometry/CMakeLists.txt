@@ -18,7 +18,7 @@ target_link_libraries(
     occt-analyzer
     PRIVATE
         TKSTEP TKSTEPAttr TKSTEP209 TKSTEPBase TKXSBase TKShHealing
-        TKSTL TKMesh TKTopAlgo TKGeomAlgo TKBRep TKGeomBase TKG3d TKG2d
+        TKSTL TKMesh TKBO TKTopAlgo TKGeomAlgo TKBRep TKGeomBase TKG3d TKG2d
         TKMath TKernel
 )
 
