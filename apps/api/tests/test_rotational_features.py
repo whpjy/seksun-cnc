@@ -6,6 +6,7 @@ from app.models import Bounds, GeometryAnalysis, JobResponse, Vec3
 from app.rotational_features import (
     RotationalFeatureAnalysis, RotationalProfile, RotationalProfilePoint,
     _extract_profile_features, bind_thread_requirements, infer_rotational_features,
+    split_outer_profile_for_longitudinal_turning, suppress_external_grooves,
 )
 from app.requirements_adapter import import_measurement_specification
 
@@ -177,6 +178,43 @@ def test_prefers_exact_section_and_keeps_inner_profile_review_only() -> None:
     assert any(feature.kind == "cutoff_boundary" for feature in result.features)
 
 
+def test_exact_section_may_use_excluded_local_source_face_when_axis_and_span_match() -> None:
+    source = analysis_with_cylinder()
+    source.cylindrical_features.append(source.cylindrical_features[0].model_copy(update={
+        "id": "HF-SECTION-SOURCE",
+        "source_face_ids": ["CF-SECTION-SOURCE"],
+        "radius": 10,
+        "length": 1,
+        "confidence": 0.3,
+        "review_state": "excluded",
+    }))
+    source = GeometryAnalysis.model_validate({
+        **source.model_dump(),
+        "rotational_sections": [{
+            "source_feature_id": "CF-SECTION-SOURCE",
+            "axis_origin": {"x": 0, "y": 0, "z": 0},
+            "axis": {"x": 0, "y": 0, "z": 1},
+            "plane_normal": {"x": 0, "y": 1, "z": 0},
+            "outer_profile": [
+                {"z": -50, "radius": 5},
+                {"z": 0, "radius": 10},
+                {"z": 50, "radius": 10},
+            ],
+            "inner_profile": [],
+            "tolerance_mm": 0.005,
+            "warnings": [],
+        }],
+    })
+
+    result = infer_rotational_features(source)
+
+    assert result.profiles[0].extraction_method == "exact_section"
+    assert result.evidence["reference_feature_id"] == "HF-SECTION-SOURCE"
+    assert [(item.z, item.radius) for item in result.profiles[0].points] == [
+        (-50, 5), (0, 10), (50, 10),
+    ]
+
+
 def test_collapses_repeated_grooves_into_reviewable_thread_form() -> None:
     profile = RotationalProfile(
         id="RP-THREAD", axis_id="RA-1", side="outer", extraction_method="exact_section",
@@ -200,6 +238,116 @@ def test_collapses_repeated_grooves_into_reviewable_thread_form() -> None:
     assert round(thread.observed_repeat_mm or 0, 6) == 1
     assert [round(item, 6) for item in thread.pitch_candidates_mm] == [1, 2]
     assert thread.review_state == "review"
+
+
+def test_rounded_groove_depth_uses_stable_lands_not_first_arc_chords() -> None:
+    profile = RotationalProfile(
+        id="RP-ROUNDED-GROOVE", axis_id="RA-1", side="outer",
+        extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=z_value, radius=radius)
+            for z_value, radius in [
+                (-2, 2), (-1, 2),
+                (-0.8, 1.95), (-0.6, 1.4), (-0.5, 1),
+                (0.5, 1), (0.6, 1.4), (0.8, 1.95),
+                (1, 2), (2, 2),
+            ]
+        ],
+        confidence=0.8,
+    )
+
+    groove = next(
+        item for item in _extract_profile_features(profile)
+        if item.kind == "external_groove_candidate"
+    )
+
+    assert groove.width_mm == 1
+    assert groove.depth_mm == 1
+
+
+def test_external_groove_is_bridged_for_longitudinal_od_turning() -> None:
+    profile = RotationalProfile(
+        id="RP-GROOVE", axis_id="RA-1", side="outer",
+        extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=z_value, radius=radius)
+            for z_value, radius in [
+                (-3, 5), (-2, 5), (-2, 3), (-1, 3), (-1, 5), (0, 5),
+            ]
+        ],
+        confidence=0.8, review_state="accepted",
+    )
+
+    base_profile = suppress_external_grooves(profile)
+
+    assert [(item.z, item.radius) for item in base_profile.points] == [
+        (-3, 5), (-2, 5), (-1, 5), (0, 5),
+    ]
+    assert [(item.z, item.radius) for item in profile.points] == [
+        (-3, 5), (-2, 5), (-2, 3), (-1, 3), (-1, 5), (0, 5),
+    ]
+
+
+def test_hidden_rear_shoulder_splits_front_and_back_turning_regions() -> None:
+    profile = RotationalProfile(
+        id="RP-REGIONAL", axis_id="RA-1", side="outer",
+        extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=z_value, radius=radius)
+            for z_value, radius in [(-20, 9), (-10, 5), (0, 10)]
+        ],
+        confidence=1, review_state="accepted",
+    )
+
+    front, front_form, back = split_outer_profile_for_longitudinal_turning(profile)
+
+    assert [(item.z, item.radius) for item in front.points] == [(-10, 5), (0, 10)]
+    assert front_form is None
+    assert back is not None
+    assert [(item.z, item.radius) for item in back.points] == [(-20, 9), (-10, 5)]
+
+
+def test_steep_leading_face_is_separated_from_longitudinal_turning() -> None:
+    profile = RotationalProfile(
+        id="RP-FRONT-FORM", axis_id="RA-1", side="outer",
+        extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=z_value, radius=radius)
+            for z_value, radius in [
+                (-8, 2), (-1.15, 10.05), (-0.95, 10.25),
+                (0.95, 10.25), (1.15, 10.05), (1.216667, 2), (3.05, 0.5),
+            ]
+        ],
+        confidence=1, review_state="accepted",
+    )
+
+    longitudinal, front_form, back = split_outer_profile_for_longitudinal_turning(profile)
+
+    assert min(item.z for item in longitudinal.points) == -8
+    assert max(item.z for item in longitudinal.points) == 1.15
+    assert front_form is not None
+    assert min(item.z for item in front_form.points) == 1.15
+    assert max(item.z for item in front_form.points) == 3.05
+    assert back is None
+
+
+def test_micron_scale_profile_noise_is_not_a_groove() -> None:
+    profile = RotationalProfile(
+        id="RP-NOISE", axis_id="RA-1", side="outer",
+        extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=z_value, radius=radius)
+            for z_value, radius in [
+                (0, 10), (1, 10), (1, 9.995), (1.001, 9.995),
+                (1.001, 10), (2, 10),
+            ]
+        ],
+        confidence=0.8,
+    )
+
+    features = _extract_profile_features(profile)
+
+    assert not any(item.kind == "external_groove_candidate" for item in features)
 
 
 def test_binds_unique_periodic_tooth_form_to_verified_drawing_thread() -> None:

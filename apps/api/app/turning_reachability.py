@@ -7,7 +7,11 @@ from pydantic import BaseModel, Field
 from cam.providers.turning import TurningContext
 
 from .models import Operation
-from .rotational_features import RotationalProfile
+from .rotational_features import (
+    RotationalProfile,
+    suppress_external_grooves,
+    suppress_rectangular_internal_grooves,
+)
 
 
 class TurningReachabilityCheck(BaseModel):
@@ -61,9 +65,10 @@ def assess_turning_reachability(
     if assembly_clearance_mm < 0:
         raise ValueError("assembly clearance cannot be negative")
     checks: list[TurningReachabilityCheck] = []
+    groove_side = str(operation.parameters.get("groove_side", "external"))
     expected_kinds = {
         "turn_cutoff": {"cutoff"},
-        "turn_grooving": {"grooving"},
+        "turn_grooving": {"internal_grooving"} if groove_side == "internal" else {"grooving"},
         "axial_drilling": {"drill"},
         "axial_tapping": {"tap"},
     }.get(operation.type, {"turning_od" if profile.side == "outer" else "turning_id"})
@@ -85,6 +90,16 @@ def assess_turning_reachability(
         "axial_alignment" if is_axial_tool else str(operation.tool.orientation_code or "missing"),
         "spindle_centerline" if is_axial_tool else str(operation.tool.hand or "missing"),
     ))
+    if operation.type in {"turn_od_roughing", "turn_od_finishing"}:
+        expected_hand = "right" if context.cut_direction == "negative_z" else "left"
+        direction_hand_ok = operation.tool.hand in {expected_hand, "neutral"}
+        checks.append(_check(
+            "cut_direction_tool_hand",
+            "passed" if direction_hand_ok else "failed",
+            "刀具左右手与轴向进给方向匹配"
+            if direction_hand_ok else "轴向进给方向与外圆车刀左右手不匹配",
+            str(operation.tool.hand or "missing"), expected_hand,
+        ))
     nose_radius = float(operation.tool.nose_radius_mm or 0)
     checks.append(_check(
         "nose_radius", "passed" if nose_radius > 0 or is_axial_tool else "warning",
@@ -93,15 +108,25 @@ def assess_turning_reachability(
         "not_applicable" if is_axial_tool else "> 0",
     ))
 
-    nodes = _material_side_nodes(profile)
-    ordered = sorted(nodes, reverse=context.cut_direction == "negative_z")
     contour_operations = {
         "turn_od_roughing", "turn_od_finishing", "turn_id_roughing", "turn_id_finishing",
     }
-    undercuts = [
-        (left, right) for left, right in zip(ordered, ordered[1:])
-        if right[1] > left[1] + 1e-6
-    ] if operation.type in contour_operations else []
+    reachability_profile = profile
+    if operation.type in contour_operations:
+        if profile.side == "inner":
+            reachability_profile = suppress_rectangular_internal_grooves(profile)
+        else:
+            reachability_profile = suppress_external_grooves(profile)
+    nodes = _material_side_nodes(reachability_profile)
+    ordered = sorted(nodes, reverse=context.cut_direction == "negative_z")
+    undercuts: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    if operation.type in contour_operations:
+        entered_reduced_diameter = False
+        for left, right in zip(ordered, ordered[1:]):
+            if right[1] < left[1] - 1e-6:
+                entered_reduced_diameter = True
+            elif entered_reduced_diameter and right[1] > left[1] + 1e-6:
+                undercuts.append((left, right))
     checks.append(_check(
         "profile_undercut", "failed" if undercuts else "passed",
         "轮廓存在标准纵向车刀无法从当前方向到达的倒扣" if undercuts else "轮廓沿设定进给方向无隐藏倒扣",
@@ -139,6 +164,25 @@ def assess_turning_reachability(
             "boring_bar_axial_reach", "passed" if reach_ok else "failed",
             "镗杆伸出长度覆盖内轮廓深度" if reach_ok else "内轮廓深度超过镗杆可用伸出长度",
             profile_depth, usable_stickout,
+        ))
+
+    if profile.side == "inner" and operation.type == "turn_grooving" and groove_side == "internal":
+        holder_radius = operation.tool.holder_diameter_mm / 2
+        required_bore = holder_radius + assembly_clearance_mm
+        minimum_profile_radius = min(point.radius for point in profile.points)
+        entry_ok = minimum_profile_radius >= required_bore - 1e-9
+        checks.append(_check(
+            "internal_groove_tool_entry", "passed" if entry_ok else "failed",
+            "基孔可供内槽刀杆安全进入" if entry_ok else "基孔小于内槽刀杆半径与装配间隙之和",
+            minimum_profile_radius, required_bore,
+        ))
+        required_reach = float(operation.parameters.get("groove_reach_depth_mm", 0))
+        usable_stickout = max(operation.tool.stickout_mm - assembly_clearance_mm, 0)
+        reach_ok = required_reach <= usable_stickout + 1e-9
+        checks.append(_check(
+            "internal_groove_axial_reach", "passed" if reach_ok else "failed",
+            "内槽刀伸出覆盖槽位深度" if reach_ok else "内槽位置超过刀杆可用伸出长度",
+            required_reach, usable_stickout,
         ))
 
     if operation.type == "axial_drilling":

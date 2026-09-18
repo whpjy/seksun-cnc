@@ -6,7 +6,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from .models import Bounds, CylindricalFeature, GeometryAnalysis, ManufacturingRequirements, Vec3
+from .models import (
+    Bounds,
+    CylindricalFeature,
+    GeometryAnalysis,
+    ManufacturingRequirements,
+    RotationalSectionCandidate,
+    Vec3,
+)
 
 
 ReviewState = Literal["accepted", "review", "excluded"]
@@ -52,7 +59,7 @@ class TurningProfileFeature(BaseModel):
     profile_id: str
     kind: Literal[
         "cylindrical_land", "taper", "radial_transition",
-        "external_groove_candidate", "thread_form_candidate",
+        "external_groove_candidate", "internal_groove_candidate", "thread_form_candidate",
         "inner_bore", "inner_taper", "cutoff_boundary",
     ]
     z_start: float
@@ -224,8 +231,48 @@ def _extract_profile_features(profile: RotationalProfile) -> list[TurningProfile
     maximum_radius = max(point.radius for point in points)
     z_tolerance = max(z_span * 1e-5, 1e-4)
     radius_tolerance = max(maximum_radius * 1e-4, 1e-3)
+    minimum_groove_depth = max(maximum_radius * 0.005, 0.03)
+    minimum_groove_width = 0.05
     confidence = min(profile.confidence, 0.72 if profile.extraction_method == "exact_section" else 0.5)
     result: list[TurningProfileFeature] = []
+
+    def nearest_land_radius(segment_index: int, direction: int) -> float | None:
+        """Return the nearest stable land beyond any rounded transition chords."""
+
+        adjacent_index = segment_index - 1 if direction < 0 else segment_index + 1
+        adjacent_reference: float | None = None
+        if 0 <= adjacent_index < len(points) - 1:
+            adjacent_left = points[adjacent_index]
+            adjacent_right = points[adjacent_index + 1]
+            adjacent_reference = (
+                adjacent_left.radius if direction < 0 else adjacent_right.radius
+            )
+            if (
+                abs(adjacent_right.z - adjacent_left.z) <= z_tolerance
+                and abs(adjacent_right.radius - adjacent_left.radius) > radius_tolerance
+            ):
+                return adjacent_reference
+
+        candidate_index = segment_index + direction
+        while 0 <= candidate_index < len(points) - 1:
+            left = points[candidate_index]
+            right = points[candidate_index + 1]
+            candidate_delta_z = abs(right.z - left.z)
+            candidate_delta_radius = abs(right.radius - left.radius)
+            if (
+                candidate_delta_z > z_tolerance
+                and candidate_delta_radius <= radius_tolerance
+            ):
+                stable_radius = (left.radius + right.radius) / 2
+                if adjacent_reference is None:
+                    return stable_radius
+                return (
+                    min(adjacent_reference, stable_radius)
+                    if profile.side == "inner"
+                    else max(adjacent_reference, stable_radius)
+                )
+            candidate_index += direction
+        return adjacent_reference
 
     for index, (start, end) in enumerate(zip(points, points[1:]), start=1):
         delta_z = abs(end.z - start.z)
@@ -242,16 +289,41 @@ def _extract_profile_features(profile: RotationalProfile) -> list[TurningProfile
             if profile.side == "inner":
                 kind = "inner_bore"
                 reasons = ["恒定内半径段来自截面包络，需排除横向孔和局部槽交线。"]
+                previous_radius = nearest_land_radius(index - 1, -1)
+                following_radius = nearest_land_radius(index - 1, 1)
+                surrounding_radius = (
+                    max(previous_radius, following_radius)
+                    if previous_radius is not None and following_radius is not None
+                    else None
+                )
+                if (
+                    surrounding_radius is not None
+                    and min(start.radius, end.radius) - surrounding_radius
+                    >= minimum_groove_depth
+                    and delta_z >= minimum_groove_width
+                ):
+                    kind = "internal_groove_candidate"
+                    depth = min(start.radius, end.radius) - surrounding_radius
+                    reasons = ["局部恒定内半径段高于两侧最近稳定基孔；槽深以稳定基孔计算，槽宽、圆角和内槽刀仍须由图纸确认。"]
             else:
                 kind = "cylindrical_land"
                 reasons = ["恒定外半径段来自截面包络，需与图纸尺寸绑定。"]
-                previous_radius = points[index - 2].radius if index >= 2 else start.radius
-                following_radius = points[index + 1].radius if index + 1 < len(points) else end.radius
-                surrounding_radius = min(previous_radius, following_radius)
-                if surrounding_radius - max(start.radius, end.radius) > radius_tolerance * 3:
+                previous_radius = nearest_land_radius(index - 1, -1)
+                following_radius = nearest_land_radius(index - 1, 1)
+                surrounding_radius = (
+                    min(previous_radius, following_radius)
+                    if previous_radius is not None and following_radius is not None
+                    else None
+                )
+                if (
+                    surrounding_radius is not None
+                    and surrounding_radius - max(start.radius, end.radius)
+                    >= minimum_groove_depth
+                    and delta_z >= minimum_groove_width
+                ):
                     kind = "external_groove_candidate"
                     depth = surrounding_radius - max(start.radius, end.radius)
-                    reasons = ["低于两侧外径的轴向恒半径段，标记为外槽候选；槽宽、圆角和刀宽必须由图纸确认。"]
+                    reasons = ["局部恒定外半径段低于两侧最近稳定外圆；槽深以稳定外圆计算，槽宽、圆角和刀宽仍须由图纸确认。"]
         else:
             kind = "inner_taper" if profile.side == "inner" else "taper"
             reasons = ["轴向与半径同时变化，暂按锥面或圆弧离散段处理。"]
@@ -275,8 +347,8 @@ def _extract_profile_features(profile: RotationalProfile) -> list[TurningProfile
         groove_candidates = [
             item for item in result
             if item.kind == "external_groove_candidate"
-            and item.depth_mm >= max(maximum_radius * 0.005, 0.03)
-            and item.width_mm >= 0.05
+            and item.depth_mm >= minimum_groove_depth
+            and item.width_mm >= minimum_groove_width
         ]
         longest_run: list[TurningProfileFeature] = []
         for start_index, first in enumerate(groove_candidates):
@@ -352,6 +424,174 @@ def _extract_profile_features(profile: RotationalProfile) -> list[TurningProfile
             review_reasons=["按外轮廓最小 Z 端建立切断边界候选，接料方式和成品端面余量确认前不得执行。"],
         ))
     return result
+
+
+def suppress_rectangular_internal_grooves(profile: RotationalProfile) -> RotationalProfile:
+    """Return the base-bore contour with sharp local ID recesses removed.
+
+    A longitudinal boring tool must leave a local recess for a dedicated ID
+    grooving tool. Only the exact four-node rectangular form is suppressed;
+    rounded or tapered recesses remain review-only geometry.
+    """
+    if profile.side != "inner" or len(profile.points) < 4:
+        return profile.model_copy(deep=True)
+    removed: set[int] = set()
+    points = profile.points
+    for index in range(1, len(points) - 2):
+        left_base, groove_left, groove_right, right_base = points[index - 1:index + 3]
+        if (
+            abs(left_base.z - groove_left.z) <= 1e-9
+            and groove_right.z > groove_left.z + 1e-9
+            and abs(groove_right.z - right_base.z) <= 1e-9
+            and abs(groove_left.radius - groove_right.radius) <= 1e-9
+            and groove_left.radius > max(left_base.radius, right_base.radius) + 1e-6
+        ):
+            removed.update((index, index + 1))
+    if not removed:
+        return profile.model_copy(deep=True)
+    return profile.model_copy(update={
+        "points": [point.model_copy(deep=True) for index, point in enumerate(points) if index not in removed],
+    })
+
+
+def suppress_external_grooves(profile: RotationalProfile) -> RotationalProfile:
+    """Return the longitudinal OD contour with dedicated grooves bridged.
+
+    External groove candidates belong to a grooving operation, not to the
+    ordinary OD roughing/finishing path.  The candidate itself may have sharp
+    or rounded flanks, so expand from its bottom land to the nearest stable
+    cylindrical land on each side and retain only those land boundary points.
+    Interpolation between the retained boundaries represents the base OD that
+    the longitudinal tool may safely prepare without entering the recess.
+    """
+    if profile.side != "outer" or len(profile.points) < 4:
+        return profile.model_copy(deep=True)
+
+    points = profile.points
+    candidates = [
+        item for item in _extract_profile_features(profile)
+        if item.kind == "external_groove_candidate"
+        and len(item.source_point_indices) == 2
+    ]
+    removed: set[int] = set()
+    for candidate in candidates:
+        bottom_left, bottom_right = candidate.source_point_indices
+
+        left_land_end: int | None = None
+        for segment in range(bottom_left - 1, -1, -1):
+            left, right = points[segment], points[segment + 1]
+            if abs(right.z - left.z) > 1e-6 and abs(right.radius - left.radius) <= 1e-6:
+                left_land_end = segment + 1
+                break
+
+        right_land_start: int | None = None
+        for segment in range(bottom_right + 1, len(points) - 1):
+            left, right = points[segment], points[segment + 1]
+            if abs(right.z - left.z) > 1e-6 and abs(right.radius - left.radius) <= 1e-6:
+                right_land_start = segment
+                break
+
+        if left_land_end is None or right_land_start is None:
+            continue
+        if left_land_end >= right_land_start:
+            continue
+        baseline_minimum = min(
+            points[left_land_end].radius,
+            points[right_land_start].radius,
+        )
+        if max(points[bottom_left].radius, points[bottom_right].radius) >= baseline_minimum - 1e-6:
+            continue
+        removed.update(range(left_land_end + 1, right_land_start))
+
+    if not removed:
+        return profile.model_copy(deep=True)
+    return profile.model_copy(update={
+        "points": [
+            point.model_copy(deep=True)
+            for index, point in enumerate(points)
+            if index not in removed
+        ],
+    })
+
+
+def clip_rotational_profile(
+    profile: RotationalProfile,
+    minimum_z: float,
+    maximum_z: float,
+) -> RotationalProfile:
+    """Clip a profile to point-aligned bounds used by a regional operation."""
+    if maximum_z <= minimum_z:
+        raise ValueError("profile region maximum Z must be greater than minimum Z")
+    profile_minimum = min(point.z for point in profile.points)
+    profile_maximum = max(point.z for point in profile.points)
+    if minimum_z < profile_minimum - 1e-6 or maximum_z > profile_maximum + 1e-6:
+        raise ValueError("profile region lies outside the accepted profile")
+    points = [
+        point.model_copy(deep=True)
+        for point in profile.points
+        if minimum_z - 1e-9 <= point.z <= maximum_z + 1e-9
+    ]
+    if len(points) < 2 or len({round(point.z, 9) for point in points}) < 2:
+        raise ValueError("profile region must contain at least two axial positions")
+    return profile.model_copy(update={"points": points})
+
+
+def split_outer_profile_for_longitudinal_turning(
+    profile: RotationalProfile,
+) -> tuple[
+    RotationalProfile,
+    RotationalProfile | None,
+    RotationalProfile | None,
+]:
+    """Split an OD profile into longitudinal, front-form and backside regions.
+
+    The first result is reachable by ordinary negative-Z longitudinal turning.
+    The optional second result contains a leading form separated by a steep
+    radial face. The optional third result is a backside/alternate-direction
+    candidate. Callers must not silently include either candidate in the
+    longitudinal operation.
+    """
+    base = suppress_external_grooves(profile)
+    if base.side != "outer":
+        return base, None, None
+    ordered = sorted(base.points, key=lambda item: item.z, reverse=True)
+    minimum_z = min(point.z for point in base.points)
+    maximum_z = max(point.z for point in base.points)
+
+    longitudinal_maximum_z = maximum_z
+    front_form: RotationalProfile | None = None
+    for left, right in zip(ordered, ordered[1:]):
+        radial_change = right.radius - left.radius
+        if radial_change < -1e-6:
+            break
+        axial_change = left.z - right.z
+        if radial_change > 0.1 and radial_change > axial_change * 1.5:
+            longitudinal_maximum_z = right.z
+            if maximum_z - right.z > 1e-6:
+                front_form = clip_rotational_profile(base, right.z, maximum_z)
+            break
+
+    longitudinal_source = (
+        clip_rotational_profile(base, minimum_z, longitudinal_maximum_z)
+        if longitudinal_maximum_z < maximum_z - 1e-6
+        else base
+    )
+    ordered = sorted(longitudinal_source.points, key=lambda item: item.z, reverse=True)
+    entered_reduced_diameter = False
+    split_z: float | None = None
+    for left, right in zip(ordered, ordered[1:]):
+        if right.radius < left.radius - 1e-6:
+            entered_reduced_diameter = True
+        elif entered_reduced_diameter and right.radius > left.radius + 1e-6:
+            split_z = left.z
+            break
+    if split_z is None:
+        return longitudinal_source, front_form, None
+    return (
+        clip_rotational_profile(longitudinal_source, split_z, longitudinal_maximum_z),
+        front_form,
+        clip_rotational_profile(longitudinal_source, minimum_z, split_z),
+    )
 
 
 def bind_thread_requirements(
@@ -435,24 +675,34 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
         )
 
     reference = max(candidates, key=_candidate_score)
-    exact_section = next(
-        (
-            section for section in analysis.rotational_sections
-            if len(section.outer_profile) >= 2
-            and any(
-                item.id == section.source_feature_id
+    reference_direction = _normalize_direction(reference.axis)
+    section_candidates: list[tuple[float, RotationalSectionCandidate, CylindricalFeature]] = []
+    for section in analysis.rotational_sections:
+        if len(section.outer_profile) < 2:
+            continue
+        source = next(
+            (
+                item for item in analysis.cylindrical_features
+                if item.id == section.source_feature_id
                 or section.source_feature_id in item.source_face_ids
-                for item in candidates
-            )
-        ),
-        None,
-    )
-    if exact_section is not None:
-        reference = next(
-            item for item in candidates
-            if item.id == exact_section.source_feature_id
-            or exact_section.source_feature_id in item.source_face_ids
+            ),
+            None,
         )
+        if source is None or source.kind not in {"boss", "cylinder"}:
+            continue
+        section_direction = _normalize_direction(section.axis)
+        if abs(_dot(section_direction, reference_direction)) < 0.98:
+            continue
+        axial_span = max(item.z for item in section.outer_profile) - min(
+            item.z for item in section.outer_profile
+        )
+        if source.review_state == "excluded" and axial_span + 1e-6 < reference.length:
+            continue
+        radial_extent = max(item.radius for item in section.outer_profile)
+        section_candidates.append((axial_span * radial_extent, section, source))
+    exact_section = None
+    if section_candidates:
+        _, exact_section, reference = max(section_candidates, key=lambda item: item[0])
     direction = _normalize_direction(exact_section.axis if exact_section else reference.axis)
     axis_origin = exact_section.axis_origin if exact_section else reference.center
     axis = RotationalAxisCandidate(

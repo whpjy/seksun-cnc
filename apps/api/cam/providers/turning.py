@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import sqrt
+from math import ceil, sqrt
 from typing import Literal
 
 from app.models import Operation
-from app.rotational_features import RotationalProfile, RotationalProfilePoint
+from app.rotational_features import (
+    RotationalProfile,
+    RotationalProfilePoint,
+    suppress_external_grooves,
+    suppress_rectangular_internal_grooves,
+)
 from app.turning_compensation import compensate_profile_for_nose
 from app.toolpath_ir import ToolpathChannel, ToolpathCommand, ToolpathProgram, ToolpathTrace
 
@@ -87,16 +92,16 @@ class TurningProvider:
             _generate_facing(builder)
         elif operation.type == "turn_od_roughing":
             assert profile is not None
-            _generate_od_roughing(builder, profile)
+            _generate_od_roughing(builder, suppress_external_grooves(profile))
         elif operation.type == "turn_od_finishing":
             assert profile is not None
-            _generate_od_finishing(builder, profile)
+            _generate_od_finishing(builder, suppress_external_grooves(profile))
         elif operation.type == "turn_id_roughing":
             assert profile is not None
-            _generate_id_roughing(builder, profile)
+            _generate_id_roughing(builder, suppress_rectangular_internal_grooves(profile))
         elif operation.type == "turn_id_finishing":
             assert profile is not None
-            _generate_id_finishing(builder, profile)
+            _generate_id_finishing(builder, suppress_rectangular_internal_grooves(profile))
         elif operation.type == "turn_grooving":
             _generate_grooving(builder)
         elif operation.type == "turn_threading":
@@ -217,7 +222,14 @@ def _generate_od_finishing(builder: _CommandBuilder, profile: RotationalProfile)
         "cut_side": "external", "position_role": "nose_center",
         "tool_nose_radius_mm": nose_radius,
     }
-    builder.add("feed_move", axes={"X": 2 * first.radius, "Z": first.z}, parameters=nose_parameters)
+    if builder.context.cut_direction == "positive_z":
+        builder.add("rapid_move", axes={"Z": first.z})
+        builder.add("feed_move", axes={"X": 2 * first.radius}, parameters=nose_parameters)
+    else:
+        builder.add(
+            "feed_move", axes={"X": 2 * first.radius, "Z": first.z},
+            parameters=nose_parameters,
+        )
     for point in points[1:]:
         builder.add("feed_move", axes={"X": 2 * point.radius, "Z": point.z}, parameters=nose_parameters)
     builder.add("rapid_move", axes={"X": builder.clearance_diameter})
@@ -258,13 +270,23 @@ def _generate_od_roughing(builder: _CommandBuilder, profile: RotationalProfile) 
     minimum_target = min(item.radius for item in points) + allowance
     if builder.context.stock_radius_mm <= minimum_target + 1e-9:
         raise ValueError("roughing profile does not remove material from the configured stock")
-    radius = max(builder.context.stock_radius_mm - depth, minimum_target)
+    radius = builder.context.stock_radius_mm
+    profile_levels = (
+        sorted({point.radius + allowance for point in points}, reverse=True)
+        if builder.context.cut_direction == "negative_z" else []
+    )
     generated_intervals = 0
     pass_count = 0
-    while radius >= minimum_target - 1e-9:
+    while radius > minimum_target + 1e-9:
         pass_count += 1
         if pass_count > 10_000:
             raise ValueError("roughing pass count exceeds the safety limit")
+        nominal_radius = max(radius - depth, minimum_target)
+        shoulder_levels = [
+            level for level in profile_levels
+            if nominal_radius + 1e-9 < level < radius - 1e-9
+        ]
+        radius = max(shoulder_levels) if shoulder_levels else nominal_radius
         intervals = _threshold_intervals(points, radius, allowance)
         for minimum_z, maximum_z in intervals:
             start_z, end_z = (
@@ -277,13 +299,20 @@ def _generate_od_roughing(builder: _CommandBuilder, profile: RotationalProfile) 
                 axes={"X": builder.clearance_diameter, "Z": _approach_z(start_z, builder.context)},
                 safety_requirements=["work_spindle_running", "tool_offset_active"],
             )
-            builder.add("feed_move", axes={"X": 2 * radius, "Z": start_z}, parameters={"cut_side": "external"})
+            if builder.context.cut_direction == "positive_z":
+                builder.add("rapid_move", axes={"Z": start_z})
+                builder.add(
+                    "feed_move", axes={"X": 2 * radius},
+                    parameters={"cut_side": "external"},
+                )
+            else:
+                builder.add(
+                    "feed_move", axes={"X": 2 * radius, "Z": start_z},
+                    parameters={"cut_side": "external"},
+                )
             builder.add("feed_move", axes={"X": 2 * radius, "Z": end_z}, parameters={"cut_side": "external"})
             builder.add("rapid_move", axes={"X": builder.clearance_diameter})
             generated_intervals += 1
-        if radius <= minimum_target + 1e-9:
-            break
-        radius = max(radius - depth, minimum_target)
     if generated_intervals == 0:
         raise ValueError("roughing profile does not remove material from the configured stock")
 
@@ -320,7 +349,8 @@ def _generate_id_roughing(builder: _CommandBuilder, profile: RotationalProfile) 
         raise ValueError("radial_allowance_mm cannot be negative")
     points = sorted(profile.points, key=lambda item: item.z)
     maximum_target = max(item.radius for item in points) - allowance
-    radius = builder.context.initial_bore_radius_mm + depth
+    minimum_target = min(item.radius for item in points) - allowance
+    radius = min(builder.context.initial_bore_radius_mm + depth, minimum_target)
     generated_intervals = 0
     pass_count = 0
     while radius <= maximum_target + 1e-9:
@@ -358,7 +388,7 @@ def _generate_id_finishing(builder: _CommandBuilder, profile: RotationalProfile)
         compensate_profile_for_nose(
             profile, nose_radius_mm=nose_radius, allowance_mm=allowance,
         ),
-        key=lambda item: item.z,
+        key=lambda item: (item.z, item.radius),
         reverse=builder.context.cut_direction == "negative_z",
     )
     first = points[0]
@@ -432,6 +462,8 @@ def _generate_axial_cycle(builder: _CommandBuilder, *, tapping: bool) -> None:
         parameters["peck_depth_mm"] = _positive(builder.operation, "peck_depth_mm")
         parameters["diameter_mm"] = builder.operation.tool.diameter_mm
         parameters["drill_tip_length_mm"] = _number(builder.operation, "drill_tip_length_mm", 0)
+        parameters["chip_evacuation_strategy"] = str(builder.operation.parameters.get("chip_evacuation_strategy", "standard_peck"))
+        parameters["through_tool_coolant_confirmed"] = bool(builder.operation.parameters.get("through_tool_coolant_confirmed", False))
     builder.add(
         "rapid_move", axes={"X": 0, "Z": retract_z},
         safety_requirements=["axial_tool_alignment_confirmed", "tool_offset_active"],
@@ -447,17 +479,54 @@ def _generate_grooving(builder: _CommandBuilder) -> None:
     final_diameter = _number(builder.operation, "final_diameter_mm")
     if final_diameter < 0:
         raise ValueError("final_diameter_mm cannot be negative")
-    builder.add(
-        "rapid_move", axes={"X": builder.clearance_diameter, "Z": z_value},
-        safety_requirements=["work_spindle_running", "tool_offset_active"],
-    )
+    groove_side = str(builder.operation.parameters.get("groove_side", "external"))
+    if groove_side not in {"external", "internal"}:
+        raise ValueError("turn_grooving groove_side must be external or internal")
     groove_width = _number(builder.operation, "groove_width_mm", builder.operation.tool.cutting_width_mm)
     if groove_width <= 0:
         raise ValueError("turn_grooving groove width must be positive")
-    builder.add("feed_move", axes={"X": final_diameter, "Z": z_value}, parameters={
-        "cut_side": "external", "axial_width_mm": groove_width,
-    })
-    builder.add("rapid_move", axes={"X": builder.clearance_diameter})
+    tool_width = float(builder.operation.tool.cutting_width_mm or 0)
+    if tool_width <= 0 or tool_width > groove_width + 1e-9:
+        raise ValueError("grooving tool width must be positive and no larger than the groove width")
+    pass_count = max(1, ceil(max(groove_width - tool_width, 0) / tool_width) + 1)
+    minimum_center = z_value - groove_width / 2 + tool_width / 2
+    maximum_center = z_value + groove_width / 2 - tool_width / 2
+    positions = [
+        minimum_center + (maximum_center - minimum_center) * index / max(pass_count - 1, 1)
+        for index in range(pass_count)
+    ]
+    peck_depth = _positive(builder.operation, "peck_depth_mm")
+    radial_depth = _positive(builder.operation, "groove_depth_mm")
+    initial_diameter = (
+        final_diameter + 2 * radial_depth
+        if groove_side == "external"
+        else final_diameter - 2 * radial_depth
+    )
+    if initial_diameter <= 0:
+        raise ValueError("internal groove base diameter must be positive")
+    retract_diameter = (
+        builder.clearance_diameter
+        if groove_side == "external"
+        else max(initial_diameter - 2 * builder.context.radial_clearance_mm, 0)
+    )
+    radial_passes = max(1, ceil(radial_depth / peck_depth))
+    for axial_index, position in enumerate(positions, start=1):
+        builder.add(
+            "rapid_move", axes={"X": retract_diameter, "Z": position},
+            safety_requirements=["work_spindle_running", "tool_offset_active"],
+        )
+        for radial_index in range(1, radial_passes + 1):
+            target_diameter = (
+                max(initial_diameter - 2 * peck_depth * radial_index, final_diameter)
+                if groove_side == "external"
+                else min(initial_diameter + 2 * peck_depth * radial_index, final_diameter)
+            )
+            builder.add("feed_move", axes={"X": target_diameter, "Z": position}, parameters={
+                "cut_side": groove_side, "axial_width_mm": tool_width,
+                "groove_axial_pass": axial_index, "groove_axial_pass_count": pass_count,
+                "groove_radial_pass": radial_index, "groove_radial_pass_count": radial_passes,
+            })
+        builder.add("rapid_move", axes={"X": retract_diameter})
 
 
 def _generate_cutoff(builder: _CommandBuilder) -> None:

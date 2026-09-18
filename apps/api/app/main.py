@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from math import radians, tan
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -13,12 +15,13 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Callable
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 from .models import (
-    AxialDrillingOperationReviewRequest, BoringOperationReviewRequest, FeatureReviewRequest, GeometryAnalysis, JobHistoryItem, JobResponse, OperationCreateRequest,
+    AxialDrillingOperationReviewRequest, BoringOperationReviewRequest, FeatureReviewRequest, GeometryAnalysis, GroovingOperationReviewRequest, JobHistoryItem, JobResponse, OperationCreateRequest,
+    GrooveBindingConfirmRequest, ManufacturingRequirement, ManufacturingRequirements,
     ManufacturingRequirementsImportRequest, OperationReorderRequest, OperationUpdateRequest,
     ProcessPlan, SafetyConfigurationRequest, ThreadBindingConfirmRequest,
     ThreadOperationReviewRequest,
@@ -30,7 +33,11 @@ from .operation_library import (
     create_operation_instance, get_operation_definition, operation_library_payload, validate_parameters,
 )
 from .device_library import device_library_payload, get_device
-from .l32_configuration import l32_definition_payload, snapshot_l32_instance
+from .l32_configuration import l32_definition_payload, l32_viii_live_tool_catalog_reference, snapshot_l32_instance
+from .l32_indexed_pocket import IndexedPocketDraft, IndexedPocketSweepCheck, build_indexed_back_pocket_draft
+from .l32_side_milling import build_l32_exterior_clear_draft, build_l32_side_mill_draft
+from .l32_front_groove import build_front_groove_geometry_draft
+from .tool_inventory import ToolInventoryInput, ToolInventoryRecord, physical_tool_fit_for_groove, record_physical_tool
 from .machine_models import MachineBindingRequest, MachineConfigurationSnapshot, MachineInstance
 from .manufacturing_knowledge import assess_plan_knowledge, get_manufacturing_process, manufacturing_process_payload
 from .route_planner import build_manufacturing_route
@@ -50,6 +57,9 @@ from .remediation import apply_automatic_remediation, build_remediation_report
 from .rotational_features import (
     RotationalFeatureAnalysis, bind_thread_requirements, infer_rotational_features,
 )
+from .groove_binding import (
+    DrawingGrooveRequirement, bind_groove_requirement, groove_candidate_evidence,
+)
 from .turning_draft import TurningDraftRequest, TurningDraftResult, compile_turning_draft
 from .turning_reachability import assess_turning_reachability
 from cam.providers.turning import TurningContext
@@ -58,7 +68,12 @@ from .turning_transfer import (
     compile_synchronized_transfer_draft,
 )
 from .l32_backside import BacksideDraftRequest, BacksideDraftResult, compile_backside_draft
+from .l32_backside_chain import (
+    BacksideChainDraftRequest, BacksideChainDraftResult, compile_backside_chain_draft,
+)
+from .l32_front_chain import FrontChainDraftRequest, FrontChainDraftResult, compile_front_chain_draft
 from .l32_whole_program import WholePartDraftRequest, WholePartDraftResult, compile_whole_part_draft
+from .inner_bore_chain import InnerBoreChainRequest, InnerBoreChainResult, compile_inner_bore_chain
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -77,9 +92,11 @@ BENCHMARK_REPORT_PATH = Path(os.getenv(
 CAM_STREAM_LOCK = threading.Lock()
 CAM_STREAMING_JOBS: set[str] = set()
 AI_REVIEW_LOCK = threading.Lock()
+L32_MATERIAL_SNAPSHOT_LOCK = threading.Lock()
 AI_REVIEWING_JOBS: set[str] = set()
 JOB_EVENT_CONDITION = threading.Condition()
 JOB_EVENT_LOGS: dict[str, list[dict[str, object]]] = {}
+TOOL_INVENTORY_LOCK = threading.Lock()
 
 
 def publish_job_event(job_id: str, stage: str, message: str, percent: float, **details: object) -> None:
@@ -169,6 +186,14 @@ def persist_rotational_analysis(
         path.unlink(missing_ok=True)
         return None
     result = infer_rotational_features(analysis)
+    accepted_axis_ids = {
+        profile.axis_id for profile in result.profiles
+        if profile.review_state == "accepted"
+    }
+    for axis in result.axes:
+        if axis.id in accepted_axis_ids:
+            axis.review_state = "accepted"
+            axis.review_reasons = []
     requirements = job.plan.manufacturing_requirements if job.plan else None
     result = bind_thread_requirements(result, requirements)
     write_json(path, result.model_dump(mode="json"))
@@ -245,7 +270,8 @@ def invalidate_cam_artifacts(directory: Path) -> None:
         "turning-backside-ir.json", "turning-backside-draft.json",
         "turning-whole-program-ir.json", "turning-whole-program-draft.json",
         "turning-whole-program-timeline.json", "turning-continuous-simulation.json",
-        "boring-reachability.json", "axial-drilling-review.json",
+        "turning-inner-bore-chain-ir.json", "turning-inner-bore-chain-draft.json",
+        "boring-reachability.json", "axial-drilling-review.json", "grooving-review.json",
     ):
         (directory / filename).unlink(missing_ok=True)
     for pattern in ("program-*.nc", "camotics-*.stl", "*.camotics"):
@@ -388,6 +414,475 @@ def get_l32_machine_definition() -> dict[str, object]:
     return l32_definition_payload()
 
 
+@app.get("/api/v1/machines/l32/catalog-reference/viii-u30b-u151b")
+def get_l32_viii_live_tool_catalog_reference() -> dict[str, object]:
+    return l32_viii_live_tool_catalog_reference()
+
+
+@app.get(
+    "/api/v1/jobs/{job_id}/l32/catalog-back-pocket/{feature_id}/draft",
+    response_model=IndexedPocketDraft,
+)
+def get_l32_catalog_back_pocket_draft(job_id: str, feature_id: str) -> IndexedPocketDraft:
+    """Read-only geometric draft for the catalog U151B scenario, never NC."""
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.analysis is None:
+        raise HTTPException(status_code=409, detail="L32 geometry analysis is required")
+    feature = next((item for item in job.analysis.prismatic_features if item.id == feature_id), None)
+    if feature is None:
+        raise HTTPException(status_code=404, detail="Pocket feature not found")
+    try:
+        draft = build_indexed_back_pocket_draft(job.analysis, feature)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    snapshot_path = job_directory(job_id) / "machine-configuration.json"
+    if job.machine_instance_id and snapshot_path.is_file():
+        snapshot = load_machine_snapshot(snapshot_path)
+        draft.bound_machine_has_required_module = (
+            draft.required_module in snapshot.instance.installed_modules
+            and snapshot.instance.id == job.machine_instance_id
+            and snapshot.configuration_hash == job.machine_configuration_hash
+        )
+    return draft
+
+
+@app.get(
+    "/api/v1/jobs/{job_id}/l32/catalog-back-pocket/{feature_id}/sweep-check",
+    response_model=IndexedPocketSweepCheck,
+)
+def check_l32_catalog_back_pocket_sweep(job_id: str, feature_id: str) -> IndexedPocketSweepCheck:
+    """Compare the actual OCC cutter sweep to the original STEP solid."""
+    draft = get_l32_catalog_back_pocket_draft(job_id, feature_id)
+    job = load_job(job_id)
+    source = job_directory(job_id) / job.filename
+    if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
+        raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
+    try:
+        completed = run_freecad_adapter(
+            FREECAD_CMD,
+            APP_ROOT / "cam" / "l32_pocket_sweep.py",
+            [source, draft.model_dump_json()],
+            timeout_seconds=120,
+        )
+        line = next(
+            item.split("CNC_POCKET_SWEEP ", 1)[1]
+            for item in completed.stdout.splitlines()
+            if "CNC_POCKET_SWEEP " in item
+        )
+        result = json.loads(line)
+    except subprocess.TimeoutExpired as error:
+        raise HTTPException(status_code=504, detail="Exact pocket sweep timed out") from error
+    except (OSError, subprocess.CalledProcessError, StopIteration, ValueError) as error:
+        raise HTTPException(status_code=502, detail=f"Exact pocket sweep failed: {error}") from error
+    contact = float(result["summed_target_contact_mm3"])
+    residual = float(result["remaining_pocket_region_mm3"])
+    status = (
+        "overcut" if contact > 0.0001
+        else "residual" if residual > 0.0001
+        else "within_geometric_tolerance"
+    )
+    return IndexedPocketSweepCheck(
+        feature_id=feature_id,
+        bound_machine_has_required_module=draft.bound_machine_has_required_module,
+        pocket_region_status=status,
+        target_material_inside_pocket_region_mm3=result["target_material_inside_pocket_region_mm3"],
+        summed_target_contact_mm3=contact,
+        remaining_pocket_region_mm3=residual,
+        removed_pocket_region_mm3=round(float(result["region_volume_mm3"]) - residual, 6),
+        stages=result["stages"],
+    )
+
+
+@app.get("/api/v1/jobs/{job_id}/l32/catalog-ear-geometry")
+def get_l32_catalog_ear_geometry(job_id: str) -> dict[str, object]:
+    """Expose exact radial side-face boundaries without changing the job."""
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.analysis is None:
+        raise HTTPException(status_code=409, detail="L32 geometry analysis is required")
+    source = job_directory(job_id) / job.filename
+    if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
+        raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
+    try:
+        completed = run_freecad_adapter(
+            FREECAD_CMD, APP_ROOT / "cam" / "l32_exact_sections.py",
+            [source], timeout_seconds=120,
+        )
+        line = next(
+            item.split("CNC_EXACT_SECTIONS ", 1)[1]
+            for item in completed.stdout.splitlines()
+            if "CNC_EXACT_SECTIONS " in item
+        )
+        result = json.loads(line)
+    except subprocess.TimeoutExpired as error:
+        raise HTTPException(status_code=504, detail="Exact side-face extraction timed out") from error
+    except (OSError, subprocess.CalledProcessError, StopIteration, ValueError) as error:
+        raise HTTPException(status_code=502, detail=f"Exact side-face extraction failed: {error}") from error
+    planar_by_index = {
+        face.source_face_index: face
+        for face in job.analysis.planar_features if face.source_face_index is not None
+    }
+    faces = []
+    for face in result["broad_side_faces"]:
+        analyzed = planar_by_index.get(face["face_number"])
+        if analyzed is None or abs(analyzed.normal.y) < 0.999:
+            continue
+        if abs(analyzed.area - face["area_mm2"]) > max(0.01, analyzed.area * 0.001):
+            continue
+        faces.append({**face, "analysis_face_id": analyzed.id})
+    return {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "source": "original_step_exact_faces",
+        "required_module": "U30B",
+        "reference_only": True,
+        "nc_generated": False,
+        "side_faces": faces,
+    }
+
+
+@app.get("/api/v1/jobs/{job_id}/l32/catalog-ear-toolpaths")
+def get_l32_catalog_ear_toolpaths(job_id: str) -> dict[str, object]:
+    """Build inset side-milling centerlines; no material or holder claim."""
+    job = load_job(job_id)
+    if job.plan is None or job.plan.stock.get("type") != "round_bar":
+        raise HTTPException(status_code=409, detail="L32 round-bar process plan is required")
+    geometry = get_l32_catalog_ear_geometry(job_id)
+    faces = geometry["side_faces"]
+    if not faces:
+        raise HTTPException(status_code=422, detail="No exact radial side faces matched the analysis")
+    try:
+        drafts = [
+            build_l32_side_mill_draft(
+                face, stock_radius_mm=float(job.plan.stock["diameter_mm"])/2,
+            ).model_dump(mode="json")
+            for face in faces
+        ]
+    except (KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    snapshot_path = job_directory(job_id) / "machine-configuration.json"
+    has_module = None
+    if job.machine_instance_id and snapshot_path.is_file():
+        snapshot = load_machine_snapshot(snapshot_path)
+        has_module = (
+            "U30B" in snapshot.instance.installed_modules
+            and snapshot.instance.id == job.machine_instance_id
+            and snapshot.configuration_hash == job.machine_configuration_hash
+        )
+    return {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "reference_only": True,
+        "nc_generated": False,
+        "material_sweep_verified": False,
+        "bound_machine_has_required_module": has_module,
+        "side_drafts": drafts,
+    }
+
+
+@app.get("/api/v1/jobs/{job_id}/l32/catalog-ear-sweep-check")
+def check_l32_catalog_ear_sweep(job_id: str) -> dict[str, object]:
+    """Run every side-milling feed through OCC against the original target."""
+    drafts = get_l32_catalog_ear_toolpaths(job_id)
+    return _check_l32_reference_sweep(job_id,drafts["side_drafts"],drafts["bound_machine_has_required_module"])
+
+
+def _check_l32_reference_sweep(
+    job_id: str, toolpaths: list[dict[str, object]], has_module: bool | None,
+) -> dict[str, object]:
+    job = load_job(job_id)
+    source = job_directory(job_id) / job.filename
+    if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
+        raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
+    try:
+        completed = run_freecad_adapter(
+            FREECAD_CMD, APP_ROOT / "cam" / "l32_side_sweep.py",
+            [source, json.dumps(toolpaths, separators=(",", ":"))],
+            timeout_seconds=120,
+        )
+        line = next(
+            item.split("CNC_SIDE_SWEEP ", 1)[1]
+            for item in completed.stdout.splitlines()
+            if "CNC_SIDE_SWEEP " in item
+        )
+        result = json.loads(line)
+    except subprocess.TimeoutExpired as error:
+        raise HTTPException(status_code=504, detail="Exact side sweep timed out") from error
+    except (OSError, subprocess.CalledProcessError, StopIteration, ValueError) as error:
+        raise HTTPException(status_code=502, detail=f"Exact side sweep failed: {error}") from error
+    checks = result["checks"]
+    return {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "reference_only": True,
+        "nc_generated": False,
+        "bound_machine_has_required_module": has_module,
+        "target_gouge_check_passed": bool(result["target_solid_valid"])
+        and len(checks) == len(toolpaths)
+        and all(
+            item["contacting_segments"] == 0
+            and item["summed_target_contact_mm3"] <= 0.000001
+            and item["analysis_face_id"] == toolpaths[index]["analysis_face_id"]
+            for index,item in enumerate(checks)
+        ),
+        "whole_part_material_verified": False,
+        "checks": checks,
+    }
+
+
+@app.get("/api/v1/jobs/{job_id}/l32/catalog-exterior-toolpaths")
+def get_l32_catalog_exterior_toolpaths(job_id: str) -> dict[str, object]:
+    """Clear the rear exterior only after exact 3D sweep verification."""
+    job = load_job(job_id)
+    if job.plan is None or job.plan.stock.get("type") != "round_bar":
+        raise HTTPException(status_code=409, detail="L32 round-bar process plan is required")
+    geometry = get_l32_catalog_ear_geometry(job_id)
+    faces = geometry["side_faces"]
+    if len(faces) != 2 or {int(face["normal_y"]) for face in faces} != {-1,1}:
+        raise HTTPException(status_code=422, detail="Two opposing exact radial faces are required")
+    try:
+        drafts = [
+            build_l32_exterior_clear_draft(
+                face,
+                stock_radius_mm=float(job.plan.stock["diameter_mm"])/2,
+                access_sign=1 if face["normal_y"] > 0 else -1,
+            ).model_dump(mode="json")
+            for face in faces
+        ]
+    except (KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    snapshot_path = job_directory(job_id) / "machine-configuration.json"
+    has_module = None
+    if job.machine_instance_id and snapshot_path.is_file():
+        snapshot = load_machine_snapshot(snapshot_path)
+        has_module = (
+            "U30B" in snapshot.instance.installed_modules
+            and snapshot.instance.id == job.machine_instance_id
+            and snapshot.configuration_hash == job.machine_configuration_hash
+        )
+    return {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "reference_only": True,
+        "nc_generated": False,
+        "material_sweep_verified": False,
+        "bound_machine_has_required_module": has_module,
+        "exterior_drafts": drafts,
+    }
+
+
+@app.get("/api/v1/jobs/{job_id}/l32/catalog-exterior-sweep-check")
+def check_l32_catalog_exterior_sweep(job_id: str) -> dict[str, object]:
+    drafts = get_l32_catalog_exterior_toolpaths(job_id)
+    return _check_l32_reference_sweep(job_id,drafts["exterior_drafts"],drafts["bound_machine_has_required_module"])
+
+
+@app.get("/api/v1/jobs/{job_id}/l32/material-snapshots")
+def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
+    """Generate clean, cumulative OCC solids for geometric L32 milling playback."""
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.plan is None:
+        raise HTTPException(status_code=409, detail="L32 process plan is required")
+    directory = job_directory(job_id)
+    source = directory / job.filename
+    if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
+        raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
+
+    operations = [item for setup in job.plan.setups for item in setup.operations]
+    rotational_path = directory / "rotational-features.json"
+    if not rotational_path.is_file():
+        raise HTTPException(status_code=404, detail="Exact rotational feature analysis is unavailable")
+    rotational = RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8"))
+    if not rotational.axes:
+        raise HTTPException(status_code=422, detail="No rotational axis is available")
+    region = job.plan.stock.get("nonrotational_region_z_mm")
+    if not isinstance(region, list) or len(region) != 2:
+        raise HTTPException(status_code=422, detail="Nonrotational stock region is unavailable")
+    pockets: dict[str, dict[str, object]] = {}
+    stages: list[dict[str, object]] = []
+    for operation in operations:
+        if operation.enabled is False:
+            continue
+        if operation.type == "live_tool_contour_roughing":
+            stages.append({"operation_id": operation.id, "kind": "exterior", "rough": True})
+        elif operation.type == "live_tool_contour_finishing":
+            stages.append({"operation_id": operation.id, "kind": "exterior", "rough": False})
+        elif operation.type in {"pocket_roughing", "pocket_finishing"}:
+            feature_id = next((item for item in operation.feature_ids if item.startswith("MF-")), None)
+            if feature_id:
+                pockets.setdefault(
+                    feature_id,
+                    get_l32_catalog_back_pocket_draft(job_id, feature_id).model_dump(mode="json"),
+                )
+                stages.append({
+                    "operation_id": operation.id,
+                    "kind": "pocket",
+                    "rough": operation.type == "pocket_roughing",
+                    "feature_id": feature_id,
+                })
+
+    if not stages:
+        return {"schema_version": "1.0.0", "operations": []}
+    axis = rotational.axes[0]
+    context = {
+        "axis_origin": axis.origin.model_dump(mode="json"),
+        "axis_direction": axis.direction.model_dump(mode="json"),
+        "stock_radius": float(job.plan.stock["diameter_mm"]) / 2,
+        "region_min": min(float(region[0]), float(region[1])),
+        "region_max": max(float(region[0]), float(region[1])),
+        "pockets": pockets,
+    }
+    stages_json = json.dumps({"stages": stages, "context": context}, separators=(",", ":"))
+    signature = hashlib.sha256(
+        f"material-binary-v7:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
+    ).hexdigest()
+    manifest_path = directory / "l32-material-snapshots.json"
+    stages_path = directory / "l32-material-stages.json"
+    with L32_MATERIAL_SNAPSHOT_LOCK:
+        if manifest_path.is_file():
+            try:
+                cached = json.loads(manifest_path.read_text(encoding="utf-8"))
+                cached_files = [
+                    name for item in cached.get("operations", []) for name in item.get("files", [])
+                ]
+                if (
+                    cached.get("signature") == signature
+                    and len(cached.get("operations", [])) == len(stages)
+                    and all((directory / name).is_file() and (directory / name).stat().st_size > 84 for name in cached_files)
+                ):
+                    return cached
+            except (OSError, ValueError, TypeError):
+                pass
+        try:
+            write_json(stages_path, {"stages": stages, "context": context})
+            with tempfile.TemporaryDirectory(prefix="l32-material-build-", dir=directory) as temporary:
+                completed = run_freecad_adapter(
+                    FREECAD_CMD,
+                    APP_ROOT / "cam" / "l32_material_snapshots.py",
+                    [source, temporary, stages_path],
+                    timeout_seconds=300,
+                )
+                line = next(
+                    item.split("CNC_L32_MATERIAL ", 1)[1]
+                    for item in completed.stdout.splitlines()
+                    if "CNC_L32_MATERIAL " in item
+                )
+                result = json.loads(line)
+                expected_ids = [stage["operation_id"] for stage in stages]
+                if [item["operation_id"] for item in result["operations"]] != expected_ids:
+                    raise ValueError("Snapshot operations do not match the process plan")
+                names = [name for item in result["operations"] for name in item["files"]]
+                invalid_names = [
+                    name for name in names if Path(name).name != name
+                    or not name.startswith("l32-material-") or not name.endswith(".stl")
+                    or not (Path(temporary) / name).is_file()
+                    or (Path(temporary) / name).stat().st_size <= 84
+                ]
+                if not names or invalid_names:
+                    raise ValueError(f"Material snapshots missing or invalid: {invalid_names[:5]}")
+                for name in names:
+                    (Path(temporary) / name).replace(directory / name)
+        except subprocess.TimeoutExpired as error:
+            raise HTTPException(status_code=504, detail="L32 material snapshots timed out") from error
+        except (OSError, subprocess.CalledProcessError, StopIteration, ValueError, KeyError) as error:
+            raise HTTPException(status_code=502, detail=f"L32 material snapshots failed: {error}") from error
+        payload = {"schema_version": "1.0.0", "signature": signature, **result}
+        write_json(manifest_path, payload)
+        return payload
+
+
+@app.get("/api/v1/jobs/{job_id}/l32/front-groove-geometry")
+def get_l32_front_groove_geometry(job_id: str) -> dict[str, object]:
+    """Expose the exact-profile groove and the currently incompatible tool width."""
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.plan is None:
+        raise HTTPException(status_code=409, detail="L32 process plan is required")
+    source = job_directory(job_id) / "rotational-features.json"
+    if not source.is_file():
+        raise HTTPException(status_code=404, detail="Exact rotational feature analysis is unavailable")
+    analysis = RotationalFeatureAnalysis.model_validate_json(source.read_text(encoding="utf-8"))
+    operations = [op for setup in job.plan.setups for op in setup.operations]
+    groove_operations = [op for op in operations if op.type == "turn_grooving" and op.workpiece_side == "front"]
+    physical_tools = _load_tool_inventory(job.machine_instance_id) if job.machine_instance_id else []
+    drafts = []
+    for operation in groove_operations:
+        features = [
+            item for item in analysis.features
+            if item.id in operation.feature_ids and item.kind == "external_groove_candidate"
+        ]
+        for feature in features:
+            profile = next((item for item in analysis.profiles if item.id == feature.profile_id),None)
+            if profile is None:
+                continue
+            if job.plan.stock.get("rotational_profile_id") != profile.id:
+                raise HTTPException(status_code=409, detail="Groove profile differs from the bound process-plan profile")
+            try:
+                draft = build_front_groove_geometry_draft(
+                    profile,feature,
+                    stock_radius_mm=float(job.plan.stock["diameter_mm"])/2,
+                    actual_planned_tool_width_mm=float(operation.tool.cutting_width_mm or 0),
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
+            drafts.append({
+                "operation_id":operation.id,"operation_enabled":operation.enabled,
+                "draft":draft.model_dump(mode="json"),
+                "physical_width_candidates": [
+                    {
+                        "inventory_id":tool.inventory_id,
+                        "measured_cutting_width_mm":tool.measured_cutting_width_mm,
+                        "verification_state":tool.verification_state,
+                        "toolpath_approved":False,
+                    }
+                    for tool in physical_tools if physical_tool_fit_for_groove(tool,feature.width_mm)
+                ],
+            })
+    return {
+        "schema_version":"1.0.0","job_id":job_id,"reference_only":True,
+        "nc_generated":False,"material_sweep_verified":False,"grooves":drafts,
+    }
+
+
+@app.get("/api/v1/jobs/{job_id}/l32/front-groove-sweep-check")
+def check_l32_front_groove_sweep(job_id: str) -> dict[str, object]:
+    geometry = get_l32_front_groove_geometry(job_id)
+    if len(geometry["grooves"]) != 1:
+        raise HTTPException(status_code=422, detail="Exactly one exact front external groove is required")
+    job = load_job(job_id)
+    source = job_directory(job_id) / job.filename
+    if not source.is_file() or source.suffix.lower() not in {".stp",".step"}:
+        raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
+    analysis_path = job_directory(job_id) / "rotational-features.json"
+    analysis = RotationalFeatureAnalysis.model_validate_json(analysis_path.read_text(encoding="utf-8"))
+    draft = geometry["grooves"][0]["draft"]
+    profile = next(item for item in analysis.profiles if item.id == draft["profile_id"])
+    axis = next(item for item in analysis.axes if item.id == profile.axis_id)
+    if axis.review_state != "accepted":
+        raise HTTPException(status_code=409, detail="Groove rotation axis has not been accepted")
+    try:
+        completed = run_freecad_adapter(
+            FREECAD_CMD, APP_ROOT / "cam" / "l32_front_groove_sweep.py",
+            [source,json.dumps(draft,separators=(",",":")),json.dumps(axis.model_dump(mode="json"),separators=(",",":"))],
+            timeout_seconds=120,
+        )
+        line = next(
+            item.split("CNC_FRONT_GROOVE_SWEEP ",1)[1]
+            for item in completed.stdout.splitlines() if "CNC_FRONT_GROOVE_SWEEP " in item
+        )
+        result = json.loads(line)
+    except subprocess.TimeoutExpired as error:
+        raise HTTPException(status_code=504, detail="Front groove OCC sweep timed out") from error
+    except (OSError, subprocess.CalledProcessError, StopIteration, ValueError) as error:
+        raise HTTPException(status_code=502, detail=f"Front groove OCC sweep failed: {error}") from error
+    return {
+        "schema_version":"1.0.0","job_id":job_id,"reference_only":True,"nc_generated":False,
+        "actual_planned_tool_fits_floor":draft["actual_tool_fits_floor"],
+        "target_gouge_check_passed":bool(result["target_solid_valid"] and result["remaining_stock_valid"]
+            and result["summed_target_contact_mm3"] <= 0.000001
+            and result["missing_target_volume_mm3"] <= 0.000001),
+        "whole_part_material_verified":False,"check":result,
+    }
+
+
 @app.post("/api/v1/machines/l32/instances", response_model=MachineConfigurationSnapshot)
 def create_l32_machine_instance(instance: MachineInstance) -> MachineConfigurationSnapshot:
     snapshot = snapshot_l32_instance(instance)
@@ -400,6 +895,72 @@ def create_l32_machine_instance(instance: MachineInstance) -> MachineConfigurati
 @app.get("/api/v1/machines/l32/instances/{instance_id}", response_model=MachineConfigurationSnapshot)
 def get_l32_machine_instance(instance_id: str) -> MachineConfigurationSnapshot:
     return load_machine_snapshot(machine_instance_path(instance_id))
+
+
+def _tool_inventory_path(instance_id: str) -> Path:
+    # Reuse the machine-identity validation before forming a storage path.
+    machine_instance_path(instance_id)
+    return STORAGE_ROOT / ".tool-inventory" / f"{instance_id}.json"
+
+
+def _load_tool_inventory(instance_id: str) -> list[ToolInventoryRecord]:
+    load_machine_snapshot(machine_instance_path(instance_id))
+    path = _tool_inventory_path(instance_id)
+    if not path.is_file():
+        return []
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+        return [ToolInventoryRecord.model_validate(value) for value in values]
+    except (OSError, ValueError, TypeError) as error:
+        raise HTTPException(status_code=500, detail="Stored tool inventory is invalid") from error
+
+
+@app.get("/api/v1/machines/l32/instances/{instance_id}/tools")
+def list_l32_physical_tools(instance_id: str) -> dict[str, object]:
+    records = _load_tool_inventory(instance_id)
+    return {
+        "schema_version": "1.0.0",
+        "machine_instance_id": instance_id,
+        "tools": [record.model_dump(mode="json") for record in records],
+    }
+
+
+@app.post("/api/v1/machines/l32/instances/{instance_id}/tools", status_code=201)
+def create_l32_physical_tool(instance_id: str, request: ToolInventoryInput) -> ToolInventoryRecord:
+    with TOOL_INVENTORY_LOCK:
+        records = _load_tool_inventory(instance_id)
+        if any(record.inventory_id == request.inventory_id for record in records):
+            raise HTTPException(status_code=409, detail="Physical tool inventory ID already exists")
+        try:
+            catalog_tool = get_tool(request.catalog_tool_id) if request.catalog_tool_id else None
+            record = record_physical_tool(instance_id, request, catalog_tool)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        path = _tool_inventory_path(instance_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(path, [*map(lambda item: item.model_dump(mode="json"), records), record.model_dump(mode="json")])
+        return record
+
+
+@app.put("/api/v1/machines/l32/instances/{instance_id}/tools/{inventory_id}")
+def update_l32_physical_tool(
+    instance_id: str, inventory_id: str, request: ToolInventoryInput,
+) -> ToolInventoryRecord:
+    if inventory_id != request.inventory_id:
+        raise HTTPException(status_code=422, detail="Physical tool inventory ID cannot change")
+    with TOOL_INVENTORY_LOCK:
+        records = _load_tool_inventory(instance_id)
+        index = next((index for index,item in enumerate(records) if item.inventory_id == inventory_id),None)
+        if index is None:
+            raise HTTPException(status_code=404, detail="Physical tool not found")
+        try:
+            catalog_tool = get_tool(request.catalog_tool_id) if request.catalog_tool_id else None
+            record = record_physical_tool(instance_id,request,catalog_tool,records[index])
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        records[index] = record
+        write_json(_tool_inventory_path(instance_id),[item.model_dump(mode="json") for item in records])
+        return record
 
 
 @app.put("/api/v1/jobs/{job_id}/machine-instance", response_model=JobResponse)
@@ -421,18 +982,48 @@ def bind_job_machine_instance(job_id: str, request: MachineBindingRequest) -> Jo
             raise HTTPException(status_code=422, detail=f"Machine instance lacks required option: {required_option}")
         job.plan.stock["machine_instance_id"] = snapshot.instance.id
         job.plan.stock["machine_configuration_hash"] = snapshot.configuration_hash
-        back_turning_enabled = "back_turning" in snapshot.validation.capabilities
+        back_module_available = "back_turning" in snapshot.validation.capabilities
+        back_live_tool_available = "back_live_tool_milling" in snapshot.validation.capabilities
+        back_turning_enabled = (
+            back_module_available
+            and job.plan.stock.get("nonrotational_turning_limit_z_mm") is None
+        )
+        regional_backside = any(
+            item.id == "OP58-BACK"
+            for setup in job.plan.setups for item in setup.operations
+        )
         for setup in job.plan.setups:
             for operation in setup.operations:
                 if operation.workpiece_side == "back":
-                    operation.enabled = back_turning_enabled
+                    if operation.type in {"pocket_roughing", "pocket_finishing"}:
+                        operation.enabled = back_live_tool_available
+                    else:
+                        operation.enabled = back_turning_enabled and not (
+                            regional_backside and operation.id == "OP60"
+                        )
                     operation.generation_state = "dirty"
-        warning = "当前绑定设备实例未确认 back_turning 刀具模块，OP50/OP60 背面工序保持禁用。"
+        warning = (
+            "当前零件背面含非回转结构，原背轴车削工序会误切成品，已保持禁用。"
+            if back_module_available and not back_turning_enabled
+            else "当前绑定设备实例未确认 back_turning 刀具模块，背面工序保持禁用。"
+        )
+        legacy_warning = "当前绑定设备实例未确认 back_turning 刀具模块，OP50/OP60 背面工序保持禁用。"
+        job.plan.warnings = [item for item in job.plan.warnings if item != legacy_warning]
         if back_turning_enabled:
             job.plan.warnings = [item for item in job.plan.warnings if item != warning]
         else:
             if warning not in job.plan.warnings:
                 job.plan.warnings.append(warning)
+        redundant_cleanup_warning = "背面区域精车 OP58-BACK 已覆盖切断邻域；旧版 OP60 清根工序保持禁用以防重复过切。"
+        if regional_backside and any(
+            item.id == "OP60" for setup in job.plan.setups for item in setup.operations
+        ):
+            if redundant_cleanup_warning not in job.plan.warnings:
+                job.plan.warnings.append(redundant_cleanup_warning)
+        else:
+            job.plan.warnings = [
+                item for item in job.plan.warnings if item != redundant_cleanup_warning
+            ]
         job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan) if job.analysis else job.plan.coverage
         job.plan.manufacturing_route = build_manufacturing_route(job.analysis, job.plan) if job.analysis else job.plan.manufacturing_route
         job.plan.knowledge_assessment = assess_plan_knowledge(job.analysis, job.plan) if job.analysis else job.plan.knowledge_assessment
@@ -488,7 +1079,29 @@ def generate_turning_draft(job_id: str, request: TurningDraftRequest) -> Turning
         ):
             raise HTTPException(status_code=409, detail="Thread operation has not completed DRAFT-level engineering review")
     elif (
-        request.operation.type in {"turn_id_roughing", "turn_id_finishing"}
+        request.operation.source == "automatic"
+        and (
+            "profile_z_min_mm" in request.operation.parameters
+            or "profile_z_max_mm" in request.operation.parameters
+            or request.operation.parameters.get("cut_direction") == "positive_z"
+        )
+    ):
+        planned = next(
+            (
+                item for setup in (job.plan.setups if job.plan else []) for item in setup.operations
+                if item.id == request.operation.id and item.type == request.operation.type
+            ),
+            None,
+        )
+        if planned is None or planned.model_dump(mode="json") != request.operation.model_dump(mode="json"):
+            raise HTTPException(
+                status_code=409,
+                detail="Regional automatic draft must exactly match the stored operation",
+            )
+        if not planned.enabled:
+            raise HTTPException(status_code=409, detail="Regional automatic operation is disabled")
+    elif (
+        request.operation.type in {"turn_id_roughing", "turn_id_finishing", "turn_grooving"}
         or (request.operation.type == "axial_drilling" and request.operation.source == "automatic")
     ):
         planned = next(
@@ -499,12 +1112,12 @@ def generate_turning_draft(job_id: str, request: TurningDraftRequest) -> Turning
             None,
         )
         if planned is None or planned.model_dump(mode="json") != request.operation.model_dump(mode="json"):
-            raise HTTPException(status_code=409, detail="Inner-feature draft must exactly match the stored reviewed operation")
+            raise HTTPException(status_code=409, detail="Reviewed automatic draft must exactly match the stored operation")
         if (
             not planned.enabled
             or planned.parameters.get("engineering_review_status") != "verified_engineer"
         ):
-            raise HTTPException(status_code=409, detail="Inner-feature operation has not completed DRAFT-level engineering review")
+            raise HTTPException(status_code=409, detail="Automatic operation has not completed DRAFT-level engineering review")
 
     if not job.machine_instance_id or not job.machine_configuration_hash:
         raise HTTPException(status_code=409, detail="Bind a validated L32 machine instance before draft generation")
@@ -610,12 +1223,27 @@ def generate_turning_backside_draft(
     ), None)
     if planned_operation is None or not planned_operation.enabled:
         raise HTTPException(status_code=409, detail="Backside operation is not enabled by the bound machine configuration")
-    if (
-        request.operation.type != planned_operation.type
-        or request.operation.tool.id != planned_operation.tool.id
-        or request.operation.feature_ids != planned_operation.feature_ids
+    if planned_operation.id == "OP60" and any(
+        item.id == "OP58-BACK"
+        for setup in job.plan.setups for item in setup.operations
     ):
+        raise HTTPException(status_code=409, detail="Legacy OP60 cleanup overlaps the planned backside region")
+    if request.operation.model_dump(mode="json") != planned_operation.model_dump(mode="json"):
         raise HTTPException(status_code=422, detail="Submitted backside operation does not match the formal process plan")
+    planned_profile_id = str(job.plan.stock.get("rotational_profile_id", ""))
+    cutoff_operation = next((
+        item for setup in job.plan.setups for item in setup.operations
+        if item.id == "OP40" and item.type == "turn_cutoff"
+    ), None)
+    if request.source_profile_id != planned_profile_id:
+        raise HTTPException(status_code=422, detail="Backside source profile does not match the formal process plan")
+    expected_back_datum = (
+        float(cutoff_operation.parameters.get(
+            "finished_back_datum_z_mm", cutoff_operation.parameters.get("z_mm", float("nan")),
+        )) if cutoff_operation is not None else float("nan")
+    )
+    if cutoff_operation is None or abs(request.source_cutoff_z_mm - expected_back_datum) > 1e-6:
+        raise HTTPException(status_code=422, detail="Backside cutoff datum does not match the formal process plan")
 
     directory = job_directory(job_id)
     try:
@@ -635,6 +1263,107 @@ def generate_turning_backside_draft(
         raise HTTPException(status_code=422, detail=str(error)) from error
     write_json(directory / "turning-backside-ir.json", result.draft.toolpath.model_dump(mode="json"))
     write_json(directory / "turning-backside-draft.json", result.model_dump(mode="json"))
+    return result
+
+
+@app.post(
+    "/api/v1/jobs/{job_id}/turning/front-chain/draft",
+    response_model=FrontChainDraftResult,
+)
+def generate_turning_front_chain_draft(
+    job_id: str, request: FrontChainDraftRequest,
+) -> FrontChainDraftResult:
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or not job.plan:
+        raise HTTPException(status_code=409, detail="Front chain requires an L32 process plan")
+    if not job.machine_instance_id or not job.machine_configuration_hash:
+        raise HTTPException(status_code=409, detail="Bind a validated L32 machine before front chain simulation")
+    if request.machine_instance_id != job.machine_instance_id:
+        raise HTTPException(status_code=422, detail="Front chain does not use the machine instance bound to this job")
+    directory = job_directory(job_id)
+    try:
+        snapshot = load_machine_snapshot(directory / "machine-configuration.json")
+        if snapshot.configuration_hash != job.machine_configuration_hash:
+            raise ValueError("bound machine configuration hash mismatch")
+        rotational = RotationalFeatureAnalysis.model_validate_json(
+            (directory / "rotational-features.json").read_text(encoding="utf-8")
+        )
+        profile = next((
+            item for item in rotational.profiles if item.id == request.source_profile_id
+        ), None)
+        if profile is None:
+            raise ValueError("front chain source profile is not available")
+        result = compile_front_chain_draft(job_id, request, job.plan, profile, snapshot)
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    write_json(directory / "turning-front-chain-ir.json", result.toolpath.model_dump(mode="json"))
+    write_json(directory / "turning-front-chain-draft.json", result.model_dump(mode="json"))
+    return result
+
+
+@app.post(
+    "/api/v1/jobs/{job_id}/turning/backside-chain/draft",
+    response_model=BacksideChainDraftResult,
+)
+def generate_turning_backside_chain_draft(
+    job_id: str, request: BacksideChainDraftRequest,
+) -> BacksideChainDraftResult:
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or not job.plan:
+        raise HTTPException(status_code=409, detail="Backside chain requires an L32 process plan")
+    if not job.machine_instance_id or not job.machine_configuration_hash:
+        raise HTTPException(status_code=409, detail="Bind a validated L32 machine before backside chain simulation")
+    if request.machine_instance_id != job.machine_instance_id:
+        raise HTTPException(status_code=422, detail="Backside chain does not use the machine instance bound to this job")
+    directory = job_directory(job_id)
+    try:
+        snapshot = load_machine_snapshot(directory / "machine-configuration.json")
+        if snapshot.configuration_hash != job.machine_configuration_hash:
+            raise ValueError("bound machine configuration hash mismatch")
+        rotational = RotationalFeatureAnalysis.model_validate_json(
+            (directory / "rotational-features.json").read_text(encoding="utf-8")
+        )
+        profile = next((
+            item for item in rotational.profiles if item.id == request.source_profile_id
+        ), None)
+        if profile is None:
+            raise ValueError("backside chain source profile is not available")
+        result = compile_backside_chain_draft(job_id, request, job.plan, profile, snapshot)
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    write_json(directory / "turning-backside-chain-ir.json", result.toolpath.model_dump(mode="json"))
+    write_json(directory / "turning-backside-chain-draft.json", result.model_dump(mode="json"))
+    return result
+
+
+@app.post(
+    "/api/v1/jobs/{job_id}/turning/inner-bore-chain/draft",
+    response_model=InnerBoreChainResult,
+)
+def generate_inner_bore_chain_draft(
+    job_id: str, request: InnerBoreChainRequest,
+) -> InnerBoreChainResult:
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or not job.plan:
+        raise HTTPException(status_code=409, detail="Inner-bore chain requires an L32 process plan")
+    if not job.machine_instance_id or not job.machine_configuration_hash:
+        raise HTTPException(status_code=409, detail="Bind a validated L32 machine instance before chain simulation")
+    directory = job_directory(job_id)
+    try:
+        snapshot = load_machine_snapshot(directory / "machine-configuration.json")
+        if snapshot.configuration_hash != job.machine_configuration_hash:
+            raise ValueError("bound machine configuration hash mismatch")
+        rotational = RotationalFeatureAnalysis.model_validate_json(
+            (directory / "rotational-features.json").read_text(encoding="utf-8")
+        )
+        profile = next((item for item in rotational.profiles if item.id == request.profile_id), None)
+        if profile is None:
+            raise ValueError("selected inner profile is not available")
+        result = compile_inner_bore_chain(job_id, request, job.plan, profile, snapshot)
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    write_json(directory / "turning-inner-bore-chain-ir.json", result.toolpath.model_dump(mode="json"))
+    write_json(directory / "turning-inner-bore-chain-draft.json", result.model_dump(mode="json"))
     return result
 
 
@@ -665,9 +1394,49 @@ def generate_turning_whole_program_draft(
         ), None)
         if source_profile is None or source_profile.review_state != "accepted":
             raise ValueError("source rotational profile must be accepted before whole-part planning")
+        if job.analysis:
+            job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan)
+        uncovered_targets = [
+            item for item in (job.plan.coverage.targets if job.plan.coverage else [])
+            if item.state != "covered"
+        ]
+        if uncovered_targets:
+            labels = ", ".join(item.label for item in uncovered_targets)
+            raise ValueError(
+                "whole-part L32 program is blocked because manufacturing targets are not covered: "
+                + labels
+            )
+        source_axis = next((
+            item for item in rotational.axes if item.id == source_profile.axis_id
+        ), None)
+        if source_axis is None or source_axis.review_state != "accepted":
+            raise ValueError("source rotational axis must be accepted before whole-part planning")
+        transverse_aspect_ratio = float(rotational.evidence.get("transverse_aspect_ratio", 1))
+        if transverse_aspect_ratio < 0.9:
+            raise ValueError(
+                "whole-part L32 turning is blocked because the source solid is not fully rotational "
+                f"(transverse aspect ratio {transverse_aspect_ratio:.3f})"
+            )
         result = compile_whole_part_draft(
             job_id, request, job.plan, source_profile, snapshot,
         )
+        compiled_operations = {stage.operation_id for stage in result.stages}
+        independently_compiled_types = {
+            "pocket_roughing", "pocket_finishing",
+            "live_tool_contour_roughing", "live_tool_contour_finishing",
+        }
+        omitted_operations = [
+            operation.id
+            for setup in job.plan.setups for operation in setup.operations
+            if operation.enabled
+            and operation.type not in independently_compiled_types
+            and operation.id not in compiled_operations
+        ]
+        if omitted_operations:
+            raise ValueError(
+                "whole-part L32 program omits enabled operations: "
+                + ", ".join(omitted_operations)
+            )
     except (OSError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     write_json(directory / "turning-whole-program-ir.json", result.toolpath.model_dump(mode="json"))
@@ -731,6 +1500,53 @@ def _ai_review_block_reason(directory: Path) -> str | None:
         return None
     summary = review.get("summary")
     return str(summary)[:500] if summary else "Qwen 工艺审查识别到未解决的制造风险"
+
+
+def provision_default_l32_planning_instance(job: JobResponse, directory: Path) -> None:
+    """Attach a deterministic L32 configuration so a new L32 job can compile CAM immediately."""
+    if job.device_id != "citizen-cincom-l32" or job.machine_instance_id or not job.plan:
+        return
+    stock_diameter = float(job.plan.stock.get("diameter_mm", 0) or 0)
+    if stock_diameter > 38 + 1e-9:
+        job.plan.warnings.append("棒料直径超过 L32 Ø38 上限，无法建立任务设备配置。")
+        return
+    uses_38mm_option = stock_diameter > 32 + 1e-9
+    instance = MachineInstance(
+        id=f"l32-{job.id[:8]}",
+        definition_id="citizen-cincom-l32",
+        name=f"L32 VIII · {job.id[:8]}",
+        controller_revision="M70LPC-VU",
+        operation_mode="guide_bushing",
+        variant="VIII",
+        installed_modules=["U30B", "U151B"],
+        enabled_options=["bar_diameter_38mm"] if uses_38mm_option else [],
+        bar_diameter_mm=38 if uses_38mm_option else 32,
+    )
+    snapshot = snapshot_l32_instance(instance)
+    if not snapshot.validation.valid:
+        raise ValueError("default L32 planning instance is invalid")
+    job.machine_instance_id = instance.id
+    job.machine_configuration_hash = snapshot.configuration_hash
+    job.plan.stock["machine_instance_id"] = instance.id
+    job.plan.stock["machine_configuration_hash"] = snapshot.configuration_hash
+    instance_path = machine_instance_path(instance.id)
+    instance_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(instance_path, snapshot.model_dump(mode="json"))
+    write_json(directory / "machine-configuration.json", snapshot.model_dump(mode="json"))
+
+
+@app.post("/api/v1/jobs/{job_id}/machine-instance/default", response_model=JobResponse)
+def bind_default_l32_planning_instance(job_id: str) -> JobResponse:
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or not job.plan:
+        raise HTTPException(status_code=409, detail="Default L32 configuration requires a completed L32 process plan")
+    directory = job_directory(job_id)
+    provision_default_l32_planning_instance(job, directory)
+    if not job.machine_instance_id:
+        raise HTTPException(status_code=422, detail="The job cannot use the default L32 configuration")
+    write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+    save_job(directory, job)
+    return job
 
 
 @app.get("/api/v1/jobs/{job_id}/ai/plan")
@@ -914,10 +1730,11 @@ def _process_new_job(
             coverage_score=plan.coverage.score if plan.coverage else None,
         )
 
-        write_json(directory / "plan.json", plan.model_dump(mode="json"))
         job.status = "completed"
         job.analysis = analysis
         job.plan = plan
+        provision_default_l32_planning_instance(job, directory)
+        write_json(directory / "plan.json", plan.model_dump(mode="json"))
         persist_rotational_analysis(directory, job, analysis)
         job.model_url = f"/api/v1/jobs/{job_id}/files/model.stl"
         save_job(directory, job)
@@ -1110,8 +1927,16 @@ def stream_job_progress(job_id: str) -> StreamingResponse:
 
 
 @app.get("/api/v1/jobs/{job_id}", response_model=JobResponse)
-def get_job(job_id: str) -> JobResponse:
-    return load_job(job_id)
+def get_job(job_id: str, response: Response) -> JobResponse:
+    # A process plan may be rebuilt while its job URL remains unchanged. Do
+    # not let a browser reuse an older operation list for the same job.
+    response.headers["Cache-Control"] = "no-store"
+    job = load_job(job_id)
+    if job.device_id == "citizen-cincom-l32" and job.analysis and job.plan:
+        # Stored plans predate newer geometry targets; refresh the read-only
+        # coverage response without rewriting the user's operations or binding.
+        job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan)
+    return job
 
 
 @app.get("/api/v1/jobs", response_model=list[JobHistoryItem])
@@ -1220,6 +2045,11 @@ def review_job_rotational_profile(
         raise HTTPException(status_code=409, detail="Geometry analysis is required")
     job.analysis.rotational_profile_reviews[profile_id] = request.review_state
     profile.review_state = request.review_state
+    if request.review_state == "accepted":
+        axis = next((item for item in analysis.axes if item.id == profile.axis_id), None)
+        if axis is not None:
+            axis.review_state = "accepted"
+            axis.review_reasons = []
     if not job.plan:
         write_json(directory / "analysis.json", job.analysis.model_dump(mode="json"))
         write_json(path, analysis.model_dump(mode="json"))
@@ -1248,7 +2078,11 @@ def review_job_rotational_profile(
                 continue
             if previous.parameters.get("engineering_review_status") == "verified_engineer":
                 setup.operations[index] = previous
-            elif previous.workpiece_side == "back" and previous.enabled:
+            elif (
+                previous.workpiece_side == "back"
+                and previous.enabled
+                and job.plan.stock.get("nonrotational_turning_limit_z_mm") is None
+            ):
                 operation.enabled = True
     write_json(directory / "analysis.json", job.analysis.model_dump(mode="json"))
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
@@ -1286,6 +2120,160 @@ def import_job_manufacturing_requirements(
     directory = job_directory(job_id)
     invalidate_cam_artifacts(directory)
     write_json(directory / "manufacturing-requirements.json", requirements.model_dump(mode="json"))
+    write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+    persist_rotational_analysis(directory, job, job.analysis)
+    save_job(directory, job)
+    return job
+
+
+@app.post(
+    "/api/v1/jobs/{job_id}/turning/groove-bindings/confirm",
+    response_model=JobResponse,
+)
+def confirm_job_groove_binding(
+    job_id: str, request: GrooveBindingConfirmRequest,
+) -> JobResponse:
+    """Bind reviewed drawing dimensions to one unique STEP groove candidate."""
+
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="Groove binding confirmation requires an L32 job")
+    if not job.analysis or not job.plan:
+        raise HTTPException(status_code=409, detail="Geometry analysis and process plan are required")
+
+    rotational = infer_rotational_features(job.analysis)
+    feature = next(
+        (
+            item for item in rotational.features
+            if item.id == request.groove_feature_id
+            and item.kind in {"external_groove_candidate", "internal_groove_candidate"}
+        ),
+        None,
+    )
+    if feature is None:
+        raise HTTPException(status_code=404, detail="STEP groove candidate not found")
+    side = "internal" if feature.kind == "internal_groove_candidate" else "external"
+    if request.requirement_kind == "external_groove" and side != "external":
+        raise HTTPException(status_code=422, detail="External drawing groove cannot bind an internal STEP candidate")
+    if request.requirement_kind == "internal_groove" and side != "internal":
+        raise HTTPException(status_code=422, detail="Internal drawing groove cannot bind an external STEP candidate")
+    profile = next((item for item in rotational.profiles if item.id == feature.profile_id), None)
+    if profile is None or profile.extraction_method != "exact_section" or profile.review_state != "accepted":
+        raise HTTPException(status_code=409, detail="Groove binding requires an accepted exact rotational profile")
+
+    drawing_requirement = DrawingGrooveRequirement(
+        id=request.requirement_id,
+        kind=request.requirement_kind,
+        side=side,
+        width_mm=request.confirmed_groove_width_mm,
+        depth_mm=request.confirmed_groove_depth_mm,
+        bottom_diameter_mm=request.confirmed_bottom_diameter_mm,
+        verification_status="verified_dimensions",
+        raw_text=request.raw_text,
+        source={"method": "engineer_structured_drawing_confirmation"},
+    )
+    binding = bind_groove_requirement(
+        drawing_requirement, groove_candidate_evidence(rotational.features),
+    )
+    if binding.status != "matched":
+        raise HTTPException(status_code=422, detail=binding.reason)
+    if binding.matched_candidate_id != feature.id:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Reviewed dimensions uniquely match {binding.matched_candidate_id}, not the selected candidate",
+        )
+
+    requirements = (
+        job.plan.manufacturing_requirements.model_copy(deep=True)
+        if job.plan.manufacturing_requirements is not None
+        else ManufacturingRequirements(
+            source_system="engineer-review",
+            status="incomplete",
+        )
+    )
+    existing = next(
+        (item for item in requirements.requirements if item.id == request.requirement_id), None,
+    )
+    if existing is not None and existing.type not in {
+        "external_groove", "internal_groove", "seal_groove",
+    }:
+        raise HTTPException(status_code=409, detail="Requirement id is already used by another requirement type")
+    requirement = ManufacturingRequirement(
+        id=request.requirement_id,
+        type=request.requirement_kind,
+        subtype=side,
+        nominal=request.confirmed_bottom_diameter_mm,
+        unit="mm",
+        cad_feature_ids=[feature.id],
+        mapping_status="matched",
+        verification_status="verified_engineer",
+        confidence=min(feature.confidence, 0.95),
+        raw_text=request.raw_text,
+        source={
+            "binding_method": "cnc_groove_dimensions_engineer_confirmation",
+            "confirmed_groove_feature_id": feature.id,
+            "confirmed_groove_width_mm": request.confirmed_groove_width_mm,
+            "confirmed_groove_depth_mm": request.confirmed_groove_depth_mm,
+            "confirmed_bottom_diameter_mm": request.confirmed_bottom_diameter_mm,
+            "confirmed_side": side,
+            "reviewer": request.reviewer,
+            "confirmed_at": utc_now(),
+        },
+    )
+    if existing is None:
+        requirements.requirements.append(requirement)
+    else:
+        requirements.requirements[requirements.requirements.index(existing)] = requirement
+    requirements.unresolved_requirement_ids = [
+        item.id for item in requirements.requirements
+        if item.mapping_status in {"ambiguous", "unmapped", "not_applicable"}
+        or not item.verification_status.startswith("verified")
+    ]
+    requirements.summary = {
+        "total": len(requirements.requirements),
+        "matched": sum(item.mapping_status == "matched" for item in requirements.requirements),
+        "ambiguous": sum(item.mapping_status == "ambiguous" for item in requirements.requirements),
+        "unmapped": sum(item.mapping_status == "unmapped" for item in requirements.requirements),
+        "recognized_only": sum(item.mapping_status == "not_applicable" for item in requirements.requirements),
+    }
+    requirements.status = (
+        "complete" if requirements.requirements and not requirements.unresolved_requirement_ids
+        else "review" if requirements.summary["matched"] else "incomplete"
+    )
+
+    previous_plan = job.plan
+    previous_operations = {
+        item.id: item.model_copy(deep=True)
+        for setup in previous_plan.setups for item in setup.operations
+    }
+    job.plan = build_process_plan(
+        job.analysis,
+        material=job.material,
+        machine=job.machine,
+        safety=previous_plan.safety,
+        requirements=requirements,
+    )
+    for key in ("machine_instance_id", "machine_configuration_hash"):
+        if key in previous_plan.stock:
+            job.plan.stock[key] = previous_plan.stock[key]
+    for setup in job.plan.setups:
+        for index, operation in enumerate(setup.operations):
+            previous = previous_operations.get(operation.id)
+            if (
+                previous is not None
+                and previous.type == operation.type
+                and previous.parameters.get("engineering_review_status") == "verified_engineer"
+            ):
+                setup.operations[index] = previous
+
+    directory = job_directory(job_id)
+    invalidate_cam_artifacts(directory)
+    write_json(directory / "manufacturing-requirements.json", requirements.model_dump(mode="json"))
+    write_json(directory / "groove-binding.json", {
+        "schema_version": "1.0.0",
+        "requirement": requirement.model_dump(mode="json"),
+        "binding": binding.model_dump(mode="json"),
+    })
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
     persist_rotational_analysis(directory, job, job.analysis)
     save_job(directory, job)
@@ -1510,6 +2498,180 @@ def review_job_thread_operation(
 
 
 @app.post(
+    "/api/v1/jobs/{job_id}/turning/grooving-operations/{operation_id}/review",
+    response_model=JobResponse,
+)
+def review_job_grooving_operation(
+    job_id: str, operation_id: str, request: GroovingOperationReviewRequest,
+) -> JobResponse:
+    """Approve an automatically detected external or internal groove for DRAFT simulation."""
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="Grooving review requires an L32 job")
+    if not job.analysis or not job.plan:
+        raise HTTPException(status_code=409, detail="Geometry analysis and process plan are required")
+    operation = next(
+        (
+            item for setup in job.plan.setups for item in setup.operations
+            if item.id == operation_id
+        ),
+        None,
+    )
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Grooving operation not found")
+    if operation.type != "turn_grooving" or operation.source != "automatic":
+        raise HTTPException(status_code=422, detail="Only an automatically planned groove can use this review")
+    rotational = persist_rotational_analysis(job_directory(job_id), job, job.analysis)
+    if rotational is None:
+        raise HTTPException(status_code=409, detail="Rotational analysis is not available")
+    groove_side = str(operation.parameters.get("groove_side", "external"))
+    expected_feature_kind = (
+        "internal_groove_candidate" if groove_side == "internal" else "external_groove_candidate"
+    )
+    expected_profile_side = "inner" if groove_side == "internal" else "outer"
+    feature = next(
+        (
+            item for item in rotational.features
+            if item.id in operation.feature_ids and item.kind == expected_feature_kind
+        ),
+        None,
+    )
+    profile = next(
+        (
+            item for item in rotational.profiles
+            if item.id in operation.feature_ids and item.side == expected_profile_side
+        ),
+        None,
+    )
+    if feature is None or profile is None:
+        raise HTTPException(status_code=409, detail="Groove feature traceability is incomplete")
+    if profile.extraction_method != "exact_section" or profile.review_state != "accepted":
+        raise HTTPException(status_code=409, detail="Grooving review requires an accepted exact profile")
+    if not request.profile_form_confirmed:
+        raise HTTPException(status_code=422, detail="Groove profile form must be confirmed from the drawing/CAD")
+    if groove_side == "internal":
+        finish = next(
+            (
+                item for setup in job.plan.setups for item in setup.operations
+                if item.type == "turn_id_finishing" and profile.id in item.feature_ids
+            ),
+            None,
+        )
+        if (
+            finish is None
+            or not finish.enabled
+            or finish.parameters.get("engineering_review_status") != "verified_engineer"
+        ):
+            raise HTTPException(status_code=409, detail="Review and enable the base-bore finishing operation before internal grooving")
+    requirement_id = str(operation.parameters.get("drawing_requirement_id") or "")
+    verified_groove_requirements = [
+        item for item in (job.plan.manufacturing_requirements.requirements if job.plan.manufacturing_requirements else [])
+        if item.id == requirement_id
+        and item.mapping_status == "matched"
+        and item.verification_status == "verified_engineer"
+        and item.cad_feature_ids == [feature.id]
+    ]
+    if (
+        operation.parameters.get("drawing_binding_status") != "matched"
+        or len(verified_groove_requirements) != 1
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Confirm a unique engineer-verified drawing-to-STEP groove binding before operation review",
+        )
+    expected_width = float(feature.width_mm)
+    expected_diameter = (
+        max(feature.radius_start, feature.radius_end) * 2
+        if groove_side == "internal"
+        else min(feature.radius_start, feature.radius_end) * 2
+    )
+    if abs(request.confirmed_groove_width_mm - expected_width) > 0.05:
+        raise HTTPException(status_code=422, detail="Confirmed groove width does not match the exact profile")
+    if abs(request.confirmed_final_diameter_mm - expected_diameter) > 0.1:
+        raise HTTPException(status_code=422, detail="Confirmed groove bottom diameter does not match the exact profile")
+    if request.peck_depth_mm > feature.depth_mm + 1e-9:
+        raise HTTPException(status_code=422, detail="Grooving peck depth cannot exceed the groove radial depth")
+    try:
+        tool = get_tool(request.groove_tool_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    expected_tool_kind = "internal_grooving" if groove_side == "internal" else "grooving"
+    if tool.kind != expected_tool_kind or tool.cutting_width_mm is None:
+        raise HTTPException(status_code=422, detail=f"Reviewed tool must be a {expected_tool_kind} tool with a cutting width")
+    if tool.cutting_width_mm > request.confirmed_groove_width_mm + 1e-9:
+        raise HTTPException(status_code=422, detail="Grooving tool is wider than the confirmed groove")
+
+    reviewed_operation = operation.model_copy(deep=True)
+    reviewed_operation.tool = tool
+    if groove_side == "internal":
+        if request.confirmed_stickout_mm is None:
+            raise HTTPException(status_code=422, detail="Internal grooving requires confirmed tool stickout")
+        reviewed_operation.tool.stickout_mm = request.confirmed_stickout_mm
+    reviewed_operation.parameters.update({
+        "groove_width_mm": request.confirmed_groove_width_mm,
+        "final_diameter_mm": request.confirmed_final_diameter_mm,
+        "peck_depth_mm": request.peck_depth_mm,
+    })
+    stock_radius = float(job.plan.stock.get("diameter_mm", 0) or 0) / 2
+    initial_bore_radius = min(point.radius for point in profile.points) if groove_side == "internal" else 0
+    reachability = assess_turning_reachability(
+        reviewed_operation, profile,
+        TurningContext(
+            machine_snapshot_hash=job.machine_configuration_hash or "0" * 64,
+            stock_radius_mm=stock_radius,
+            initial_bore_radius_mm=initial_bore_radius,
+        ),
+        assembly_clearance_mm=request.assembly_clearance_mm,
+    )
+    if reachability.status == "failed":
+        raise HTTPException(
+            status_code=422,
+            detail="Grooving reachability failed: " + "; ".join(reachability.blocking_reasons),
+        )
+    operation.tool = reviewed_operation.tool
+    operation.parameters.update({
+        **reviewed_operation.parameters,
+        "groove_tool_inventory_id": request.groove_tool_inventory_id,
+        "confirmed_stickout_mm": request.confirmed_stickout_mm or tool.stickout_mm,
+        "assembly_clearance_mm": request.assembly_clearance_mm,
+        "profile_form_confirmed": True,
+        "engineering_review_status": "verified_engineer",
+        "engineering_reviewer": request.reviewer,
+        "engineering_reviewed_at": utc_now(),
+    })
+    operation.enabled = True
+    operation.status = "warning"
+    operation.generation_state = "dirty"
+    review_reason = "槽宽、槽底直径、槽形、分层切入和切槽刀实物已完成 DRAFT 级工程审核"
+    if review_reason not in operation.rationale:
+        operation.rationale.append(review_reason)
+    job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan)
+    job.plan.manufacturing_route = build_manufacturing_route(job.analysis, job.plan)
+    job.plan.knowledge_assessment = assess_plan_knowledge(job.analysis, job.plan)
+    directory = job_directory(job_id)
+    invalidate_cam_artifacts(directory)
+    write_json(directory / "grooving-review.json", {
+        "schema_version": "1.0.0",
+        "operation_id": operation.id,
+        "feature_id": feature.id,
+        "profile_id": profile.id,
+        "tool_id": tool.id,
+        "tool_inventory_id": request.groove_tool_inventory_id,
+        "groove_width_mm": request.confirmed_groove_width_mm,
+        "final_diameter_mm": request.confirmed_final_diameter_mm,
+        "peck_depth_mm": request.peck_depth_mm,
+        "groove_side": groove_side,
+        "confirmed_stickout_mm": request.confirmed_stickout_mm,
+        "assembly_clearance_mm": request.assembly_clearance_mm,
+        "reviewer": request.reviewer,
+        "reachability": reachability.model_dump(mode="json"),
+    })
+    write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+    save_job(directory, job)
+    return job
+
+
+@app.post(
     "/api/v1/jobs/{job_id}/turning/axial-drilling-operations/{operation_id}/review",
     response_model=JobResponse,
 )
@@ -1544,6 +2706,20 @@ def review_job_axial_drilling_operation(
     )
     if profile is None or profile.extraction_method != "exact_section" or profile.review_state != "accepted":
         raise HTTPException(status_code=409, detail="Pre-bore review requires an accepted exact inner profile")
+    stage_index = int(operation.parameters.get("drilling_stage_index", 1))
+    if stage_index > 1:
+        preceding = [
+            item for setup in job.plan.setups for item in setup.operations
+            if item.type == "axial_drilling"
+            and profile.id in item.feature_ids
+            and int(item.parameters.get("drilling_stage_index", 1)) < stage_index
+        ]
+        if any(
+            not item.enabled
+            or item.parameters.get("engineering_review_status") != "verified_engineer"
+            for item in preceding
+        ):
+            raise HTTPException(status_code=409, detail="Review deeper pre-bore stages before this enlarged stage")
     try:
         drill = get_tool(request.drill_tool_id)
     except ValueError as error:
@@ -1560,6 +2736,20 @@ def review_job_axial_drilling_operation(
         raise HTTPException(status_code=422, detail="Peck depth cannot exceed the confirmed drill diameter")
 
     profile_depth = float(operation.parameters.get("profile_depth_mm", 0))
+    length_to_diameter_ratio = profile_depth / drill.diameter_mm
+    deep_hole_required = length_to_diameter_ratio > 5.0
+    if deep_hole_required and request.chip_evacuation_strategy != "deep_hole_peck":
+        raise HTTPException(status_code=422, detail="Hole depth exceeds 5×D and requires the deep-hole peck strategy")
+    if (
+        request.chip_evacuation_strategy == "deep_hole_peck"
+        and not request.through_tool_coolant_confirmed
+    ):
+        raise HTTPException(status_code=422, detail="Deep-hole peck drilling requires confirmed through-tool coolant")
+    if (
+        request.chip_evacuation_strategy == "deep_hole_peck"
+        and request.peck_depth_mm > drill.diameter_mm * 0.5 + 1e-9
+    ):
+        raise HTTPException(status_code=422, detail="Deep-hole peck depth cannot exceed 0.5×D")
     tip_length = drill.diameter_mm / 2 / tan(radians(request.drill_point_angle_deg / 2))
     if (
         request.bottom_condition == "blind_tip_allowance_confirmed"
@@ -1582,6 +2772,9 @@ def review_job_axial_drilling_operation(
         "peck_depth_mm": request.peck_depth_mm,
         "bottom_condition": request.bottom_condition,
         "tip_overtravel_allowance_mm": request.tip_overtravel_allowance_mm,
+        "length_to_diameter_ratio": round(length_to_diameter_ratio, 3),
+        "chip_evacuation_strategy": request.chip_evacuation_strategy,
+        "through_tool_coolant_confirmed": request.through_tool_coolant_confirmed,
         "confirmed_stickout_mm": request.confirmed_stickout_mm,
         "drill_inventory_id": request.drill_inventory_id,
         "engineering_review_status": "verified_engineer",
@@ -1591,7 +2784,7 @@ def review_job_axial_drilling_operation(
     operation.enabled = True
     operation.status = "warning"
     operation.generation_state = "dirty"
-    reason = "钻头实物、有效刃长、伸出、啄钻深度和钻尖越程已通过 DRAFT 级审核"
+    reason = "钻头实物、有效刃长、伸出、啄钻深度、排屑/内冷和钻尖越程已通过 DRAFT 级审核"
     if reason not in operation.rationale:
         operation.rationale.append(reason)
     job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan)
@@ -1602,8 +2795,15 @@ def review_job_axial_drilling_operation(
     write_json(directory / "axial-drilling-review.json", {
         "schema_version": "1.0.0", "operation_id": operation.id,
         "profile_id": profile.id, "drill_tool_id": drill.id,
+        "drilling_stage_index": stage_index,
+        "planned_drilling_stage_count": int(operation.parameters.get("planned_drilling_stage_count", 1)),
+        "target_bore_diameter_mm": float(operation.parameters.get("target_bore_diameter_mm", 0)),
         "drill_diameter_mm": drill.diameter_mm, "profile_depth_mm": profile_depth,
         "programmed_depth_mm": programmed_depth, "tip_length_mm": tip_length,
+        "length_to_diameter_ratio": length_to_diameter_ratio,
+        "deep_hole_required": deep_hole_required,
+        "chip_evacuation_strategy": request.chip_evacuation_strategy,
+        "through_tool_coolant_confirmed": request.through_tool_coolant_confirmed,
         "reviewer": request.reviewer,
     })
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
@@ -1649,21 +2849,23 @@ def review_job_boring_operation(
     if profile is None or profile.extraction_method != "exact_section" or profile.review_state != "accepted":
         raise HTTPException(status_code=409, detail="Boring review requires an accepted exact inner profile")
 
-    prebore = next(
+    prebores = sorted(
         (
             item for setup in job.plan.setups for item in setup.operations
             if item.type == "axial_drilling"
             and item.source == "automatic"
             and profile.id in item.feature_ids
         ),
-        None,
+        key=lambda item: int(item.parameters.get("drilling_stage_index", 1)),
     )
+    prebore = prebores[0] if prebores else None
     if prebore is not None:
-        if (
-            not prebore.enabled
-            or prebore.parameters.get("engineering_review_status") != "verified_engineer"
+        if any(
+            not item.enabled
+            or item.parameters.get("engineering_review_status") != "verified_engineer"
+            for item in prebores
         ):
-            raise HTTPException(status_code=409, detail="Review and enable the planned pre-bore before approving boring")
+            raise HTTPException(status_code=409, detail="Review and enable every planned pre-bore stage before approving boring")
         if abs(prebore.tool.diameter_mm - request.initial_bore_diameter_mm) > 1e-6:
             raise HTTPException(status_code=422, detail="Initial bore diameter must match the reviewed pre-bore drill")
         required_depth = float(operation.parameters.get("profile_depth_mm", 0))
@@ -1672,6 +2874,32 @@ def review_job_boring_operation(
             raise HTTPException(status_code=422, detail="Reviewed pre-bore does not cover the inner-profile depth")
 
     reviewed_operation = operation.model_copy(deep=True)
+    sharp_shoulder_count = int(operation.parameters.get("sharp_inner_shoulder_count", 0))
+    if request.finishing_tool_id is not None:
+        try:
+            selected_tool = get_tool(request.finishing_tool_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if operation.type != "turn_id_finishing" or selected_tool.kind != "turning_id":
+            raise HTTPException(
+                status_code=422,
+                detail="Finishing tool override requires an inner finishing operation and turning_id tool",
+            )
+        reviewed_operation.tool = selected_tool
+    if sharp_shoulder_count > 0 and operation.type == "turn_id_finishing":
+        maximum_nose_radius = float(operation.parameters.get("maximum_finish_nose_radius_mm", 0.05))
+        if request.shoulder_strategy != "small_nose_tool":
+            raise HTTPException(status_code=422, detail="Sharp inner shoulder requires the small_nose_tool strategy")
+        if request.finishing_tool_id is None:
+            raise HTTPException(status_code=422, detail="Sharp inner shoulder requires a reviewed finishing tool")
+        if (
+            reviewed_operation.tool.nose_radius_mm is None
+            or reviewed_operation.tool.nose_radius_mm > maximum_nose_radius + 1e-9
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Sharp inner shoulder requires nose radius <= {maximum_nose_radius:.3f} mm",
+            )
     reviewed_operation.tool.stickout_mm = request.confirmed_stickout_mm
     stock_radius = float(job.plan.stock.get("diameter_mm", 0) or 0) / 2
     if stock_radius <= 0 or request.initial_bore_diameter_mm / 2 >= stock_radius:
@@ -1697,6 +2925,8 @@ def review_job_boring_operation(
         "initial_bore_diameter_mm": request.initial_bore_diameter_mm,
         "confirmed_stickout_mm": request.confirmed_stickout_mm,
         "assembly_clearance_mm": request.assembly_clearance_mm,
+        "finishing_tool_id": request.finishing_tool_id or operation.tool.id,
+        "shoulder_strategy": request.shoulder_strategy,
         "boring_bar_inventory_id": request.boring_bar_inventory_id,
         "engineering_review_status": "verified_engineer",
         "engineering_reviewer": request.reviewer,
@@ -1816,11 +3046,13 @@ def get_job_file(job_id: str, filename: str) -> FileResponse:
         "turning-backside-ir.json", "turning-backside-draft.json",
         "turning-whole-program-ir.json", "turning-whole-program-draft.json",
         "turning-whole-program-timeline.json", "turning-continuous-simulation.json",
+        "turning-inner-bore-chain-ir.json", "turning-inner-bore-chain-draft.json",
     }
     generated_artifact = (
         Path(filename).name == filename
         and ((filename.startswith("program-") and filename.endswith(".nc"))
-             or (filename.startswith("camotics-") and filename.endswith(".stl")))
+             or (filename.startswith("camotics-") and filename.endswith(".stl"))
+             or (filename.startswith("l32-material-") and filename.endswith(".stl")))
     )
     if filename not in allowed and not generated_artifact:
         raise HTTPException(status_code=404, detail="File not found")
@@ -1964,6 +3196,19 @@ def _feature_type(job: JobResponse, feature_id: str) -> str | None:
     prismatic = next((item for item in job.analysis.prismatic_features if item.id == feature_id), None)
     if prismatic:
         return f"prismatic_{prismatic.kind}"
+    # L32 accepted rotational entities are stored outside GeometryAnalysis.
+    # Only IDs already referenced by the formal plan are eligible here; a
+    # client cannot invent an RP/TPF identifier to bypass geometry checks.
+    planned = [operation for setup in (job.plan.setups if job.plan else []) for operation in setup.operations]
+    if any(feature_id in operation.feature_ids for operation in planned):
+        if feature_id.startswith("RP-INNER-"):
+            return "inner_rotational_profile"
+        if feature_id.startswith("RP-OUTER-"):
+            return "outer_rotational_profile"
+        if feature_id.startswith("TPF-OUTER-"):
+            return "od_groove"
+        if feature_id.startswith("TPF-INNER-"):
+            return "id_groove"
     return None
 
 
@@ -2006,7 +3251,11 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
         definition = get_operation_definition(request.definition_id)
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
-    if not definition.manual_enabled:
+    l32_turning_draft = (
+        job.device_id == "citizen-cincom-l32"
+        and definition.engine.provider == "turning"
+    )
+    if not definition.manual_enabled and not l32_turning_draft:
         raise HTTPException(status_code=409, detail=f"{definition.name}尚未通过当前执行引擎验证")
     _validate_operation_geometry(job, definition, request.feature_ids)
     try:
@@ -2015,16 +3264,29 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
             raise ValueError(f"刀具类型 {tool.kind} 不适用于 {definition.name}")
         existing = [operation for item in job.plan.setups for operation in item.operations] if job.plan else []
         next_sequence = max((operation.sequence for operation in existing), default=0) + 10
+        insert_index = len(setup.operations)
+        neighbour = setup.operations[-1] if setup.operations else None
+        if request.insert_after_operation_id is not None:
+            after_index = next((index for index,item in enumerate(setup.operations) if item.id == request.insert_after_operation_id),None)
+            if after_index is None:
+                raise ValueError("插入位置不属于当前装夹")
+            insert_index = after_index+1
+            neighbour = setup.operations[after_index]
         operation = create_operation_instance(
             id=f"OP{next_sequence}", sequence=next_sequence, type=definition.id,
             name=request.name or definition.name, feature_ids=request.feature_ids, tool=tool,
             parameters=request.parameters, rationale=["制造工程师从工序库手动创建"],
             confidence=1.0, status="proposed", source="manual",
+            channel_id=neighbour.channel_id if l32_turning_draft and neighbour else None,
+            spindle_id=neighbour.spindle_id if l32_turning_draft and neighbour else None,
+            workpiece_side=neighbour.workpiece_side if l32_turning_draft and neighbour else None,
         )
         apply_cutting_parameters(operation, resolve_material(job.material), resolve_machine(job.machine))
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    setup.operations.append(operation)
+    setup.operations.insert(insert_index,operation)
+    for index,item in enumerate(setup.operations,1):
+        item.sequence = index*10
     return _save_manual_plan_change(job_id, job)
 
 
@@ -2036,11 +3298,11 @@ def update_manual_operation(job_id: str, setup_id: str, operation_id: str, reque
     if operation is None:
         raise HTTPException(status_code=404, detail="工序不存在")
     if (
-        operation.type in {"turn_threading", "turn_id_roughing", "turn_id_finishing", "axial_drilling"}
+        operation.type in {"turn_threading", "turn_id_roughing", "turn_id_finishing", "axial_drilling", "turn_grooving"}
         and operation.source == "automatic"
         and (request.parameters is not None or request.tool_id is not None or request.enabled is not None)
     ):
-        raise HTTPException(status_code=409, detail="自动规划的螺纹/内孔工序必须通过专用工程审核接口修改或启用")
+        raise HTTPException(status_code=409, detail="自动规划的螺纹/内孔/外槽工序必须通过专用工程审核接口修改或启用")
     try:
         definition = get_operation_definition(operation.definition_id or operation.type)
         if request.feature_ids is not None:

@@ -345,6 +345,17 @@ class ThreadBindingConfirmRequest(BaseModel):
     requirement_id: str = Field(min_length=1)
 
 
+class GrooveBindingConfirmRequest(BaseModel):
+    groove_feature_id: str = Field(min_length=1)
+    requirement_id: str = Field(min_length=1, max_length=100)
+    requirement_kind: Literal["external_groove", "internal_groove", "seal_groove"]
+    confirmed_groove_width_mm: float = Field(gt=0, le=50)
+    confirmed_groove_depth_mm: float | None = Field(default=None, gt=0, le=50)
+    confirmed_bottom_diameter_mm: float = Field(gt=0, le=100)
+    raw_text: str | None = Field(default=None, max_length=500)
+    reviewer: str = Field(min_length=1, max_length=100)
+
+
 class ThreadOperationReviewRequest(BaseModel):
     start_z_mm: float
     end_z_mm: float
@@ -357,10 +368,24 @@ class ThreadOperationReviewRequest(BaseModel):
     reviewer: str = Field(min_length=1, max_length=100)
 
 
+class GroovingOperationReviewRequest(BaseModel):
+    confirmed_groove_width_mm: float = Field(gt=0, le=50)
+    confirmed_final_diameter_mm: float = Field(gt=0, le=100)
+    peck_depth_mm: float = Field(gt=0, le=10)
+    groove_tool_id: str = Field(min_length=1, max_length=64)
+    groove_tool_inventory_id: str = Field(min_length=1, max_length=64)
+    confirmed_stickout_mm: float | None = Field(default=None, gt=0, le=200)
+    assembly_clearance_mm: float = Field(default=0.2, ge=0, le=5)
+    profile_form_confirmed: bool = False
+    reviewer: str = Field(min_length=1, max_length=100)
+
+
 class BoringOperationReviewRequest(BaseModel):
     initial_bore_diameter_mm: float = Field(gt=0)
     confirmed_stickout_mm: float = Field(gt=0, le=200)
     assembly_clearance_mm: float = Field(default=0.2, ge=0, le=5)
+    finishing_tool_id: str | None = Field(default=None, min_length=1, max_length=64)
+    shoulder_strategy: Literal["not_required", "small_nose_tool"] = "not_required"
     boring_bar_inventory_id: str = Field(min_length=1, max_length=64)
     reviewer: str = Field(min_length=1, max_length=100)
 
@@ -372,6 +397,8 @@ class AxialDrillingOperationReviewRequest(BaseModel):
     peck_depth_mm: float = Field(gt=0, le=50)
     bottom_condition: Literal["through", "blind_tip_allowance_confirmed"]
     tip_overtravel_allowance_mm: float = Field(default=0, ge=0, le=50)
+    chip_evacuation_strategy: Literal["standard_peck", "deep_hole_peck"] = "standard_peck"
+    through_tool_coolant_confirmed: bool = False
     drill_inventory_id: str = Field(min_length=1, max_length=64)
     reviewer: str = Field(min_length=1, max_length=100)
 
@@ -453,6 +480,7 @@ class OperationCreateRequest(BaseModel):
     tool_id: str | None = None
     name: str | None = None
     parameters: dict[str, OperationParameterValue] = Field(default_factory=dict)
+    insert_after_operation_id: str | None = None
 
 
 class OperationUpdateRequest(BaseModel):

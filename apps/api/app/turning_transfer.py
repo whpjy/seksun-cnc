@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field, model_validator
 from .l32_configuration import L32_DEFINITION
 from .machine_models import MachineConfigurationSnapshot
 from .toolpath_ir import ToolpathChannel, ToolpathCommand, ToolpathProgram, ToolpathTrace
+from .models import Operation
+from .rotational_features import RotationalProfile
 from .turning_draft import TurningDraftRequest, compile_turning_draft
 from .turning_reachability import TurningReachabilityResult
 from .turning_simulation import TurningSimulationResult
@@ -89,6 +91,20 @@ def _renumber(commands: list[ToolpathCommand], channel_id: str) -> list[Toolpath
         command.model_copy(update={"sequence": index, "channel_id": channel_id})
         for index, command in enumerate(commands, 1)
     ]
+
+
+def cutoff_kerf_intrusion_mm(operation: Operation, profile: RotationalProfile) -> float:
+    """Amount of a centered parting kerf entering the accepted part profile."""
+    width = float(operation.parameters.get(
+        "cutting_width_mm", operation.tool.cutting_width_mm or 0,
+    ))
+    if width <= 0:
+        raise ValueError("cutoff kerf width must be positive")
+    if "z_mm" not in operation.parameters:
+        raise ValueError("cutoff datum Z is missing")
+    cutoff_z = float(operation.parameters["z_mm"])
+    finished_minimum_z = min(point.z for point in profile.points)
+    return max(cutoff_z + width / 2 - finished_minimum_z, 0)
 
 
 def compile_synchronized_transfer_draft(
@@ -182,6 +198,10 @@ def compile_synchronized_transfer_draft(
         WorkpieceTransferState(sequence=4, state="part_separated", holding_spindles=["sub"], barrier_id="PART_SEPARATED"),
         WorkpieceTransferState(sequence=5, state="sub_spindle_held", holding_spindles=["sub"]),
     ]
+    kerf_intrusion = (
+        cutoff_kerf_intrusion_mm(request.operation, request.profile)
+        if request.profile is not None else 0
+    )
     return TurningTransferDraftResult(
         job_id=job_id,
         machine_instance_id=snapshot.instance.id,
@@ -194,6 +214,8 @@ def compile_synchronized_transfer_draft(
         reachability=base.reachability,
         warnings=[
             *base.warnings,
+            *([f"切断刀缝侵入已确认成品轮廓 {kerf_intrusion:.3f} mm；整件草案必须阻断，需增加牺牲余料并重新定义切断/背轴基准。"]
+              if kerf_intrusion > 0.05 else []),
             "双通道同步仅为控制器无关草案；同步代码、夹紧确认信号和等待号尚未映射到 MELDAS/CINCOM。",
             "接料位置、夹持长度、夹紧力与退出路径必须在命名机床上完成干运行和首件验证。",
         ],

@@ -6,7 +6,8 @@ from pydantic import BaseModel, Field
 
 from .toolpath_ir import ToolpathChannel, ToolpathProgram
 from .turning_simulation import (
-    TurningSimulationResult, TurningStockSample, simulate_turning_stock,
+    TurningSimulationMetrics, TurningSimulationResult, TurningStockSample,
+    simulate_turning_stock,
 )
 
 
@@ -17,12 +18,22 @@ class ContinuousMaterialCheck(BaseModel):
     measured_value: float | int | str | None = None
 
 
+class TurningStageSnapshot(BaseModel):
+    operation_id: str
+    channel_id: Literal["main", "sub"]
+    source_frame: Literal["main", "sub"]
+    before_samples: list[TurningStockSample]
+    after_samples: list[TurningStockSample]
+    metrics: TurningSimulationMetrics
+
+
 class ContinuousTurningSimulationResult(BaseModel):
     schema_version: str = "1.0.0"
     status: Literal["passed", "failed"]
     main_frame_after_cutoff: TurningSimulationResult
     transferred_sub_frame_samples: list[TurningStockSample]
     sub_frame_final: TurningSimulationResult
+    stage_snapshots: list[TurningStageSnapshot] = Field(default_factory=list)
     checks: list[ContinuousMaterialCheck]
     initial_volume_mm3: float = Field(ge=0)
     transferred_volume_mm3: float = Field(ge=0)
@@ -42,6 +53,84 @@ def _single_channel(program: ToolpathProgram, channel_id: str) -> ToolpathProgra
         plan_revision=program.plan_revision,
         channels=[ToolpathChannel(id=channel_id, commands=commands)],
     )
+
+
+def _operation_program(
+    program: ToolpathProgram,
+    channel_id: str,
+    operation_id: str,
+) -> ToolpathProgram:
+    channel = next((item for item in program.channels if item.id == channel_id), None)
+    if channel is None:
+        raise ValueError(f"whole-part program is missing channel: {channel_id}")
+    commands = [
+        item for item in channel.commands
+        if item.operation_id == operation_id and item.type != "sync_barrier"
+    ]
+    return ToolpathProgram(
+        coordinate_convention=program.coordinate_convention,
+        machine_snapshot_hash=program.machine_snapshot_hash,
+        plan_revision=program.plan_revision,
+        channels=[ToolpathChannel(id=channel_id, commands=commands)],
+    )
+
+
+def _operation_ids(program: ToolpathProgram, channel_id: str) -> list[str]:
+    channel = next((item for item in program.channels if item.id == channel_id), None)
+    if channel is None:
+        return []
+    return list(dict.fromkeys(
+        item.operation_id for item in channel.commands if item.type != "sync_barrier"
+    ))
+
+
+def _simulate_stage_snapshots(
+    program: ToolpathProgram,
+    *,
+    channel_id: Literal["main", "sub"],
+    stock_radius_mm: float,
+    initial_bore_radius_mm: float,
+    z_min_mm: float,
+    z_max_mm: float,
+    resolution_mm: float,
+    initial_samples: list[TurningStockSample] | None = None,
+    excluded_operation_ids: set[str] | None = None,
+) -> tuple[list[TurningStageSnapshot], list[TurningStockSample]]:
+    excluded = excluded_operation_ids or set()
+    state = initial_samples
+    snapshots: list[TurningStageSnapshot] = []
+    for operation_id in _operation_ids(program, channel_id):
+        if operation_id in excluded:
+            continue
+        stage_program = _operation_program(program, channel_id, operation_id)
+        before_result = simulate_turning_stock(
+            _operation_program(program, channel_id, "__empty__"),
+            stock_radius_mm=stock_radius_mm,
+            initial_bore_radius_mm=initial_bore_radius_mm,
+            z_min_mm=z_min_mm,
+            z_max_mm=z_max_mm,
+            resolution_mm=resolution_mm,
+            initial_samples=state,
+        )
+        result = simulate_turning_stock(
+            stage_program,
+            stock_radius_mm=stock_radius_mm,
+            initial_bore_radius_mm=initial_bore_radius_mm,
+            z_min_mm=z_min_mm,
+            z_max_mm=z_max_mm,
+            resolution_mm=resolution_mm,
+            initial_samples=before_result.samples,
+        )
+        snapshots.append(TurningStageSnapshot(
+            operation_id=operation_id,
+            channel_id=channel_id,
+            source_frame=channel_id,
+            before_samples=before_result.samples,
+            after_samples=result.samples,
+            metrics=result.metrics,
+        ))
+        state = result.samples
+    return snapshots, state or []
 
 
 def _volume(samples: list[TurningStockSample]) -> float:
@@ -76,18 +165,37 @@ def simulate_continuous_whole_part(
         z_max_mm=main_z_max_mm,
         resolution_mm=resolution_mm,
     )
-    retained = [
+    main_stage_snapshots, _ = _simulate_stage_snapshots(
+        program,
+        channel_id="main",
+        stock_radius_mm=stock_radius_mm,
+        initial_bore_radius_mm=initial_bore_radius_mm,
+        z_min_mm=main_z_min_mm,
+        z_max_mm=main_z_max_mm,
+        resolution_mm=resolution_mm,
+    )
+    retained_interior = [
         TurningStockSample(
             z=round(transfer_datum_z_mm - sample.z, 6),
             outer_radius=sample.outer_radius,
             inner_radius=sample.inner_radius,
         )
         for sample in main_result.samples
-        if sample.z >= transfer_datum_z_mm - 1e-9
+        if sample.z > transfer_datum_z_mm + 1e-9
+    ]
+    retained_interior.sort(key=lambda item: item.z)
+    if len(retained_interior) < 2:
+        raise ValueError("cutoff transfer produced fewer than two retained material samples")
+    datum_side = max(retained_interior, key=lambda item: item.z)
+    retained = [
+        *retained_interior,
+        TurningStockSample(
+            z=0,
+            outer_radius=datum_side.outer_radius,
+            inner_radius=datum_side.inner_radius,
+        ),
     ]
     retained.sort(key=lambda item: item.z)
-    if len(retained) < 2:
-        raise ValueError("cutoff transfer produced fewer than two retained material samples")
     sub_result = simulate_turning_stock(
         sub_program,
         stock_radius_mm=max(item.outer_radius for item in retained),
@@ -96,6 +204,17 @@ def simulate_continuous_whole_part(
         z_max_mm=retained[-1].z,
         resolution_mm=resolution_mm,
         initial_samples=retained,
+    )
+    sub_stage_snapshots, _ = _simulate_stage_snapshots(
+        program,
+        channel_id="sub",
+        stock_radius_mm=max(item.outer_radius for item in retained),
+        initial_bore_radius_mm=min(item.inner_radius for item in retained),
+        z_min_mm=retained[0].z,
+        z_max_mm=retained[-1].z,
+        resolution_mm=resolution_mm,
+        initial_samples=retained,
+        excluded_operation_ids={"OP40"},
     )
     initial_volume = main_result.metrics.initial_volume_mm3
     transferred_volume = _volume(retained)
@@ -135,6 +254,7 @@ def simulate_continuous_whole_part(
         main_frame_after_cutoff=main_result,
         transferred_sub_frame_samples=retained,
         sub_frame_final=sub_result,
+        stage_snapshots=[*main_stage_snapshots, *sub_stage_snapshots],
         checks=checks,
         initial_volume_mm3=round(initial_volume, 6),
         transferred_volume_mm3=round(transferred_volume, 6),

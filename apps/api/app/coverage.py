@@ -79,6 +79,13 @@ def evaluate_plan_coverage(
             else {"slot_roughing", "slot_finishing"}
         )
         add_feature_target(feature, feature.kind, required, f"{feature.kind} {feature.length:g}×{feature.width:g}")
+        if (
+            plan.stock.get("type") == "round_bar"
+            and feature.kind == "pocket"
+            and feature.id not in set(plan.stock.get("verified_prismatic_feature_ids", []))
+            and targets[-1].state == "covered"
+        ):
+            targets[-1].state = "uncovered"
 
     for feature in analysis.internal_profile_features:
         if feature.review_state == "excluded":
@@ -124,7 +131,26 @@ def evaluate_plan_coverage(
         ]
         found_types = {operation.type for operation in profile_operations}
         review_state = str(plan.stock.get("profile_review_state", "review"))
-        if review_state == "accepted" and profile_id and turning_required <= found_types:
+        protected_limit = plan.stock.get("nonrotational_turning_limit_z_mm")
+        covers_complete_profile = all(
+            operation.parameters.get("profile_region_complete", True) is True
+            or (
+                protected_limit is not None
+                and abs(float(operation.parameters.get("profile_z_min_mm", protected_limit)) - float(protected_limit)) <= 0.05
+            )
+            for operation in profile_operations
+        )
+        rotational_scope_complete = (
+            plan.stock.get("profile_axial_complete", True) is True
+            or protected_limit is not None
+        )
+        if (
+            review_state == "accepted"
+            and profile_id
+            and turning_required <= found_types
+            and covers_complete_profile
+            and rotational_scope_complete
+        ):
             state = "covered"
         elif review_state == "review":
             state = "review"
@@ -139,6 +165,30 @@ def evaluate_plan_coverage(
             covered_by=[operation.id for operation in profile_operations],
             source_feature_ids=[profile_id] if profile_id else [],
         ))
+        if plan.stock.get("nonrotational_turning_limit_z_mm") is not None:
+            required = {"live_tool_contour_roughing", "live_tool_contour_finishing"}
+            matching = [
+                operation for operation in by_feature.get(profile_id, [])
+                if operation.type in required
+            ]
+            region = plan.stock.get("nonrotational_region_z_mm")
+            if not isinstance(region, list) or len(region) != 2:
+                back = float(plan.stock.get("finished_back_z_mm", 0))
+                limit = float(plan.stock["nonrotational_turning_limit_z_mm"])
+                region = [min(back, limit), max(back, limit)]
+            targets.append(CoverageTarget(
+                id=f"TARGET-NONROTATIONAL-OUTER-{profile_id or 'UNKNOWN'}",
+                kind="outer_profile",
+                label=f"L32 nonrotational outer region {region} mm",
+                state=(
+                    "covered" if required <= {item.type for item in matching}
+                    and plan.stock.get("nonrotational_material_verified") is True
+                    else "uncovered"
+                ),
+                required_operation_types=sorted(required),
+                covered_by=[operation.id for operation in matching],
+                source_feature_ids=[profile_id] if profile_id else [],
+            ))
 
     bounds = analysis.measurements.get("bounding_box")
     profile_plane = None

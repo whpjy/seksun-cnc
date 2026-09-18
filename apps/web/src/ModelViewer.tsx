@@ -4,7 +4,7 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import type { FixtureComponent, FormingPreview, ManufacturingFeature, SimulationResult, SpatialDefectRegion, SpatialDefectSample, ToolpathSegment, Vec3 } from "./types";
+import type { FixtureComponent, FormingPreview, ManufacturingFeature, SimulationResult, SpatialDefectRegion, SpatialDefectSample, ToolpathSegment, TurningStageView, Vec3 } from "./types";
 
 type ViewMode = "特征" | "工艺" | "刀路" | "仿真";
 
@@ -14,9 +14,12 @@ type Props = {
   selectedFeatureIds: string[];
   onSelectFeature: (id: string) => void;
   toolpathSegments?: ToolpathSegment[];
+  materialSnapshotUrls?: string[];
   initialToolpathSegments?: ToolpathSegment[];
   profileBoundaries?: { operation_id: string; setup_id: string; work_axis: { x: number; y: number; z: number }; points: { x: number; y: number; z: number }[] }[];
   simulation?: SimulationResult | null;
+  simulationBlocked?: boolean;
+  turningStage?: TurningStageView | null;
   camoticsSurface?: { url: string; frame: { x: Vec3; y: Vec3; z: Vec3 } } | null;
   fixtureComponents?: FixtureComponent[];
   animateToolpath?: boolean;
@@ -49,7 +52,7 @@ function featureMarkerColor(feature: ManufacturingFeature) {
   return 0x18b89a;
 }
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", workAxis = null, activeOperationLabel = "" }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], materialSnapshotUrls = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", workAxis = null, activeOperationLabel = "" }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
@@ -57,12 +60,6 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const onSelectDefectRef = useRef(onSelectDefect);
   const selectedIdsRef = useRef(selectedFeatureIds);
   const playbackRef = useRef({ playing: false, progress: initialProgress, speed: 1 });
-  const cameraStateRef = useRef<{
-    modelUrl: string;
-    position: THREE.Vector3;
-    target: THREE.Vector3;
-    zoom: number;
-  } | null>(null);
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(initialProgress);
   const [speed, setSpeed] = useState(1);
@@ -78,6 +75,25 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     setToolVisible: (visible: boolean) => void;
     setTrailVisible: (visible: boolean) => void;
   } | null>(null);
+  // Preview geometry arrives asynchronously after an operation is selected.
+  // Keep the user's camera only while the visible machining content is the
+  // same; otherwise the newly arrived stock/result must receive a fresh fit.
+  const cameraContentKey = [
+    activeOperationId ?? "",
+    viewMode,
+    toolpathLoaded ? "loaded" : "loading",
+    toolpathSegments.length,
+    materialSnapshotUrls.join(","),
+    initialToolpathSegments.length,
+    turningStage
+      ? `${turningStage.operation_id}:${turningStage.before_samples.length}:${turningStage.after_samples.length}`
+      : "no-turning-stage",
+    simulation
+      ? `${simulation.surface.columns}:${simulation.surface.rows}:${simulation.surface.heights.length}`
+      : "no-simulation",
+    camoticsSurface?.url ?? "no-camotics-surface",
+    formingPreview?.stages.length ?? 0,
+  ].join("|");
 
   const updatePlaying = (value: boolean) => {
     if (value && playbackRef.current.progress >= 0.999) {
@@ -109,15 +125,16 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   }, [onSelectDefect]);
 
   useEffect(() => {
-    playbackRef.current.playing = false;
+    const autoPlay = Boolean(turningStage && toolpathSegments.length);
+    playbackRef.current.playing = autoPlay;
     playbackRef.current.progress = 0;
     const reset = window.setTimeout(() => {
-      setPlaying(false);
+      setPlaying(autoPlay);
       setProgress(0);
       setActiveMotion(null);
     }, 0);
     return () => window.clearTimeout(reset);
-  }, [activeOperationId, playbackMode]);
+  }, [activeOperationId, playbackMode, toolpathSegments.length, turningStage]);
 
   useEffect(() => {
     selectedIdsRef.current = selectedFeatureIds;
@@ -231,7 +248,6 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     scene.add(floorGrid);
 
     let model: THREE.Mesh | null = null;
-    let modelLoaded = false;
     let lastFormingFactor = -1;
     let formingActuator: THREE.Mesh | null = null;
     let formingStock: THREE.Mesh | null = null;
@@ -242,6 +258,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     let simulationMesh: THREE.Mesh | null = null;
     let simulationLowerMesh: THREE.Mesh | null = null;
     let simulationWalls: THREE.Mesh | null = null;
+    let turningBeforeMesh: THREE.Mesh | null = null;
+    let turningAfterMesh: THREE.Mesh | null = null;
+    let turningBeforeSamples: TurningStageView["before_samples"] = [];
+    let turningAfterSamples: TurningStageView["after_samples"] = [];
     let camoticsMesh: THREE.Mesh | null = null;
     let playbackTool: THREE.Group | null = null;
     let playbackCutter: THREE.Mesh | null = null;
@@ -265,6 +285,8 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     let profileDetachWeight = Number.POSITIVE_INFINITY;
     const fixtureMeshes: { mesh: THREE.Mesh; setupId?: string | null }[] = [];
     const defectRegionMeshes: THREE.Mesh[] = [];
+    const materialSnapshotMeshes: Array<THREE.Mesh | null> = Array(materialSnapshotUrls.length).fill(null);
+    let disposed = false;
     let defectPointCloud: THREE.Points | null = null;
     let animation = 0;
     let lastFrameTime = performance.now();
@@ -324,31 +346,108 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       model = new THREE.Mesh(
         renderGeometry,
         new THREE.MeshPhysicalMaterial({
-          color: simulation ? UG_TARGET_COLOR : viewMode === "特征" ? 0x768793 : viewMode === "刀路" ? 0x87969d : UG_PART_COLOR,
+          color: simulation || turningStage ? UG_TARGET_COLOR : viewMode === "特征" ? 0x768793 : viewMode === "刀路" ? 0x87969d : UG_PART_COLOR,
           roughness: 0.56,
           metalness: 0.06,
           clearcoat: 0.04,
           clearcoatRoughness: 0.68,
           envMapIntensity: 0.5,
-          transparent: Boolean(simulation || formingPreview || viewMode === "特征" || viewMode === "刀路"),
-          opacity: simulation ? 0.16 : viewMode === "特征" ? 0.58 : viewMode === "刀路" ? 0.34 : 1,
-          depthWrite: !simulation && viewMode !== "刀路",
+          transparent: Boolean(simulation || turningStage || formingPreview || viewMode === "特征" || viewMode === "刀路"),
+          opacity: simulation || turningStage ? 0.16 : viewMode === "特征" ? 0.58 : viewMode === "刀路" ? 0.34 : 1,
+          depthWrite: !simulation && !turningStage && viewMode !== "刀路",
           // Keep coplanar CAD edge overlays stable when zoomed in. Without a
           // small depth bias the edge and surface alternate at sub-pixel depth,
           // producing the broken/dotted outlines visible at high zoom.
           polygonOffset: true,
-          polygonOffsetFactor: simulation ? -2 : 1,
-          polygonOffsetUnits: simulation ? -2 : 1,
+          polygonOffsetFactor: simulation || turningStage ? -2 : 1,
+          polygonOffsetUnits: simulation || turningStage ? -2 : 1,
         }),
       );
       // Keep the target optional during simulation. The target and final IPW
       // are often nearly coplanar, so drawing both produces white shimmer that
       // looks like a rough machined surface even when the height field is clean.
-      model.visible = !simulation || targetVisibleRef.current;
+      model.visible = materialSnapshotUrls.length === 0 && (!(simulation || turningStage) || targetVisibleRef.current);
       model.castShadow = true;
       model.receiveShadow = true;
       scene.add(model);
-      modelLoaded = true;
+
+      for (const [snapshotIndex, snapshotUrl] of materialSnapshotUrls.entries()) {
+        new STLLoader().load(snapshotUrl, (snapshotGeometry) => {
+          if (disposed) {
+            snapshotGeometry.dispose();
+            return;
+          }
+          snapshotGeometry.translate(-modelCenter.x, -modelCenter.y, -modelCenter.z);
+          const renderSnapshot = toCreasedNormals(snapshotGeometry, THREE.MathUtils.degToRad(52));
+          if (renderSnapshot !== snapshotGeometry) snapshotGeometry.dispose();
+          const snapshotMesh = new THREE.Mesh(
+            renderSnapshot,
+            new THREE.MeshPhysicalMaterial({
+              color: 0x718083,
+              roughness: 0.5,
+              metalness: 0.08,
+              clearcoat: 0.04,
+              clearcoatRoughness: 0.68,
+            }),
+          );
+          snapshotMesh.castShadow = true;
+          snapshotMesh.receiveShadow = true;
+          snapshotMesh.visible = false;
+          materialSnapshotMeshes[snapshotIndex] = snapshotMesh;
+          scene.add(snapshotMesh);
+          if (model) model.visible = false;
+        });
+      }
+
+      if (turningStage) {
+        const axisOrigin = new THREE.Vector3(
+          turningStage.axis_origin.x,
+          turningStage.axis_origin.y,
+          turningStage.axis_origin.z,
+        );
+        const axisDirection = new THREE.Vector3(
+          turningStage.axis_direction.x,
+          turningStage.axis_direction.y,
+          turningStage.axis_direction.z,
+        ).normalize();
+        const makeStockMesh = (
+          samples: TurningStageView["before_samples"],
+          color: number,
+          opacity: number,
+        ) => {
+          const ordered = [...samples].sort((left, right) => left.z - right.z);
+          const profile = [
+            ...ordered.map((sample) => new THREE.Vector2(Math.max(sample.outer_radius, 0), sample.z)),
+            ...ordered.slice().reverse().map((sample) => new THREE.Vector2(Math.max(sample.inner_radius, 0), sample.z)),
+          ];
+          const stockGeometry = new THREE.LatheGeometry(profile, 64);
+          stockGeometry.computeVertexNormals();
+          const material = new THREE.MeshPhysicalMaterial({
+            color,
+            roughness: 0.38,
+            metalness: 0.42,
+            clearcoat: 0.12,
+            clearcoatRoughness: 0.5,
+            transparent: true,
+            opacity,
+            side: THREE.DoubleSide,
+            depthWrite: opacity > 0.75,
+          });
+          const mesh = new THREE.Mesh(stockGeometry, material);
+          mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axisDirection);
+          mesh.position.copy(axisOrigin).sub(modelCenter);
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+          return mesh;
+        };
+        turningBeforeMesh = makeStockMesh(turningStage.before_samples, 0x7f8c92, 0.78);
+        turningAfterMesh = makeStockMesh(turningStage.after_samples, 0x268b7a, 0.28);
+        turningBeforeSamples = [...turningStage.before_samples].sort((left, right) => left.z - right.z);
+        turningAfterSamples = [...turningStage.after_samples].sort((left, right) => left.z - right.z);
+        turningBeforeMesh.renderOrder = 3;
+        turningAfterMesh.renderOrder = 4;
+        scene.add(turningBeforeMesh, turningAfterMesh);
+      }
 
       if (formingPreview) {
         const partSize = bounds?.getSize(new THREE.Vector3()) ?? new THREE.Vector3(viewSize, viewSize * 0.1, viewSize * 0.6);
@@ -460,13 +559,13 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         new THREE.LineBasicMaterial({
           color: UG_EDGE_COLOR,
           transparent: true,
-          opacity: simulation ? 0.24 : viewMode === "刀路" ? 0.2 : viewMode === "特征" ? 0.38 : 0.64,
+          opacity: simulation || turningStage ? 0.24 : viewMode === "刀路" ? 0.2 : viewMode === "特征" ? 0.38 : 0.64,
           depthTest: true,
           depthWrite: false,
         }),
       );
       cadEdges.renderOrder = 2;
-      cadEdges.visible = !formingPreview && (!simulation || targetVisibleRef.current);
+      cadEdges.visible = materialSnapshotUrls.length === 0 && !formingPreview && (!(simulation || turningStage) || targetVisibleRef.current);
       scene.add(cadEdges);
       if (renderGeometry !== geometry) geometry.dispose();
 
@@ -541,6 +640,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         trailPath.renderOrder = 10;
         trailPath.visible = true;
         scene.add(trailPath);
+
       }
 
       for (const fixture of fixtureComponents) {
@@ -790,17 +890,65 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           minY = Math.min(minY, projectedY);
           maxY = Math.max(maxY, projectedY);
         }
+        // A machining preview can be larger than the finished CAD model (for
+        // example, OP10 includes the full bar stock). Include all workpiece
+        // result surfaces in the fit, but intentionally exclude tools,
+        // fixtures and rapid paths so they cannot make the part unreadably
+        // small.
+        const fitSurfaces = [
+          formingStock,
+          camoticsMesh,
+          simulationMesh,
+          simulationLowerMesh,
+          simulationWalls,
+          turningBeforeMesh,
+          turningAfterMesh,
+        ].filter((surface): surface is THREE.Mesh => Boolean(surface));
+        const boundsCorners = Array.from({ length: 8 }, () => new THREE.Vector3());
+        for (const surface of fitSurfaces) {
+          surface.updateMatrixWorld(true);
+          const surfaceBounds = new THREE.Box3().setFromObject(surface);
+          if (surfaceBounds.isEmpty()) continue;
+          const { min, max } = surfaceBounds;
+          boundsCorners[0].set(min.x, min.y, min.z);
+          boundsCorners[1].set(min.x, min.y, max.z);
+          boundsCorners[2].set(min.x, max.y, min.z);
+          boundsCorners[3].set(min.x, max.y, max.z);
+          boundsCorners[4].set(max.x, min.y, min.z);
+          boundsCorners[5].set(max.x, min.y, max.z);
+          boundsCorners[6].set(max.x, max.y, min.z);
+          boundsCorners[7].set(max.x, max.y, max.z);
+          for (const corner of boundsCorners) {
+            const projectedX = corner.dot(right);
+            const projectedY = corner.dot(screenUp);
+            minX = Math.min(minX, projectedX);
+            maxX = Math.max(maxX, projectedX);
+            minY = Math.min(minY, projectedY);
+            maxY = Math.max(maxY, projectedY);
+          }
+        }
         const halfWidth = (maxX - minX) / 2;
         const halfHeight = (maxY - minY) / 2;
         // Leave enough breathing room on first display. A tighter fit makes
         // large or elongated parts look cropped even when they technically fit.
-        viewHeight = Math.max(halfHeight * 2, halfWidth * 2 / Math.max(viewAspect, 0.1)) / 0.7;
+        // Operation details and inspection cards float over the viewport. Keep
+        // the whole part comfortably visible instead of fitting it edge-to-edge.
+        viewHeight = Math.max(halfHeight * 2, halfWidth * 2 / Math.max(viewAspect, 0.1)) / 0.42;
         const radius = viewSize / 2;
         const distance = viewSize * 2.2;
-        // The STL has already been translated by its bounding-box center.
-        // Using the projected silhouette midpoint here shifts asymmetric parts
-        // toward a long edge; the origin is the stable visual pivot instead.
-        const target = new THREE.Vector3(0, 0, 0);
+        // Center the *visible projected bounds*, not the world origin. Turning
+        // stock and cumulative IPW geometry can extend mostly to one side of
+        // the CAD origin, which otherwise leaves the part in a viewport corner.
+        const projectedCenterX = (minX + maxX) / 2;
+        const projectedCenterY = (minY + maxY) / 2;
+        const target = right.clone().multiplyScalar(projectedCenterX)
+          .add(screenUp.clone().multiplyScalar(projectedCenterY));
+        // Product layout reserves visual weight in the upper-left and places
+        // controls along the bottom/right. Bias the camera target toward the
+        // lower-right so the workpiece itself appears left and up on screen.
+        // This is a screen-space composition offset and does not move geometry.
+        target.add(right.clone().multiplyScalar(viewHeight * viewAspect * 0.07));
+        target.add(screenUp.clone().multiplyScalar(-viewHeight * 0.07));
         controls.target.copy(target);
         camera.position.copy(target).add(direction.multiplyScalar(distance));
         camera.zoom = 1;
@@ -826,22 +974,16 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       viewApiRef.current = {
         setView,
         setTargetVisible: (visible) => {
-          if (model) model.visible = !simulation || visible;
-          if (cadEdges) cadEdges.visible = !simulation || visible;
+          if (model) model.visible = materialSnapshotUrls.length === 0 && (!(simulation || turningStage) || visible);
+          if (cadEdges) cadEdges.visible = !(simulation || turningStage) || visible;
         },
         setToolVisible: (visible) => { if (playbackTool) playbackTool.visible = visible; },
         setTrailVisible: (visible) => { if (trailPath) trailPath.visible = visible; },
       };
-      const savedCamera = cameraStateRef.current;
-      if (savedCamera?.modelUrl === modelUrl) {
-        camera.position.copy(savedCamera.position);
-        camera.zoom = savedCamera.zoom;
-        controls.target.copy(savedCamera.target);
-        camera.updateProjectionMatrix();
-        controls.update();
-      } else {
-        fitDirection(camera.position.clone());
-      }
+      // A rebuilt scene represents a different mode, operation or newly
+      // arrived preview. Never restore an old pan target here: it is the main
+      // cause of a correctly scaled part reopening in the lower-right corner.
+      fitDirection(camera.position.clone());
     });
 
     const raycaster = new THREE.Raycaster();
@@ -853,16 +995,8 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       pointer.y = -((event.clientY - rectangle.top) / rectangle.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
     };
-    const focusRotationAtPointer = (event: PointerEvent) => {
+    const recordPointerDown = (event: PointerEvent) => {
       pointerDownPosition = { x: event.clientX, y: event.clientY };
-      if (event.button !== 0) return;
-      setPointerFromEvent(event);
-      const rotationSurfaces = [formingStock, camoticsMesh, simulationMesh, simulationLowerMesh, simulationWalls, model]
-        .filter((surface): surface is THREE.Mesh => Boolean(surface?.visible));
-      const hit = raycaster.intersectObjects(rotationSurfaces, false)[0];
-      if (!hit) return;
-      controls.target.copy(hit.point);
-      controls.update();
     };
     const pickFeature = (event: PointerEvent) => {
       if (event.button !== 0 || !pointerDownPosition) return;
@@ -885,7 +1019,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       const featureId = hit?.object.userData.featureId as string | undefined;
       if (featureId) onSelectRef.current(featureId);
     };
-    renderer.domElement.addEventListener("pointerdown", focusRotationAtPointer, true);
+    renderer.domElement.addEventListener("pointerdown", recordPointerDown, true);
     renderer.domElement.addEventListener("pointerup", pickFeature);
 
     const segmentWeights = toolpathSegments.map((segment) => {
@@ -895,6 +1029,92 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     const totalWeight = segmentWeights.reduce((sum, value) => sum + value, 0) || 1;
     const cumulativeWeights = [0];
     for (const value of segmentWeights) cumulativeWeights.push(cumulativeWeights[cumulativeWeights.length - 1] + value);
+
+    const turningSampleTargets = turningStage && turningBeforeSamples.length
+      ? turningBeforeSamples.map((before, index) => {
+          const indexed = turningAfterSamples[index];
+          const after = indexed && Math.abs(indexed.z - before.z) < 1e-5
+            ? indexed
+            : turningAfterSamples.reduce((nearest, candidate) =>
+                Math.abs(candidate.z - before.z) < Math.abs(nearest.z - before.z) ? candidate : nearest,
+              turningAfterSamples[0] ?? before);
+          return { before, after };
+        })
+      : [];
+    const turningAxis = turningStage
+      ? new THREE.Vector3(
+          turningStage.axis_direction.x,
+          turningStage.axis_direction.y,
+          turningStage.axis_direction.z,
+        ).normalize()
+      : new THREE.Vector3(1, 0, 0);
+    const turningAxisOrigin = turningStage
+      ? new THREE.Vector3(turningStage.axis_origin.x, turningStage.axis_origin.y, turningStage.axis_origin.z)
+      : new THREE.Vector3();
+    const turningSampleSpacing = turningSampleTargets.length > 1
+      ? Math.max(
+          0.02,
+          Math.abs(turningSampleTargets[turningSampleTargets.length - 1].before.z - turningSampleTargets[0].before.z)
+            / (turningSampleTargets.length - 1),
+        )
+      : 0.1;
+    const turningEncounterRatios = turningSampleTargets.map(({ before }, sampleIndex) => {
+      let earliest = Number.POSITIVE_INFINITY;
+      for (let index = 0; index < toolpathSegments.length; index += 1) {
+        const segment = toolpathSegments[index];
+        if (segment.motion !== "cut" || (turningStage && segment.operation_id !== turningStage.operation_id)) continue;
+        const start = new THREE.Vector3(segment.x1, segment.y1, segment.z1).sub(turningAxisOrigin).dot(turningAxis);
+        const end = new THREE.Vector3(segment.x2, segment.y2, segment.z2).sub(turningAxisOrigin).dot(turningAxis);
+        const minimum = Math.min(start, end) - turningSampleSpacing * 0.75;
+        const maximum = Math.max(start, end) + turningSampleSpacing * 0.75;
+        if (before.z < minimum || before.z > maximum) continue;
+        const segmentRatio = Math.abs(end - start) > 1e-6
+          ? THREE.MathUtils.clamp((before.z - start) / (end - start), 0, 1)
+          : 1;
+        earliest = Math.min(
+          earliest,
+          (cumulativeWeights[index] + segmentWeights[index] * segmentRatio) / totalWeight,
+        );
+      }
+      // Some controller cycles are represented as one semantic command rather
+      // than a dense path. Give those samples a deterministic progressive
+      // fallback instead of holding all material until the final frame.
+      return Number.isFinite(earliest)
+        ? earliest
+        : 0.08 + 0.82 * sampleIndex / Math.max(turningSampleTargets.length - 1, 1);
+    });
+    let lastTurningGeometryProgress = -1;
+    const updateTurningMaterial = (currentProgress: number) => {
+      if (!turningBeforeMesh || !turningSampleTargets.length) return;
+      if (Math.abs(currentProgress - lastTurningGeometryProgress) < 0.008 && currentProgress < 0.999) return;
+      const dynamicSamples = turningSampleTargets.map(({ before, after }, index) => {
+        const encounter = turningEncounterRatios[index];
+        const pathProgress = currentProgress >= 0.999
+          ? 1
+          : THREE.MathUtils.smoothstep(currentProgress, encounter, Math.min(encounter + 0.055, 1));
+        // Controller cycles may collapse several physical passes into one IR
+        // command. Blend in the operation-wide pass so every changed section
+        // evolves continuously instead of waiting for the last frame.
+        const localProgress = Math.max(
+          pathProgress,
+          THREE.MathUtils.smoothstep(currentProgress, 0.04, 0.96),
+        );
+        return {
+          z: THREE.MathUtils.lerp(before.z, after.z, localProgress),
+          outer_radius: THREE.MathUtils.lerp(before.outer_radius, after.outer_radius, localProgress),
+          inner_radius: THREE.MathUtils.lerp(before.inner_radius, after.inner_radius, localProgress),
+        };
+      });
+      const profile = [
+        ...dynamicSamples.map((sample) => new THREE.Vector2(Math.max(sample.outer_radius, 0), sample.z)),
+        ...dynamicSamples.slice().reverse().map((sample) => new THREE.Vector2(Math.max(sample.inner_radius, 0), sample.z)),
+      ];
+      const previousGeometry = turningBeforeMesh.geometry;
+      turningBeforeMesh.geometry = new THREE.LatheGeometry(profile, 64);
+      turningBeforeMesh.geometry.computeVertexNormals();
+      previousGeometry.dispose();
+      lastTurningGeometryProgress = currentProgress;
+    };
 
     if (simulation && profileBoundaries.length) {
       const boundary = profileBoundaries[0];
@@ -1252,21 +1472,36 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       const drillTipLength = tool.kind === "drill" || tool.kind === "chamfer_mill"
         ? tool.diameter_mm / 2 / Math.tan(THREE.MathUtils.degToRad(pointAngle / 2))
         : 0;
-      const cutterLength = Math.max(1, tool.stickout_mm - drillTipLength);
+      // Material removal still uses the catalog dimensions. These caps affect
+      // only the rendered assembly so a long holder cannot hide a small part.
+      const visualDiameter = Math.min(
+        Math.max(tool.diameter_mm, 0.5),
+        Math.max(viewSize * 0.12, 0.8),
+      );
+      const visualStickout = Math.min(
+        Math.max(tool.stickout_mm, visualDiameter * 1.5),
+        Math.max(viewSize * 0.28, visualDiameter * 2.2, 2),
+      );
+      const cutterLength = Math.max(1, visualStickout - drillTipLength);
       if (playbackCutter) {
-        playbackCutter.scale.set(Math.max(tool.diameter_mm, 1), cutterLength, Math.max(tool.diameter_mm, 1));
+        playbackCutter.scale.set(visualDiameter, cutterLength, visualDiameter);
         playbackCutter.position.set(0, drillTipLength + cutterLength / 2, 0);
         (playbackCutter.material as THREE.MeshStandardMaterial).emissive.set(segment.motion === "cut" ? 0x17362f : 0x172129);
       }
       if (playbackDrillTip) {
         playbackDrillTip.visible = tool.kind === "drill" || tool.kind === "chamfer_mill";
-        playbackDrillTip.scale.set(Math.max(tool.diameter_mm, 1), Math.max(drillTipLength, 0.01), Math.max(tool.diameter_mm, 1));
+        playbackDrillTip.scale.set(visualDiameter, Math.max(drillTipLength, 0.01), visualDiameter);
         playbackDrillTip.position.set(0, drillTipLength / 2, 0);
         (playbackDrillTip.material as THREE.MeshStandardMaterial).emissive.set(segment.motion === "cut" ? 0x17362f : 0x172129);
       }
       if (playbackHolder) {
-        playbackHolder.scale.set(Math.max(tool.holder_diameter_mm, tool.diameter_mm), 10, Math.max(tool.holder_diameter_mm, tool.diameter_mm));
-        playbackHolder.position.set(0, tool.stickout_mm + 5, 0);
+        const holderDiameter = Math.min(
+          Math.max(tool.holder_diameter_mm, visualDiameter),
+          Math.max(viewSize * 0.16, visualDiameter * 1.35, 1.2),
+        );
+        const holderLength = Math.max(viewSize * 0.2, visualDiameter * 1.8, 1.5);
+        playbackHolder.scale.set(holderDiameter, holderLength, holderDiameter);
+        playbackHolder.position.set(0, visualStickout + holderLength / 2, 0);
       }
       playbackTool.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis);
       playbackTool.position.copy(tip);
@@ -1381,7 +1616,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       const elapsed = Math.min((time - lastFrameTime) / 1000, 0.1);
       lastFrameTime = time;
       if (animateToolpath && playbackRef.current.playing && (toolpathSegments.length || formingPreview)) {
-        const duration = formingPreview ? 18 : 30;
+        const duration = formingPreview ? 18 : turningStage ? 8 : materialSnapshotUrls.length ? 18 : 30;
         const nextProgress = Math.min(1, playbackRef.current.progress + elapsed * playbackRef.current.speed / duration);
         playbackRef.current.progress = nextProgress;
         setProgress(nextProgress);
@@ -1392,6 +1627,34 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       }
       if (animateToolpath) updatePlaybackScene(playbackRef.current.progress);
       if (animateToolpath) updateFormingScene(playbackRef.current.progress);
+      const loadedSnapshotCount = materialSnapshotMeshes.filter(Boolean).length;
+      if (loadedSnapshotCount) {
+        const requestedIndex = Math.min(
+          materialSnapshotMeshes.length - 1,
+          Math.floor(playbackRef.current.progress * Math.max(materialSnapshotMeshes.length - 1, 0) + 1e-6),
+        );
+        let visibleIndex = requestedIndex;
+        while (visibleIndex > 0 && !materialSnapshotMeshes[visibleIndex]) visibleIndex -= 1;
+        if (!materialSnapshotMeshes[visibleIndex]) {
+          visibleIndex = materialSnapshotMeshes.findIndex(Boolean);
+        }
+        materialSnapshotMeshes.forEach((snapshot, index) => {
+          if (snapshot) snapshot.visible = index === visibleIndex;
+        });
+        if (model) model.visible = false;
+        if (cadEdges) cadEdges.visible = false;
+      }
+      if (turningBeforeMesh && turningAfterMesh) {
+        const turningProgress = animateToolpath ? playbackRef.current.progress : 1;
+        updateTurningMaterial(turningProgress);
+        const beforeMaterial = turningBeforeMesh.material as THREE.MeshPhysicalMaterial;
+        beforeMaterial.opacity = 0.96;
+        beforeMaterial.visible = true;
+        beforeMaterial.depthWrite = true;
+        // The authoritative final mesh remains available for bounds checking,
+        // while the visible IPW is now the continuously rebuilt dynamic mesh.
+        turningAfterMesh.visible = false;
+      }
       if (camoticsMesh) camoticsMesh.visible = playbackRef.current.progress >= 0.999;
       controls.update();
       renderer.render(scene, camera);
@@ -1403,17 +1666,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     rebuildMaterialWalls();
     animate(performance.now());
     return () => {
-      if (modelLoaded) {
-        cameraStateRef.current = {
-          modelUrl,
-          position: camera.position.clone(),
-          target: controls.target.clone(),
-          zoom: camera.zoom,
-        };
-      }
+      disposed = true;
       cancelAnimationFrame(animation);
       observer.disconnect();
-      renderer.domElement.removeEventListener("pointerdown", focusRotationAtPointer, true);
+      renderer.domElement.removeEventListener("pointerdown", recordPointerDown, true);
       renderer.domElement.removeEventListener("pointerup", pickFeature);
       controls.dispose();
       renderer.dispose();
@@ -1433,6 +1689,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       pmremGenerator.dispose();
       model?.geometry.dispose();
       (model?.material as THREE.Material | undefined)?.dispose();
+      for (const snapshot of materialSnapshotMeshes) {
+        snapshot?.geometry.dispose();
+        (snapshot?.material as THREE.Material | undefined)?.dispose();
+      }
       formingActuator?.geometry.dispose();
       (formingActuator?.material as THREE.Material | undefined)?.dispose();
       formingStock?.geometry.dispose();
@@ -1449,6 +1709,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       (simulationLowerMesh?.material as THREE.Material | undefined)?.dispose();
       simulationWalls?.geometry.dispose();
       (simulationWalls?.material as THREE.Material | undefined)?.dispose();
+      turningBeforeMesh?.geometry.dispose();
+      (turningBeforeMesh?.material as THREE.Material | undefined)?.dispose();
+      turningAfterMesh?.geometry.dispose();
+      (turningAfterMesh?.material as THREE.Material | undefined)?.dispose();
       camoticsMesh?.geometry.dispose();
       (camoticsMesh?.material as THREE.Material | undefined)?.dispose();
       playbackCutter?.geometry.dispose();
@@ -1484,7 +1748,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       host.removeChild(renderer.domElement);
       axisHost.removeChild(axisRenderer.domElement);
     };
-  }, [activeOperationId, animateToolpath, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, modelUrl, operationTools, profileBoundaries, simulation, spatialDefects, toolpathSegments, topologyEdges, viewMode, workAxis]);
+  }, [activeOperationId, animateToolpath, cameraContentKey, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, materialSnapshotUrls, modelUrl, operationTools, profileBoundaries, simulation, spatialDefects, toolpathLoaded, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
   const activeFormingStage = formingPreview?.stages.length
@@ -1518,8 +1782,9 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     ? spatialDefects?.regions.find((region) => region.id === activeDefect.id) ?? null
     : null;
   const modeClass = { "特征": "features", "工艺": "process", "刀路": "toolpath", "仿真": "simulation" }[viewMode];
-  const modeTitle = { "特征": "特征识别", "工艺": "工艺规划", "刀路": "刀路结果", "仿真": "加工仿真" }[viewMode];
-  const modeDetail = viewMode === "特征"
+  const modeTitle = simulationBlocked ? "原始零件" : { "特征": "特征识别", "工艺": "工艺规划", "刀路": "刀路结果", "仿真": "加工仿真" }[viewMode];
+  const modeDetail = simulationBlocked ? "整件结果未通过检查，当前显示原始 3D"
+    : viewMode === "特征"
     ? `${features.length} 个制造特征 · 点击彩色区域查看`
     : viewMode === "工艺"
       ? activeOperationId ? `${activeOperationId} · ${activeOperationLabel || "当前工序"}` : "请选择一道工序"

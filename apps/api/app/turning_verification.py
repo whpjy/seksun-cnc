@@ -41,19 +41,11 @@ class TurningVerificationResult(BaseModel):
 
 
 def _profile_nodes(profile: RotationalProfile) -> list[tuple[float, float]]:
-    grouped: list[tuple[float, list[float]]] = []
-    for point in profile.points:
-        if grouped and abs(grouped[-1][0] - point.z) <= 1e-9:
-            grouped[-1][1].append(point.radius)
-        else:
-            grouped.append((point.z, [point.radius]))
-    # A radial shoulder has two radii at the same axial plane. The plane has
-    # zero volume; selecting the material-side radius avoids false overcut at
-    # the one discrete sample that lands exactly on it.
-    return [
-        (z_value, max(radii) if profile.side == "outer" else min(radii))
-        for z_value, radii in grouped
-    ]
+    # Keep both radii at a zero-width shoulder. Collapsing them to one radius
+    # turns the next cylindrical land into a false taper during interpolation.
+    # The exact shoulder plane has zero volume, so retaining the source order
+    # is both geometrically faithful and stable for volume verification.
+    return [(point.z, point.radius) for point in profile.points]
 
 
 def _interpolate(nodes: list[tuple[float, float]], z_value: float) -> float:
@@ -85,9 +77,18 @@ def verify_turning_profile(
 
     nodes = _profile_nodes(profile)
     z_min, z_max = nodes[0][0], nodes[-1][0]
+    shoulder_planes = {
+        left[0] for left, right in zip(nodes, nodes[1:])
+        if abs(left[0] - right[0]) <= 1e-9 and abs(left[1] - right[1]) > 1e-9
+    }
     evaluated: list[tuple[float, float, float]] = []
     for sample in simulation.samples:
         if sample.z < z_min - 1e-9 or sample.z > z_max + 1e-9:
+            continue
+        # A radial shoulder has two valid radii on one zero-volume plane. A
+        # one-dimensional stock sample cannot represent both, so the plane is
+        # excluded while both adjacent lands remain fully verified.
+        if any(abs(sample.z - plane) <= 1e-9 for plane in shoulder_planes):
             continue
         target = _interpolate(nodes, sample.z)
         actual = sample.outer_radius if profile.side == "outer" else sample.inner_radius

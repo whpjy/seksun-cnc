@@ -41,6 +41,37 @@ def test_external_front_turning_profile_is_reachable() -> None:
     assert all(item.status == "passed" for item in result.checks)
 
 
+def test_positive_z_outer_turning_requires_left_hand_tool() -> None:
+    front_form = profile("outer", [(1.15, 10), (1.25, 2), (3, 0.5)])
+
+    accepted = assess_turning_reachability(
+        operation("TURN-OD-L-MICRO-F"),
+        front_form,
+        context(cut_direction="positive_z"),
+    )
+    rejected = assess_turning_reachability(
+        operation("TURN-OD-F"),
+        front_form,
+        context(cut_direction="positive_z"),
+    )
+
+    assert accepted.status == "passed"
+    assert rejected.status == "failed"
+    check = next(item for item in rejected.checks if item.id == "cut_direction_tool_hand")
+    assert check.status == "failed"
+
+
+def test_front_chamfer_may_increase_to_body_diameter_before_longitudinal_cut() -> None:
+    result = assess_turning_reachability(
+        operation("TURN-OD-F"),
+        profile("outer", [(-20, 5), (-2, 10), (0, 8)]),
+        context(),
+    )
+
+    assert result.status == "passed"
+    assert next(item for item in result.checks if item.id == "profile_undercut").status == "passed"
+
+
 def test_hidden_external_undercut_is_blocked_for_standard_longitudinal_tool() -> None:
     result = assess_turning_reachability(
         operation("TURN-OD-F"),
@@ -50,6 +81,19 @@ def test_hidden_external_undercut_is_blocked_for_standard_longitudinal_tool() ->
 
     assert result.status == "failed"
     assert next(item for item in result.checks if item.id == "profile_undercut").status == "failed"
+
+
+def test_dedicated_external_groove_is_not_treated_as_longitudinal_undercut() -> None:
+    result = assess_turning_reachability(
+        operation("TURN-OD-F"),
+        profile("outer", [
+            (-3, 5), (-2, 5), (-2, 3), (-1, 3), (-1, 5), (0, 5),
+        ]),
+        context(),
+    )
+
+    assert result.status == "passed"
+    assert next(item for item in result.checks if item.id == "profile_undercut").status == "passed"
 
 
 def test_wrong_tool_side_is_blocked() -> None:

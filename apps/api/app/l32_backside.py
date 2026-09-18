@@ -6,7 +6,10 @@ from pydantic import BaseModel, Field, model_validator
 
 from .machine_models import MachineConfigurationSnapshot
 from .models import Operation
-from .rotational_features import RotationalProfile, RotationalProfilePoint
+from .rotational_features import (
+    RotationalProfile, RotationalProfilePoint,
+    clip_rotational_profile, suppress_external_grooves,
+)
 from .turning_draft import TurningDraftRequest, TurningDraftResult, compile_turning_draft
 
 
@@ -32,8 +35,8 @@ class BacksideDraftRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_back_operation(self) -> "BacksideDraftRequest":
-        if self.operation.type not in {"turn_facing", "turn_od_finishing"}:
-            raise ValueError("backside draft currently supports facing and local OD cleanup")
+        if self.operation.type not in {"turn_facing", "turn_od_roughing", "turn_od_finishing"}:
+            raise ValueError("backside draft currently supports facing and OD contour turning")
         if self.operation.channel_id != "sub" or self.operation.spindle_id != "sub":
             raise ValueError("backside operation must be assigned to the sub channel and sub spindle")
         if self.operation.workpiece_side != "back":
@@ -101,13 +104,31 @@ def compile_backside_draft(
 ) -> BacksideDraftResult:
     if "back_turning" not in snapshot.validation.capabilities:
         raise ValueError("machine configuration lacks capability: back_turning")
+    region_minimum = request.operation.parameters.get("source_region_z_min_mm")
+    region_maximum = request.operation.parameters.get("source_region_z_max_mm")
+    if (region_minimum is None) != (region_maximum is None):
+        raise ValueError("backside source region requires both Z bounds")
+    regional = region_minimum is not None
+    if regional:
+        if request.operation.type not in {"turn_od_roughing", "turn_od_finishing"}:
+            raise ValueError("backside source region requires an OD contour operation")
+        if request.operation.parameters.get("cut_direction", "negative_z") != "negative_z":
+            raise ValueError("backside region must feed into the part in negative sub-spindle Z")
+        if abs(float(region_minimum) - request.source_cutoff_z_mm) > 1e-6:
+            raise ValueError("backside source region must begin at the cutoff datum")
+        base_profile = suppress_external_grooves(source_profile)
+        source_region = clip_rotational_profile(
+            base_profile, float(region_minimum), float(region_maximum),
+        )
+    else:
+        source_region = source_profile
     cleanup_length = (
         float(request.operation.parameters.get("back_cleanup_length_mm", 1.0))
-        if request.operation.type == "turn_od_finishing"
+        if request.operation.type == "turn_od_finishing" and not regional
         else None
     )
     transform, profile = derive_backside_profile(
-        source_profile, request.source_cutoff_z_mm,
+        source_region, request.source_cutoff_z_mm,
         cleanup_length_mm=cleanup_length,
     )
     if profile.id not in request.operation.feature_ids:

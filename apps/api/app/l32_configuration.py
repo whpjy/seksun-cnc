@@ -44,7 +44,7 @@ L32_DEFINITION = MachineDefinition(
         ),
     ],
     spindles=[
-        SpindleDefinition(id="main", name="正面主轴", channel_id="main", role="work", maximum_rpm=8000, motor_kw=[3.7, 7.5]),
+        SpindleDefinition(id="main", name="正面主轴", channel_id="main", role="work", maximum_rpm=8000, motor_kw=[3.7, 7.5], standard_indexing_increment_degrees=1, continuous_c_axis_option_id="continuous_c_axis"),
         SpindleDefinition(id="sub", name="背面主轴", channel_id="sub", role="work", maximum_rpm=8000, motor_kw=[2.2, 3.7]),
         SpindleDefinition(id="gang_live", name="排刀旋转刀具", channel_id="main", role="live_tool", maximum_rpm=6000, rated_rpm=4500, motor_kw=[1.0]),
         SpindleDefinition(id="sub_live", name="背面旋转刀具", channel_id="sub", role="live_tool", maximum_rpm=6000, rated_rpm=3000, motor_kw=[1.0]),
@@ -125,7 +125,9 @@ def validate_l32_instance(instance: MachineInstance) -> MachineConfigurationVali
             "尚未绑定并认证 L32 后处理器，仅允许生成 CAM 草案",
         ))
 
-    base_capabilities = {"turning", "grooving_cutoff", "threading_tapping", "axial_drilling"}
+    base_capabilities = {"turning", "grooving_cutoff", "threading_tapping", "axial_drilling", "main_spindle_indexing_1deg"}
+    if "continuous_c_axis" in instance.enabled_options:
+        base_capabilities.add("continuous_c_axis")
     capabilities = sorted(base_capabilities | {capability for module in selected_modules for capability in module.capabilities})
     blocking = any(item.severity == "blocking" for item in issues)
     production_blocking_codes = {
@@ -161,4 +163,33 @@ def l32_definition_payload() -> dict[str, object]:
     return {
         "schema_version": "1.0.0",
         "definition": L32_DEFINITION.model_dump(mode="json"),
+    }
+
+
+def l32_viii_live_tool_catalog_reference() -> dict[str, object]:
+    """A read-only catalog scenario, never a registered or bound shop machine."""
+    reference = MachineInstance(
+        id="catalog-viii-u30b-u151b",
+        definition_id=L32_DEFINITION.id,
+        name="L32 VIII + U30B + U151B catalog reference",
+        variant="VIII",
+        operation_mode="guide_bushing",
+        installed_modules=["U30B", "U151B"],
+        enabled_options=[],
+        bar_diameter_mm=32,
+    )
+    validation = validate_l32_instance(reference)
+    return {
+        "catalog_only": True,
+        "bindable": False,
+        "source_document": L32_DEFINITION.source_document,
+        "source_revision": L32_DEFINITION.source_revision,
+        "variant": reference.variant,
+        "modules": reference.installed_modules,
+        "standard_main_spindle_indexing_degrees": 1,
+        "continuous_c_axis_assumed": False,
+        "capabilities": validation.capabilities,
+        "configuration_valid": validation.valid,
+        "production_ready": False,
+        "unconfirmed": ["physical_module_installation", "tool_station_mapping", "tool_holder_clearance", "controller_revision", "postprocessor"],
     }

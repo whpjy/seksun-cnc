@@ -5,18 +5,23 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .l32_backside import BacksideDraftRequest, compile_backside_draft
+from .l32_backside_chain import (
+    BacksideChainDraftRequest, compile_backside_chain_draft,
+)
+from .l32_front_chain import FrontChainDraftRequest, compile_front_chain_draft
 from .channel_timeline import ChannelTimelineResult, schedule_channel_timeline
 from .continuous_turning_simulation import (
-    ContinuousTurningSimulationResult, simulate_continuous_whole_part,
+    ContinuousMaterialCheck, ContinuousTurningSimulationResult, simulate_continuous_whole_part,
 )
 from .machine_models import MachineConfigurationSnapshot
 from .models import Operation, ProcessPlan
-from .rotational_features import RotationalProfile
+from .rotational_features import RotationalProfile, clip_rotational_profile
 from .toolpath_ir import ToolpathChannel, ToolpathCommand, ToolpathProgram, toolpath_program_hash
 from .turning_draft import TurningDraftRequest, compile_turning_draft
+from .turning_verification import verify_turning_profile
 from .turning_transfer import (
     TurningTransferDraftRequest, WorkpieceTransferState,
-    compile_synchronized_transfer_draft,
+    compile_synchronized_transfer_draft, cutoff_kerf_intrusion_mm,
 )
 
 
@@ -97,7 +102,11 @@ def compile_whole_part_draft(
     snapshot: MachineConfigurationSnapshot,
 ) -> WholePartDraftResult:
     operations = _operation_map(plan)
-    required_ids = ["OP10", "OP20", "OP30", "OP40", "OP50", "OP60"]
+    has_front_form = all(item in operations for item in ("OP21-FORM", "OP31-FORM"))
+    has_back_region = all(item in operations for item in ("OP55-BACK", "OP58-BACK"))
+    required_ids = ["OP10", "OP20", "OP30", "OP40", "OP50"]
+    required_ids.extend(["OP21-FORM", "OP31-FORM"] if has_front_form else [])
+    required_ids.extend(["OP55-BACK", "OP58-BACK"] if has_back_region else ["OP60"])
     missing = [operation_id for operation_id in required_ids if operation_id not in operations]
     disabled = [operation_id for operation_id in required_ids if operation_id in operations and not operations[operation_id].enabled]
     if missing:
@@ -108,12 +117,17 @@ def compile_whole_part_draft(
         raise ValueError("formal L32 rotational profile must be accepted")
     if source_profile.id != request.source_profile_id or source_profile.review_state != "accepted":
         raise ValueError("whole-part draft requires the accepted source profile")
-
+    kerf_intrusion = cutoff_kerf_intrusion_mm(operations["OP40"], source_profile)
+    if kerf_intrusion > 0.05:
+        raise ValueError(
+            f"cutoff kerf overlaps the accepted finished profile by {kerf_intrusion:.3f} mm; "
+            "add sacrificial stock and redefine the cutoff/sub-spindle datum before whole-part DRAFT"
+        )
     z_values = [point.z for point in source_profile.points]
     z_min = min(z_values) - 2
     z_max = max(z_values) + 2
     front_results = []
-    for operation_id in ["OP10", "OP20", "OP30"]:
+    for operation_id in ["OP10", *([] if has_front_form else ["OP20", "OP30"])]:
         front_results.append(compile_turning_draft(
             job_id,
             TurningDraftRequest(
@@ -128,6 +142,18 @@ def compile_whole_part_draft(
             ),
             snapshot,
         ))
+    front_chain = (
+        compile_front_chain_draft(
+            job_id,
+            FrontChainDraftRequest(
+                machine_instance_id=request.machine_instance_id,
+                source_profile_id=source_profile.id,
+                stock_radius_mm=request.stock_radius_mm,
+                resolution_mm=request.resolution_mm,
+            ),
+            plan, source_profile, snapshot,
+        ) if has_front_form else None
+    )
 
     transfer = compile_synchronized_transfer_draft(
         job_id,
@@ -150,28 +176,47 @@ def compile_whole_part_draft(
     )
 
     cutoff_z = float(operations["OP40"].parameters["z_mm"])
+    finished_back_datum_z = float(operations["OP40"].parameters.get(
+        "finished_back_datum_z_mm", cutoff_z,
+    ))
     finished_radius = max(point.radius for point in source_profile.points)
     backside_stock_radius = min(request.stock_radius_mm, finished_radius + 0.2)
     backside_results = []
-    for operation_id in ["OP50", "OP60"]:
+    for operation_id in ["OP50", *([] if has_back_region else ["OP60"])]:
         backside_results.append(compile_backside_draft(
             job_id,
             BacksideDraftRequest(
                 machine_instance_id=request.machine_instance_id,
                 source_profile_id=source_profile.id,
                 operation=operations[operation_id],
-                source_cutoff_z_mm=cutoff_z,
+                source_cutoff_z_mm=finished_back_datum_z,
                 stock_radius_mm=backside_stock_radius,
                 resolution_mm=request.resolution_mm,
             ),
             source_profile,
             snapshot,
         ))
+    backside_chain = (
+        compile_backside_chain_draft(
+            job_id,
+            BacksideChainDraftRequest(
+                machine_instance_id=request.machine_instance_id,
+                source_profile_id=source_profile.id,
+                stock_radius_mm=backside_stock_radius,
+                resolution_mm=request.resolution_mm,
+            ),
+            plan, source_profile, snapshot,
+        ) if has_back_region else None
+    )
 
     main_groups = [result.toolpath.channels[0].commands for result in front_results]
+    if front_chain is not None:
+        main_groups.append(front_chain.toolpath.channels[0].commands)
     main_groups.append(next(channel.commands for channel in transfer.toolpath.channels if channel.id == "main"))
     sub_groups = [next(channel.commands for channel in transfer.toolpath.channels if channel.id == "sub")]
     sub_groups.extend(result.draft.toolpath.channels[0].commands for result in backside_results)
+    if backside_chain is not None:
+        sub_groups.append(backside_chain.toolpath.channels[0].commands)
     main_commands = _renumber([command for group in main_groups for command in group], "main")
     sub_commands = _renumber([command for group in sub_groups for command in group], "sub")
     toolpath = ToolpathProgram(
@@ -190,9 +235,42 @@ def compile_whole_part_draft(
         initial_bore_radius_mm=request.initial_bore_radius_mm,
         main_z_min_mm=z_min,
         main_z_max_mm=z_max,
-        transfer_datum_z_mm=cutoff_z,
+        transfer_datum_z_mm=finished_back_datum_z,
         resolution_mm=request.resolution_mm,
     )
+    if front_chain is not None:
+        for operation_id, label in (
+            ("OP30", "主纵车"), ("OP31-FORM", "前端成形"),
+        ):
+            operation = operations[operation_id]
+            target = clip_rotational_profile(
+                source_profile,
+                float(operation.parameters["profile_z_min_mm"]),
+                float(operation.parameters["profile_z_max_mm"]),
+            )
+            verification = verify_turning_profile(
+                target, continuous_simulation.main_frame_after_cutoff, tolerance_mm=0.05,
+            )
+            continuous_simulation.checks.append(ContinuousMaterialCheck(
+                id=f"{operation_id.lower()}_final_profile",
+                status="passed" if verification.status == "passed" else "failed",
+                message=f"{label}区域在接料切断后必须保持最终轮廓",
+                measured_value=verification.metrics.maximum_overcut_mm,
+            ))
+    if backside_chain is not None:
+        verification = verify_turning_profile(
+            backside_chain.derived_profile,
+            continuous_simulation.sub_frame_final,
+            tolerance_mm=0.05,
+        )
+        continuous_simulation.checks.append(ContinuousMaterialCheck(
+            id="op58_back_final_profile",
+            status="passed" if verification.status == "passed" else "failed",
+            message="背面区域在接料、端面和粗精车后必须满足最终轮廓",
+            measured_value=verification.metrics.maximum_overcut_mm,
+        ))
+    if any(item.status == "failed" for item in continuous_simulation.checks):
+        continuous_simulation.status = "failed"
     if continuous_simulation.status == "failed":
         failures = [
             item.message for item in continuous_simulation.checks if item.status == "failed"
@@ -210,15 +288,33 @@ def compile_whole_part_draft(
             verification_status=_verification_status(result),
         ))
         main_cursor += count
+    if front_chain is not None:
+        for item in front_chain.stages:
+            operation = operations[item.operation_id]
+            stages.append(WholePartStage(
+                sequence=len(stages) + 1,
+                operation_id=operation.id,
+                operation_name=operation.name,
+                channel_id="main",
+                phase="front_turning",
+                command_start=main_cursor,
+                command_end=main_cursor + item.command_count - 1,
+                command_count=item.command_count,
+                verification_status=item.verification_status,
+            ))
+            main_cursor += item.command_count
     transfer_count = len(next(channel.commands for channel in transfer.toolpath.channels if channel.id == "main"))
     stages.append(WholePartStage(
-        sequence=4, operation_id="OP40", operation_name=operations["OP40"].name,
+        sequence=len(stages) + 1, operation_id="OP40", operation_name=operations["OP40"].name,
         channel_id="main", phase="synchronized_transfer", command_start=main_cursor,
         command_end=main_cursor + transfer_count - 1, command_count=transfer_count,
         verification_status=_verification_status(transfer),
     ))
     sub_cursor = len(next(channel.commands for channel in transfer.toolpath.channels if channel.id == "sub")) + 1
-    for operation, result in zip((operations[item] for item in ["OP50", "OP60"]), backside_results):
+    backside_stage_ids = ["OP50"] if has_back_region else ["OP50", "OP60"]
+    for operation, result in zip(
+        (operations[item] for item in backside_stage_ids), backside_results,
+    ):
         count = len(result.draft.toolpath.channels[0].commands)
         stages.append(WholePartStage(
             sequence=len(stages) + 1, operation_id=operation.id, operation_name=operation.name,
@@ -227,12 +323,29 @@ def compile_whole_part_draft(
             verification_status=_verification_status(result.draft),
         ))
         sub_cursor += count
+    if backside_chain is not None:
+        for item in backside_chain.stages:
+            operation = operations[item.operation_id]
+            stages.append(WholePartStage(
+                sequence=len(stages) + 1,
+                operation_id=operation.id,
+                operation_name=operation.name,
+                channel_id="sub",
+                phase="back_turning",
+                command_start=sub_cursor,
+                command_end=sub_cursor + item.command_count - 1,
+                command_count=item.command_count,
+                verification_status=item.verification_status,
+            ))
+            sub_cursor += item.command_count
 
     warnings = list(dict.fromkeys([
         *(warning for result in front_results for warning in result.warnings),
         *transfer.warnings,
         *(warning for result in backside_results for warning in result.warnings),
-        "整件程序仅完成控制器无关的工序与同步编排；各阶段仿真尚未合并为跨坐标系连续材料状态。",
+        *(front_chain.warnings if front_chain is not None else []),
+        *(backside_chain.warnings if backside_chain is not None else []),
+        "整件程序已合并轴对称跨坐标系连续材料状态；仍未替代三维机床运动学与碰撞验证。",
         "不得将本草案直接转换或发送到机床，必须完成后处理器映射、机床级仿真、干运行和首件验证。",
     ]))
     return WholePartDraftResult(
@@ -248,7 +361,7 @@ def compile_whole_part_draft(
             ),
             WholePartCoordinateFrame(
                 channel_id="sub", spindle_id="sub", datum="OP40 cutoff plane",
-                z_scale_from_main=-1, source_cutoff_z_mm=cutoff_z,
+                z_scale_from_main=-1, source_cutoff_z_mm=finished_back_datum_z,
             ),
         ],
         stages=stages,

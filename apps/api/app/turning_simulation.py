@@ -42,11 +42,12 @@ def _indices_between(z_values: list[float], start: float, end: float, half_width
     minimum, maximum = sorted((start, end))
     minimum -= half_width
     maximum += half_width
-    matches = [index for index, value in enumerate(z_values) if minimum - 1e-9 <= value <= maximum + 1e-9]
-    if matches:
-        return matches
-    midpoint = (minimum + maximum) / 2
-    return [min(range(len(z_values)), key=lambda index: abs(z_values[index] - midpoint))]
+    # Never map a narrow cut to a sample outside its programmed axial extent:
+    # at a steep shoulder that invents material removal on the protected side.
+    return [
+        index for index, value in enumerate(z_values)
+        if minimum - 1e-9 <= value <= maximum + 1e-9
+    ]
 
 
 def _sweep_nose_circle(

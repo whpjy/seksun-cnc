@@ -7,7 +7,9 @@ from app.machine_models import MachineInstance
 from app.models import GeometryAnalysis, JobResponse, Operation
 from app.rotational_features import RotationalFeatureAnalysis, RotationalProfile, RotationalProfilePoint
 from app.turning_draft import TurningDraftRequest, compile_turning_draft
-from app.turning_transfer import TurningTransferDraftRequest, compile_synchronized_transfer_draft
+from app.turning_transfer import (
+    TurningTransferDraftRequest, compile_synchronized_transfer_draft, cutoff_kerf_intrusion_mm,
+)
 
 
 client = TestClient(main.app)
@@ -157,6 +159,106 @@ def test_compile_turning_draft_is_controller_neutral_and_never_releases_nc() -> 
     assert any("未生成 NC" in warning for warning in result.warnings)
 
 
+def test_compile_turning_draft_limits_toolpath_to_declared_front_region() -> None:
+    profile = RotationalProfile(
+        id="RP-1", axis_id="RA-1", side="outer", extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=-20, radius=9),
+            RotationalProfilePoint(z=-10, radius=5),
+            RotationalProfilePoint(z=0, radius=10),
+        ],
+        confidence=1, review_state="accepted",
+    )
+    operation = _operation()
+    operation.parameters.update({
+        "cut_direction": "negative_z",
+        "profile_z_min_mm": -10,
+        "profile_z_max_mm": 0,
+        "profile_region_complete": False,
+    })
+
+    result = compile_turning_draft(
+        "a" * 32,
+        _request(
+            operation=operation,
+            profile=profile,
+            z_min_mm=-22,
+            z_max_mm=2,
+        ),
+        _snapshot(),
+    )
+
+    feed_z = [
+        command.axes["Z"]
+        for command in result.toolpath.channels[0].commands
+        if command.type == "feed_move" and "Z" in command.axes
+    ]
+    assert result.reachability is not None
+    assert result.reachability.status == "passed"
+    assert feed_z
+    assert min(feed_z) >= -10 - operation.tool.nose_radius_mm
+    assert max(feed_z) <= operation.tool.nose_radius_mm
+    assert result.verification is not None
+
+
+def test_regional_draft_rejects_oversized_nose_and_detected_overcut() -> None:
+    profile = RotationalProfile(
+        id="RP-1", axis_id="RA-1", side="outer", extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=1.15, radius=10.05),
+            RotationalProfilePoint(z=1.216667, radius=2),
+            RotationalProfilePoint(z=3.05, radius=0.5),
+        ],
+        confidence=1, review_state="accepted",
+    )
+    operation = _operation()
+    operation.tool = get_tool("TURN-OD-L-MICRO-F")
+    operation.tool.nose_radius_mm = 0.8
+    operation.parameters.update({
+        "cut_direction": "positive_z",
+        "profile_z_min_mm": 1.15,
+        "profile_z_max_mm": 3.05,
+        "profile_region_complete": False,
+        "maximum_finish_nose_radius_mm": 0.2,
+    })
+    request = _request(
+        operation=operation, profile=profile,
+        z_min_mm=-1, z_max_mm=5, resolution_mm=0.1,
+    )
+
+    try:
+        compile_turning_draft("a" * 32, request, _snapshot())
+    except ValueError as error:
+        assert "permitted nose radius" in str(error)
+    else:
+        raise AssertionError("oversized tool nose must be blocked")
+
+    del operation.parameters["maximum_finish_nose_radius_mm"]
+    request = _request(
+        operation=operation, profile=profile,
+        z_min_mm=-1, z_max_mm=5, resolution_mm=0.1,
+    )
+    try:
+        compile_turning_draft("a" * 32, request, _snapshot())
+    except ValueError as error:
+        assert "regional turning DRAFT verification failed" in str(error)
+    else:
+        raise AssertionError("regional overcut must be blocked")
+
+
+def test_cutoff_draft_does_not_claim_whole_profile_verification() -> None:
+    result = compile_turning_draft(
+        "a" * 32,
+        _request(operation=_cutoff_operation()),
+        _snapshot(),
+    )
+
+    assert result.release_status == "DRAFT"
+    assert result.nc_generated is False
+    assert result.verification is None
+    assert result.reachability is not None
+
+
 def test_compile_turning_draft_rejects_unaccepted_profile_and_oversize_stock() -> None:
     try:
         compile_turning_draft("a" * 32, _request(profile=_profile("review")), _snapshot())
@@ -191,6 +293,7 @@ def test_compile_synchronized_transfer_pairs_barriers_across_two_channels() -> N
 
     assert result.release_status == "DRAFT"
     assert result.nc_generated is False
+    assert any("切断刀缝侵入已确认成品轮廓 1.000 mm" in item for item in result.warnings)
     assert [channel.id for channel in result.toolpath.channels] == ["main", "sub"]
     barrier_sets = [
         {str(command.parameters["barrier_id"]) for command in channel.commands if command.type == "sync_barrier"}
@@ -204,6 +307,13 @@ def test_compile_synchronized_transfer_pairs_barriers_across_two_channels() -> N
         "main_spindle_held", "dual_spindle_clamped", "phase_synchronized",
         "part_separated", "sub_spindle_held",
     ]
+
+
+def test_cutoff_kerf_intrusion_requires_sacrificial_stock_outside_profile() -> None:
+    operation = _cutoff_operation()
+    assert cutoff_kerf_intrusion_mm(operation, _profile()) == 1
+    operation.parameters["z_mm"] = -31.1
+    assert cutoff_kerf_intrusion_mm(operation, _profile()) == 0
 
 
 def test_turning_draft_api_persists_reviewable_artifacts_without_nc(tmp_path, monkeypatch) -> None:

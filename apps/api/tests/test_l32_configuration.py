@@ -1,10 +1,12 @@
+import json
+
 from fastapi.testclient import TestClient
 
 from app import main
 from app.l32_configuration import L32_DEFINITION, snapshot_l32_instance, validate_l32_instance
 from app.machine_models import MachineInstance
 from app.main import app
-from app.models import JobResponse
+from app.models import JobResponse, ProcessPlan
 
 
 client = TestClient(app)
@@ -37,6 +39,37 @@ def test_l32_definition_derives_axes_for_all_four_variants() -> None:
     assert "B" in variants["IX"].enabled_axes
     assert "Y2" in variants["X"].enabled_axes
     assert {"B", "Y2"} <= set(variants["XII"].enabled_axes)
+
+
+def test_catalog_live_tool_reference_is_not_a_bound_machine(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+
+    response = client.get("/api/v1/machines/l32/catalog-reference/viii-u30b-u151b")
+
+    assert response.status_code == 200
+    reference = response.json()
+    assert reference["catalog_only"] is True
+    assert reference["bindable"] is False
+    assert reference["modules"] == ["U30B", "U151B"]
+    assert reference["standard_main_spindle_indexing_degrees"] == 1
+    assert reference["continuous_c_axis_assumed"] is False
+    assert reference["configuration_valid"] is True
+    assert reference["production_ready"] is False
+    assert {"live_tool_milling", "back_live_tool_milling", "main_spindle_indexing_1deg"} <= set(reference["capabilities"])
+    assert "continuous_c_axis" not in reference["capabilities"]
+    assert not (tmp_path / ".machine-instances").exists()
+
+
+def test_continuous_c_axis_requires_explicit_option() -> None:
+    standard = validate_l32_instance(instance(variant="VIII", installed_modules=["U30B", "U151B"]))
+    optional = validate_l32_instance(instance(
+        variant="VIII", installed_modules=["U30B", "U151B"],
+        enabled_options=["continuous_c_axis"],
+    ))
+
+    assert "main_spindle_indexing_1deg" in standard.capabilities
+    assert "continuous_c_axis" not in standard.capabilities
+    assert "continuous_c_axis" in optional.capabilities
 
 
 def test_public_device_record_is_derived_from_machine_definition() -> None:
@@ -141,3 +174,45 @@ def test_l32_instance_can_be_bound_to_job_as_immutable_snapshot(tmp_path, monkey
     assert loaded.status_code == 200
     assert loaded.json()["configuration_hash"] == created.json()["configuration_hash"]
     assert (directory / "machine-configuration.json").is_file()
+
+
+def test_default_l32_planning_instance_is_created_for_unbound_job(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "a" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    plan = ProcessPlan(
+        title="L32 test plan",
+        material="S45C",
+        machine="Citizen Cincom L32",
+        stock={"diameter_mm": 32, "length_mm": 60},
+        setups=[],
+        warnings=[],
+        assumptions=[],
+        estimated_minutes=0,
+    )
+    main.save_job(directory, JobResponse(
+        id=job_id,
+        status="completed",
+        filename="shaft.step",
+        created_at=main.utc_now(),
+        material="S45C",
+        machine="Citizen Cincom L32",
+        device_id="citizen-cincom-l32",
+        plan=plan,
+    ))
+
+    created = client.post(f"/api/v1/jobs/{job_id}/machine-instance/default")
+    repeated = client.post(f"/api/v1/jobs/{job_id}/machine-instance/default")
+
+    assert created.status_code == 200
+    assert repeated.status_code == 200
+    payload = created.json()
+    assert payload["machine_instance_id"] == "l32-aaaaaaaa"
+    assert payload["machine_configuration_hash"] == repeated.json()["machine_configuration_hash"]
+    assert payload["plan"]["stock"]["machine_instance_id"] == "l32-aaaaaaaa"
+    snapshot = json.loads((directory / "machine-configuration.json").read_text(encoding="utf-8"))
+    assert snapshot["instance"]["variant"] == "VIII"
+    assert snapshot["instance"]["installed_modules"] == ["U30B", "U151B"]
+    assert {"turning", "live_tool_milling", "back_turning"} <= set(snapshot["validation"]["capabilities"])
+    assert (tmp_path / ".machine-instances" / "l32-aaaaaaaa.json").is_file()

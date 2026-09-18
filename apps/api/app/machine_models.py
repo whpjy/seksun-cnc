@@ -33,6 +33,8 @@ class SpindleDefinition(BaseModel):
     maximum_rpm: int = Field(gt=0)
     rated_rpm: int | None = Field(default=None, gt=0)
     motor_kw: list[float] = Field(default_factory=list)
+    standard_indexing_increment_degrees: float | None = Field(default=None, gt=0)
+    continuous_c_axis_option_id: str | None = None
 
 
 class MachineModuleDefinition(BaseModel):

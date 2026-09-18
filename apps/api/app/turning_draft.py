@@ -9,7 +9,7 @@ from cam.providers.turning import TurningContext, TurningProvider
 from .l32_configuration import L32_DEFINITION, snapshot_l32_instance
 from .machine_models import MachineConfigurationSnapshot
 from .models import Operation
-from .rotational_features import RotationalProfile
+from .rotational_features import RotationalProfile, clip_rotational_profile
 from .toolpath_ir import ToolpathProgram
 from .turning_simulation import TurningSimulationResult, simulate_turning_stock
 from .turning_verification import TurningVerificationResult, verify_turning_profile
@@ -113,6 +113,32 @@ def compile_turning_draft(
         if float(requested_rpm) > rpm_limit:
             raise ValueError(f"maximum_spindle_rpm exceeds configured spindle/tool limit: {rpm_limit}")
 
+    cut_direction = str(request.operation.parameters.get("cut_direction", "negative_z"))
+    if cut_direction not in {"negative_z", "positive_z"}:
+        raise ValueError("turning operation has an invalid cut direction")
+    if request.operation.type == "turn_od_finishing":
+        maximum_nose_radius = request.operation.parameters.get("maximum_finish_nose_radius_mm")
+        if maximum_nose_radius is not None and (
+            isinstance(maximum_nose_radius, bool)
+            or not isinstance(maximum_nose_radius, (int, float))
+            or float(request.operation.tool.nose_radius_mm or 0) > float(maximum_nose_radius) + 1e-9
+        ):
+            raise ValueError("OD finishing tool exceeds the permitted nose radius")
+    operation_profile = request.profile
+    if request.profile is not None and (
+        "profile_z_min_mm" in request.operation.parameters
+        or "profile_z_max_mm" in request.operation.parameters
+    ):
+        operation_profile = clip_rotational_profile(
+            request.profile,
+            float(request.operation.parameters.get(
+                "profile_z_min_mm", min(point.z for point in request.profile.points),
+            )),
+            float(request.operation.parameters.get(
+                "profile_z_max_mm", max(point.z for point in request.profile.points),
+            )),
+        )
+
     context = TurningContext(
         machine_snapshot_hash=snapshot.configuration_hash,
         stock_radius_mm=request.stock_radius_mm,
@@ -120,13 +146,14 @@ def compile_turning_draft(
         radial_clearance_mm=request.radial_clearance_mm,
         axial_clearance_mm=request.axial_clearance_mm,
         channel_id=spindle.channel_id,
+        cut_direction=cut_direction,
     )
     reachability = None
-    if request.profile is not None:
-        reachability = assess_turning_reachability(request.operation, request.profile, context)
+    if operation_profile is not None:
+        reachability = assess_turning_reachability(request.operation, operation_profile, context)
         if reachability.status == "failed":
             raise ValueError("turning tool is not reachable: " + "; ".join(reachability.blocking_reasons))
-    toolpath = TurningProvider().generate(request.operation, context, request.profile)
+    toolpath = TurningProvider().generate(request.operation, context, operation_profile)
     simulation = simulate_turning_stock(
         toolpath,
         stock_radius_mm=request.stock_radius_mm,
@@ -141,13 +168,22 @@ def compile_turning_draft(
         thread_verification = verify_threading_cycle(request.operation, toolpath, simulation)
         if thread_verification.status == "failed":
             raise ValueError("threading DRAFT verification failed")
-    elif request.profile is not None:
+    elif operation_profile is not None and request.operation.type in {
+        "turn_od_roughing", "turn_od_finishing",
+        "turn_id_roughing", "turn_id_finishing",
+        "turn_grooving",
+    }:
         verification = verify_turning_profile(
-            request.profile,
+            operation_profile,
             simulation,
             tolerance_mm=0.05,
             expected_allowance_mm=float(request.operation.parameters.get("radial_allowance_mm", 0)),
         )
+        if (
+            request.operation.parameters.get("profile_region_complete") is False
+            and verification.status == "failed"
+        ):
+            raise ValueError("regional turning DRAFT verification failed: profile overcut")
     warnings = [
         "仅供 CAM 适配验证，未生成 NC，禁止直接用于机床生产。",
         "MELDAS/CINCOM 后处理器、通道同步、刀具补偿和机床碰撞尚未认证。",

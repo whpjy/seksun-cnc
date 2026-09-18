@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.benchmarks import discover_example_cases, example_catalog_payload
+from app.groove_binding import assess_case_grooves
 from app.models import GeometryAnalysis
 from app.planner import build_process_plan
 from app.recognizer import normalize_manufacturing_features
@@ -160,6 +161,7 @@ def evaluate_case(
             "evidence": rotational.evidence,
             "warnings": rotational.warnings,
         }
+        result["grooves"] = assess_case_grooves(case, rotational.features)
         result["expectation"] = assess_expectation(case, result)
     return result
 
@@ -190,9 +192,12 @@ def main() -> int:
         if isinstance(item.get("expectation"), dict)
         and item["expectation"].get("status") != "not_defined"
     ]
+    groove_assessments = [
+        item["grooves"] for item in completed if isinstance(item.get("grooves"), dict)
+    ]
     catalog = example_catalog_payload(arguments.root, arguments.manifest)
     report = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "created_at": datetime.now(UTC).isoformat(),
         "root": str(arguments.root),
         "manifest": catalog.get("manifest"),
@@ -209,6 +214,26 @@ def main() -> int:
             "paired_case_count": sum(bool(item.get("paired")) for item in results),
             "expectation_passed_count": sum(item.get("status") == "passed" for item in expectations),
             "expectation_failed_count": sum(item.get("status") == "failed" for item in expectations),
+            "groove_required_case_count": sum(
+                item.get("status") != "not_required" for item in groove_assessments
+            ),
+            "groove_matched_case_count": sum(
+                item.get("status") == "matched" for item in groove_assessments
+            ),
+            "groove_ambiguous_case_count": sum(
+                item.get("status") == "ambiguous" for item in groove_assessments
+            ),
+            "groove_missing_case_count": sum(
+                item.get("status") == "missing" for item in groove_assessments
+            ),
+            "external_groove_candidate_count": sum(
+                int((item.get("summary") or {}).get("external_candidate_count", 0))
+                for item in groove_assessments
+            ),
+            "internal_groove_candidate_count": sum(
+                int((item.get("summary") or {}).get("internal_candidate_count", 0))
+                for item in groove_assessments
+            ),
             "complete_coverage_count": sum(item["status"] == "complete" for item in coverages),
             "average_coverage_score": round(
                 sum(float(item["score"]) for item in coverages) / max(len(coverages), 1), 4,

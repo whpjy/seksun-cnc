@@ -64,6 +64,37 @@ def test_simulates_external_profile_removal_in_zr_space() -> None:
     assert result.metrics.remaining_volume_mm3 < result.metrics.initial_volume_mm3
 
 
+def test_positive_z_roughing_does_not_assign_narrow_cut_to_protected_shoulder() -> None:
+    profile = RotationalProfile(
+        id="RP-1", axis_id="RA-1", side="outer", extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=1.15, radius=10.05),
+            RotationalProfilePoint(z=1.216667, radius=2),
+            RotationalProfilePoint(z=3.05, radius=0.5),
+        ],
+        confidence=1, review_state="accepted",
+    )
+    program = TurningProvider().generate(
+        operation(
+            "turn_od_roughing", tool_id="TURN-OD-L-R",
+            radial_allowance_mm=0.3, depth_of_cut_mm=1,
+        ),
+        TurningContext(
+            machine_snapshot_hash="d" * 64, stock_radius_mm=11.25,
+            cut_direction="positive_z",
+        ),
+        profile,
+    )
+
+    result = simulate_turning_stock(
+        program, stock_radius_mm=11.25,
+        z_min_mm=1.15, z_max_mm=3.05, resolution_mm=0.1,
+    )
+
+    assert sample_at(result, 1.15).outer_radius == 11.25
+    assert sample_at(result, 1.25).outer_radius < 11.25
+
+
 def test_simulates_inner_profile_without_crossing_outer_stock() -> None:
     context = TurningContext(
         machine_snapshot_hash="e" * 64, stock_radius_mm=12,

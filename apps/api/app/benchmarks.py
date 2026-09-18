@@ -89,15 +89,20 @@ def _discover_manifest_cases(root: Path, manifest_path: Path) -> list[dict[str, 
 def discover_example_cases(
     root: Path | None = None, manifest: Path | None = None,
 ) -> list[dict[str, object]]:
-    root = root or example_root()
-    if not root.is_dir():
+    explicit_root = root is not None
+    resolved_root = root or example_root()
+    if not resolved_root.is_dir():
         return []
-    selected_manifest = manifest if manifest is not None else example_manifest()
+    selected_manifest = (
+        manifest if manifest is not None
+        else None if explicit_root
+        else example_manifest()
+    )
     if selected_manifest is not None:
-        return _discover_manifest_cases(root, selected_manifest)
+        return _discover_manifest_cases(resolved_root, selected_manifest)
     cases: list[dict[str, object]] = []
     directories = sorted(
-        (item for item in root.iterdir() if item.is_dir()),
+        (item for item in resolved_root.iterdir() if item.is_dir()),
         key=lambda item: (
             int(match.group(1)) if (match := re.match(r"(\d+)", item.name)) else 10_000,
             item.name.casefold(),
@@ -143,8 +148,13 @@ def discover_example_cases(
 def example_catalog_payload(
     root: Path | None = None, manifest: Path | None = None,
 ) -> dict[str, object]:
+    explicit_root = root is not None
     resolved = root or example_root()
-    selected_manifest = manifest if manifest is not None else example_manifest()
+    selected_manifest = (
+        manifest if manifest is not None
+        else None if explicit_root
+        else example_manifest()
+    )
     cases = discover_example_cases(resolved, selected_manifest)
     payload: dict[str, object] = {
         "schema_version": "1.0.0",

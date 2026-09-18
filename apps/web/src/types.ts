@@ -87,6 +87,21 @@ export type ToolpathSegment = {
   work_axis?: Vec3;
 };
 
+export type TurningStockSample = {
+  z: number;
+  outer_radius: number;
+  inner_radius: number;
+};
+
+export type TurningStageView = {
+  operation_id: string;
+  channel_id: "main" | "sub";
+  before_samples: TurningStockSample[];
+  after_samples: TurningStockSample[];
+  axis_origin: Vec3;
+  axis_direction: Vec3;
+};
+
 export type CamResult = {
   status: "completed";
   engine: string;
@@ -436,7 +451,7 @@ export type RotationalFeatureAnalysis = {
   features: Array<{
     id: string;
     profile_id: string;
-    kind: "cylindrical_land" | "taper" | "radial_transition" | "external_groove_candidate" | "thread_form_candidate" | "inner_bore" | "inner_taper" | "cutoff_boundary";
+    kind: "cylindrical_land" | "taper" | "radial_transition" | "external_groove_candidate" | "internal_groove_candidate" | "thread_form_candidate" | "inner_bore" | "inner_taper" | "cutoff_boundary";
     z_start: number;
     z_end: number;
     radius_start: number;
@@ -471,7 +486,13 @@ export type TurningDraftResult = {
   operation_id: string;
   toolpath: {
     coordinate_convention: "diameter-x_z";
-    channels: Array<{ id: string; commands: Array<{ sequence: number; type: string; axes: Record<string, number>; operation_id: string }> }>;
+    channels: Array<{ id: string; commands: Array<{
+      sequence: number;
+      type: string;
+      axes: Record<string, number>;
+      parameters?: Record<string, string | number | boolean>;
+      operation_id: string;
+    }> }>;
   };
   simulation: {
     status: "completed" | "failed";
@@ -575,6 +596,57 @@ export type BacksideDraftResult = {
   warnings: string[];
 };
 
+export type BacksideChainDraftResult = {
+  schema_version: string;
+  job_id: string;
+  release_status: "DRAFT";
+  nc_generated: false;
+  status: "passed" | "failed";
+  machine_instance_id: string;
+  machine_configuration_hash: string;
+  source_profile_id: string;
+  program_hash: string;
+  transform: BacksideDraftResult["transform"];
+  derived_profile: RotationalProfile;
+  toolpath: TurningDraftResult["toolpath"];
+  stages: Array<{
+    operation_id: string;
+    command_count: number;
+    initial_volume_mm3: number;
+    final_volume_mm3: number;
+    removed_volume_mm3: number;
+    verification_status: "passed" | "warning" | "failed";
+  }>;
+  final_simulation: TurningDraftResult["simulation"];
+  final_verification: NonNullable<TurningDraftResult["verification"]>;
+  checks: Array<{
+    id: string;
+    status: "passed" | "failed";
+    message: string;
+    measured_value?: number | string | null;
+  }>;
+  warnings: string[];
+};
+
+export type FrontChainDraftResult = {
+  schema_version: string;
+  job_id: string;
+  release_status: "DRAFT";
+  nc_generated: false;
+  status: "passed" | "failed";
+  machine_instance_id: string;
+  machine_configuration_hash: string;
+  source_profile_id: string;
+  program_hash: string;
+  toolpath: TurningDraftResult["toolpath"];
+  stages: BacksideChainDraftResult["stages"];
+  final_simulation: TurningDraftResult["simulation"];
+  longitudinal_verification: NonNullable<TurningDraftResult["verification"]>;
+  front_form_verification: NonNullable<TurningDraftResult["verification"]>;
+  checks: BacksideChainDraftResult["checks"];
+  warnings: string[];
+};
+
 export type WholePartDraftResult = {
   schema_version: string;
   job_id: string;
@@ -627,9 +699,54 @@ export type WholePartDraftResult = {
     transferred_volume_mm3: number;
     final_volume_mm3: number;
     total_removed_volume_mm3: number;
+    stage_snapshots: Array<{
+      operation_id: string;
+      channel_id: "main" | "sub";
+      source_frame: "main" | "sub";
+      before_samples: TurningStockSample[];
+      after_samples: TurningStockSample[];
+      metrics: {
+        initial_volume_mm3: number;
+        remaining_volume_mm3: number;
+        removed_volume_mm3: number;
+        removal_percent: number;
+      };
+    }>;
     checks: Array<{ id: string; status: "passed" | "failed"; message: string; measured_value?: number | string | null }>;
     warnings: string[];
   };
+  warnings: string[];
+};
+
+export type InnerBoreChainResult = {
+  schema_version: string;
+  job_id: string;
+  release_status: "DRAFT";
+  nc_generated: false;
+  status: "passed" | "failed";
+  machine_instance_id: string;
+  machine_configuration_hash: string;
+  program_hash: string;
+  profile_id: string;
+  toolpath: TurningDraftResult["toolpath"];
+  stages: Array<{
+    sequence: number;
+    operation_id: string;
+    operation_type: string;
+    command_count: number;
+    initial_volume_mm3: number;
+    final_volume_mm3: number;
+    removed_volume_mm3: number;
+    verification_status: "passed" | "warning" | "failed";
+  }>;
+  final_simulation: TurningDraftResult["simulation"];
+  final_verification: NonNullable<TurningDraftResult["verification"]>;
+  checks: Array<{
+    id: string;
+    status: "passed" | "failed";
+    message: string;
+    measured_value?: number | string | null;
+  }>;
   warnings: string[];
 };
 

@@ -21,6 +21,9 @@ MACHINES = [
 ]
 
 TOOL_DEFINITIONS = [
+    {"id": "TURN-OD-L-R", "name": "外圆反向粗车刀", "kind": "turning_od", "diameter_mm": 0.8, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.8, "stickout_mm": 20, "holder_diameter_mm": 16, "nose_radius_mm": 0.8, "insert_shape": "CNMG", "hand": "left", "orientation_code": 3},
+    {"id": "TURN-OD-L-MICRO-F", "name": "外圆反向小刀尖精车刀", "kind": "turning_od", "diameter_mm": 0.2, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.2, "stickout_mm": 20, "holder_diameter_mm": 12, "nose_radius_mm": 0.2, "insert_shape": "VBMT", "hand": "left", "orientation_code": 3},
+    {"id": "TURN-OD-MICRO-F", "name": "外圆小刀尖精车刀", "kind": "turning_od", "diameter_mm": 0.2, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.2, "stickout_mm": 20, "holder_diameter_mm": 12, "nose_radius_mm": 0.2, "insert_shape": "VBMT", "hand": "right", "orientation_code": 3},
     {"id": "FM-50", "name": "Ø50 面铣刀", "kind": "face_mill", "diameter_mm": 50.0, "flute_count": 5, "max_rpm": 8000, "flute_length_mm": 8, "stickout_mm": 20, "holder_diameter_mm": 40},
     {"id": "CM-6-90", "name": "Ø6 90°倒角刀", "kind": "chamfer_mill", "diameter_mm": 6.0, "flute_count": 3, "max_rpm": 12000, "flute_length_mm": 8, "stickout_mm": 20, "holder_diameter_mm": 20},
     *[
@@ -28,8 +31,8 @@ TOOL_DEFINITIONS = [
         for diameter in (2.0, 3.0, 4.0, 5.0, 6.0, 6.5, 7.0, 8.0, 10.0, 10.5, 11.0, 12.0, 16.0, 20.0)
     ],
     *[
-        {"id": f"EM-{diameter}", "name": f"Ø{diameter} 平底立铣刀", "kind": "end_mill", "diameter_mm": float(diameter), "flute_count": 3, "max_rpm": 16000, "flute_length_mm": max(12, diameter * 2.5), "stickout_mm": max(25, diameter * 3), "holder_diameter_mm": 32}
-        for diameter in (2, 3, 4, 6, 8, 10, 12, 16)
+        {"id": f"EM-{diameter}", "name": f"Ø{diameter} 平底立铣刀", "kind": "end_mill", "diameter_mm": float(diameter), "flute_count": 3, "max_rpm": 16000, "flute_length_mm": max(12, diameter * 2.5), "stickout_mm": max(25, diameter * 3), "holder_diameter_mm": 8 if diameter <= 2 else 12 if diameter <= 4 else 20 if diameter <= 8 else 32}
+        for diameter in (1, 2, 3, 4, 6, 8, 10, 12, 16)
     ],
     *[
         {"id": f"BM-{diameter:g}", "name": f"Ø{diameter:g} 球头立铣刀", "kind": "ball_end_mill", "diameter_mm": float(diameter), "flute_count": 2, "max_rpm": 16000, "flute_length_mm": max(8, diameter * 4), "stickout_mm": max(18, diameter * 6), "holder_diameter_mm": 10 if diameter <= 2.5 else 16}
@@ -39,7 +42,10 @@ TOOL_DEFINITIONS = [
     {"id": "TURN-OD-F", "name": "外圆精车刀", "kind": "turning_od", "diameter_mm": 0.4, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.4, "stickout_mm": 20, "holder_diameter_mm": 16, "nose_radius_mm": 0.4, "insert_shape": "DCMT", "hand": "right", "orientation_code": 3},
     {"id": "TURN-ID-R", "name": "内孔粗车刀", "kind": "turning_id", "diameter_mm": 0.4, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.4, "stickout_mm": 25, "holder_diameter_mm": 10, "nose_radius_mm": 0.4, "insert_shape": "CCMT", "hand": "right", "orientation_code": 2},
     {"id": "TURN-ID-F", "name": "内孔精车刀", "kind": "turning_id", "diameter_mm": 0.2, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.2, "stickout_mm": 25, "holder_diameter_mm": 8, "nose_radius_mm": 0.2, "insert_shape": "DCGT", "hand": "right", "orientation_code": 2},
+    {"id": "TURN-ID-MICRO-F", "name": "内孔尖肩微小刀尖精车刀", "kind": "turning_id", "diameter_mm": 0.1, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.1, "stickout_mm": 25, "holder_diameter_mm": 6, "nose_radius_mm": 0.05, "insert_shape": "DCGT-MICRO", "hand": "right", "orientation_code": 2},
     {"id": "TURN-GROOVE-2", "name": "2 mm 切槽刀", "kind": "grooving", "diameter_mm": 2.0, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 2.0, "stickout_mm": 20, "holder_diameter_mm": 16, "cutting_width_mm": 2.0, "hand": "neutral", "orientation_code": 4},
+    {"id": "TURN-GROOVE-0.8", "name": "0.8 mm 窄槽刀", "kind": "grooving", "diameter_mm": 0.8, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.8, "stickout_mm": 16, "holder_diameter_mm": 10, "cutting_width_mm": 0.8, "hand": "neutral", "orientation_code": 4},
+    {"id": "TURN-ID-GROOVE-1", "name": "1 mm 内孔切槽刀", "kind": "internal_grooving", "diameter_mm": 1.0, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 1.0, "stickout_mm": 25, "holder_diameter_mm": 6, "cutting_width_mm": 1.0, "hand": "right", "orientation_code": 2},
     {"id": "TURN-THREAD-60", "name": "60°螺纹车刀", "kind": "threading", "diameter_mm": 0.2, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.2, "stickout_mm": 20, "holder_diameter_mm": 16, "nose_radius_mm": 0.1, "insert_shape": "60deg", "hand": "right", "orientation_code": 3},
     {"id": "TURN-CUTOFF-2", "name": "2 mm 切断刀", "kind": "cutoff", "diameter_mm": 2.0, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 2.0, "stickout_mm": 25, "holder_diameter_mm": 16, "cutting_width_mm": 2.0, "hand": "neutral", "orientation_code": 4},
     {"id": "TAP-M6", "name": "M6 丝锥", "kind": "tap", "diameter_mm": 6.0, "flute_count": 3, "max_rpm": 3000, "flute_length_mm": 15, "stickout_mm": 30, "holder_diameter_mm": 16},
