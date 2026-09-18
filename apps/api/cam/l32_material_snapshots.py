@@ -107,6 +107,15 @@ def main():
         ).cut(target)
         for operation_id, groove in context.get("grooves", {}).items()
     }
+    cutoff_shapes = {
+        operation_id: Part.makeCylinder(
+            float(context["stock_radius"]),
+            float(cutoff["maximum"]) - float(cutoff["minimum"]),
+            origin + axis * float(cutoff["minimum"]),
+            axis,
+        ).cut(target)
+        for operation_id, cutoff in context.get("cutoffs", {}).items()
+    }
     groove_fill = Part.makeCompound(list(groove_shapes.values())) if groove_shapes else None
     front_removal = front_stock.cut(target)
     if groove_fill is not None:
@@ -139,6 +148,8 @@ def main():
             )
         elif stage["kind"] == "groove":
             stage_volumes.append(groove_shapes[stage["operation_id"]])
+        elif stage["kind"] == "cutoff":
+            stage_volumes.append(cutoff_shapes[stage["operation_id"]])
         elif stage["kind"] == "exterior":
             paired = ("exterior", None, not stage["rough"]) in stage_kinds
             stage_volumes.append(
@@ -170,6 +181,12 @@ def main():
             radial_limits = (
                 float(groove["floor_radius"]), float(groove["radius"]),
                 float(groove["minimum"]), float(groove["maximum"]),
+            )
+        elif stage["kind"] == "cutoff":
+            cutoff = context["cutoffs"][stage["operation_id"]]
+            radial_limits = (
+                0.0, float(context["stock_radius"]),
+                float(cutoff["minimum"]), float(cutoff["maximum"]),
             )
         bounds = removal.BoundBox
         lengths = [bounds.XLength, bounds.YLength, bounds.ZLength]

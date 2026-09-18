@@ -15,6 +15,7 @@ type Props = {
   onSelectFeature: (id: string) => void;
   toolpathSegments?: ToolpathSegment[];
   materialSnapshotUrls?: string[];
+  materialSnapshotStages?: { operationId: string; start: number; count: number }[];
   initialToolpathSegments?: ToolpathSegment[];
   profileBoundaries?: { operation_id: string; setup_id: string; work_axis: { x: number; y: number; z: number }; points: { x: number; y: number; z: number }[] }[];
   simulation?: SimulationResult | null;
@@ -24,6 +25,7 @@ type Props = {
   fixtureComponents?: FixtureComponent[];
   animateToolpath?: boolean;
   initialProgress?: number;
+  playbackResetToken?: number;
   operationTools?: Record<string, { name: string; tool_name: string; diameter_mm: number; stickout_mm: number; holder_diameter_mm: number; kind: string; drill_point_angle_deg: number; spindle_rpm: number; feed_rate_mm_min: number }>;
   topologyEdges?: Vec3[][];
   activeOperationId?: string;
@@ -52,7 +54,7 @@ function featureMarkerColor(feature: ManufacturingFeature) {
   return 0x18b89a;
 }
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], materialSnapshotUrls = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", workAxis = null, activeOperationLabel = "" }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], materialSnapshotUrls = [], materialSnapshotStages = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", workAxis = null, activeOperationLabel = "" }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
@@ -60,9 +62,15 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const onSelectDefectRef = useRef(onSelectDefect);
   const selectedIdsRef = useRef(selectedFeatureIds);
   const playbackRef = useRef({ playing: false, progress: initialProgress, speed: 1 });
+  const progressByModeRef = useRef<Record<string, number>>({});
+  const lastPlaybackResetTokenRef = useRef(playbackResetToken);
+  const cameraByModeRef = useRef<Record<string, { position: [number, number, number]; target: [number, number, number]; zoom: number }>>({});
+  const playbackKey = `${modelUrl}:${activeOperationId ?? "none"}:${playbackMode}`;
+  const cameraKey = `${playbackKey}:${viewMode}:${toolpathSegments.length}:${materialSnapshotUrls.length}`;
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(initialProgress);
   const [speed, setSpeed] = useState(1);
+  const [snapshotLoadError, setSnapshotLoadError] = useState<string | null>(null);
   const [activeMotion, setActiveMotion] = useState<{ operation: string; setup?: string; motion: string; removesMaterial: boolean } | null>(null);
   const [targetVisible, setTargetVisible] = useState(false);
   const targetVisibleRef = useRef(false);
@@ -80,6 +88,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   // same; otherwise the newly arrived stock/result must receive a fresh fit.
   const cameraContentKey = [
     activeOperationId ?? "",
+    playbackMode,
     viewMode,
     toolpathLoaded ? "loaded" : "loading",
     toolpathSegments.length,
@@ -107,6 +116,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const updateProgress = (value: number) => {
     playbackRef.current.progress = value;
     playbackRef.current.playing = false;
+    progressByModeRef.current[playbackKey] = value;
     setProgress(value);
     setPlaying(false);
   };
@@ -125,16 +135,21 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   }, [onSelectDefect]);
 
   useEffect(() => {
-    const autoPlay = Boolean((turningStage || materialSnapshotUrls.length) && toolpathSegments.length);
-    playbackRef.current.playing = autoPlay;
-    playbackRef.current.progress = 0;
+    if (lastPlaybackResetTokenRef.current !== playbackResetToken) {
+      progressByModeRef.current[playbackKey] = 0;
+      lastPlaybackResetTokenRef.current = playbackResetToken;
+    }
+    const savedProgress = progressByModeRef.current[playbackKey];
+    playbackRef.current.playing = false;
+    playbackRef.current.progress = savedProgress ?? 0;
     const reset = window.setTimeout(() => {
-      setPlaying(autoPlay);
-      setProgress(0);
+      setPlaying(playbackRef.current.playing);
+      setProgress(playbackRef.current.progress);
       setActiveMotion(null);
+      setSnapshotLoadError(null);
     }, 0);
     return () => window.clearTimeout(reset);
-  }, [activeOperationId, materialSnapshotUrls.length, playbackMode, toolpathSegments.length, turningStage]);
+  }, [playbackKey, playbackResetToken, viewMode]);
 
   useEffect(() => {
     selectedIdsRef.current = selectedFeatureIds;
@@ -151,6 +166,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     const host = hostRef.current;
     const axisHost = axisHostRef.current;
     if (!host || !axisHost) return;
+    const cameraMemory = cameraByModeRef.current;
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(
       viewMode === "特征" ? 0xdce7f1
@@ -286,7 +302,47 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     const fixtureMeshes: { mesh: THREE.Mesh; setupId?: string | null }[] = [];
     const defectRegionMeshes: THREE.Mesh[] = [];
     const materialSnapshotMeshes: Array<THREE.Mesh | null> = Array(materialSnapshotUrls.length).fill(null);
+    const loadingSnapshotIndexes = new Set<number>();
+    const failedSnapshotIndexes = new Set<number>();
     let disposed = false;
+    const requestMaterialSnapshot = (snapshotIndex: number) => {
+      const snapshotUrl = materialSnapshotUrls[snapshotIndex];
+      if (!model || !snapshotUrl || materialSnapshotMeshes[snapshotIndex] || loadingSnapshotIndexes.has(snapshotIndex) || failedSnapshotIndexes.has(snapshotIndex)) return;
+      loadingSnapshotIndexes.add(snapshotIndex);
+      new STLLoader().load(snapshotUrl, (snapshotGeometry) => {
+        loadingSnapshotIndexes.delete(snapshotIndex);
+        if (disposed) {
+          snapshotGeometry.dispose();
+          return;
+        }
+        snapshotGeometry.translate(-modelCenter.x, -modelCenter.y, -modelCenter.z);
+        const renderSnapshot = toCreasedNormals(snapshotGeometry, THREE.MathUtils.degToRad(52));
+        if (renderSnapshot !== snapshotGeometry) snapshotGeometry.dispose();
+        const snapshotMesh = new THREE.Mesh(
+          renderSnapshot,
+          new THREE.MeshPhysicalMaterial({
+            color: 0x718083,
+            roughness: 0.5,
+            metalness: 0.08,
+            clearcoat: 0.04,
+            clearcoatRoughness: 0.68,
+          }),
+        );
+        snapshotMesh.castShadow = true;
+        snapshotMesh.receiveShadow = true;
+        snapshotMesh.visible = false;
+        materialSnapshotMeshes[snapshotIndex] = snapshotMesh;
+        scene.add(snapshotMesh);
+      }, undefined, () => {
+        loadingSnapshotIndexes.delete(snapshotIndex);
+        if (!disposed) {
+          failedSnapshotIndexes.add(snapshotIndex);
+          playbackRef.current.playing = false;
+          setPlaying(false);
+          setSnapshotLoadError(`实体材料第 ${snapshotIndex + 1} 帧加载失败，请检查服务后重新打开工序。`);
+        }
+      });
+    };
     let defectPointCloud: THREE.Points | null = null;
     let animation = 0;
     let lastFrameTime = performance.now();
@@ -371,33 +427,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       model.receiveShadow = true;
       scene.add(model);
 
-      for (const [snapshotIndex, snapshotUrl] of materialSnapshotUrls.entries()) {
-        new STLLoader().load(snapshotUrl, (snapshotGeometry) => {
-          if (disposed) {
-            snapshotGeometry.dispose();
-            return;
-          }
-          snapshotGeometry.translate(-modelCenter.x, -modelCenter.y, -modelCenter.z);
-          const renderSnapshot = toCreasedNormals(snapshotGeometry, THREE.MathUtils.degToRad(52));
-          if (renderSnapshot !== snapshotGeometry) snapshotGeometry.dispose();
-          const snapshotMesh = new THREE.Mesh(
-            renderSnapshot,
-            new THREE.MeshPhysicalMaterial({
-              color: 0x718083,
-              roughness: 0.5,
-              metalness: 0.08,
-              clearcoat: 0.04,
-              clearcoatRoughness: 0.68,
-            }),
-          );
-          snapshotMesh.castShadow = true;
-          snapshotMesh.receiveShadow = true;
-          snapshotMesh.visible = false;
-          materialSnapshotMeshes[snapshotIndex] = snapshotMesh;
-          scene.add(snapshotMesh);
-          if (model) model.visible = false;
-        });
-      }
+      requestMaterialSnapshot(0);
 
       if (turningStage) {
         const axisOrigin = new THREE.Vector3(
@@ -980,10 +1010,17 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         setToolVisible: (visible) => { if (playbackTool) playbackTool.visible = visible; },
         setTrailVisible: (visible) => { if (trailPath) trailPath.visible = visible; },
       };
-      // A rebuilt scene represents a different mode, operation or newly
-      // arrived preview. Never restore an old pan target here: it is the main
-      // cause of a correctly scaled part reopening in the lower-right corner.
       fitDirection(camera.position.clone());
+      // Restore only the same mode, operation and geometry revision. New
+      // previews receive a fresh fit so stale panning cannot hide the stock.
+      const savedCamera = cameraMemory[cameraKey];
+      if (savedCamera) {
+        camera.position.fromArray(savedCamera.position);
+        controls.target.fromArray(savedCamera.target);
+        camera.zoom = savedCamera.zoom;
+        camera.updateProjectionMatrix();
+        controls.update();
+      }
     });
 
     const raycaster = new THREE.Raycaster();
@@ -1029,6 +1066,25 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     const totalWeight = segmentWeights.reduce((sum, value) => sum + value, 0) || 1;
     const cumulativeWeights = [0];
     for (const value of segmentWeights) cumulativeWeights.push(cumulativeWeights[cumulativeWeights.length - 1] + value);
+    const stageWeights = materialSnapshotStages.map((stage) => {
+      const first = toolpathSegments.findIndex((segment) => segment.operation_id === stage.operationId);
+      let last = -1;
+      for (let index = first; index < toolpathSegments.length; index += 1) {
+        if (toolpathSegments[index]?.operation_id === stage.operationId) last = index;
+      }
+      return { ...stage, from: first < 0 ? 0 : cumulativeWeights[first], to: last < 0 ? 0 : cumulativeWeights[last + 1] };
+    });
+    const snapshotIndexForProgress = (currentProgress: number) => {
+      const targetWeight = currentProgress * totalWeight;
+      const currentStage = stageWeights.find((stage) => targetWeight <= stage.to && stage.to > stage.from)
+        ?? (toolpathSegments.length ? stageWeights[stageWeights.length - 1] : stageWeights[0]);
+      const lastCompletedStage = [...stageWeights].reverse().find((stage) => stage.count && stage.to <= targetWeight);
+      return currentStage?.count
+        ? currentStage.start + Math.min(currentStage.count - 1, Math.floor(
+            Math.max(0, Math.min(1, (targetWeight - currentStage.from) / (currentStage.to - currentStage.from || 1))) * (currentStage.count - 1) + 1e-6,
+          ))
+        : lastCompletedStage?.count ? lastCompletedStage.start + lastCompletedStage.count - 1 : 0;
+    };
 
     const turningSampleTargets = turningStage && turningBeforeSamples.length
       ? turningBeforeSamples.map((before, index) => {
@@ -1616,9 +1672,14 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       const elapsed = Math.min((time - lastFrameTime) / 1000, 0.1);
       lastFrameTime = time;
       if (animateToolpath && playbackRef.current.playing && (toolpathSegments.length || formingPreview)) {
-        const duration = formingPreview ? 18 : turningStage ? 8 : materialSnapshotUrls.length ? 18 : 30;
-        const nextProgress = Math.min(1, playbackRef.current.progress + elapsed * playbackRef.current.speed / duration);
+        const duration = formingPreview ? 18 : turningStage ? 8 : materialSnapshotUrls.length ? 12 * Math.max(1, materialSnapshotStages.length) : 30;
+        const proposedProgress = Math.min(1, playbackRef.current.progress + elapsed * playbackRef.current.speed / duration);
+        const nextSnapshotIndex = snapshotIndexForProgress(proposedProgress);
+        if (materialSnapshotUrls.length && !materialSnapshotMeshes[nextSnapshotIndex]) requestMaterialSnapshot(nextSnapshotIndex);
+        const nextProgress = materialSnapshotUrls.length && !materialSnapshotMeshes[nextSnapshotIndex]
+          ? playbackRef.current.progress : proposedProgress;
         playbackRef.current.progress = nextProgress;
+        progressByModeRef.current[playbackKey] = nextProgress;
         setProgress(nextProgress);
         if (nextProgress >= 1) {
           playbackRef.current.playing = false;
@@ -1627,22 +1688,29 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       }
       if (animateToolpath) updatePlaybackScene(playbackRef.current.progress);
       if (animateToolpath) updateFormingScene(playbackRef.current.progress);
-      const loadedSnapshotCount = materialSnapshotMeshes.filter(Boolean).length;
-      if (loadedSnapshotCount) {
-        const requestedIndex = Math.min(
-          materialSnapshotMeshes.length - 1,
-          Math.floor(playbackRef.current.progress * Math.max(materialSnapshotMeshes.length - 1, 0) + 1e-6),
-        );
+      if (materialSnapshotUrls.length) {
+        const requestedIndex = snapshotIndexForProgress(playbackRef.current.progress);
+        requestMaterialSnapshot(requestedIndex);
+        requestMaterialSnapshot(Math.min(requestedIndex + 1, materialSnapshotMeshes.length - 1));
         let visibleIndex = requestedIndex;
         while (visibleIndex > 0 && !materialSnapshotMeshes[visibleIndex]) visibleIndex -= 1;
-        if (!materialSnapshotMeshes[visibleIndex]) {
-          visibleIndex = materialSnapshotMeshes.findIndex(Boolean);
-        }
         materialSnapshotMeshes.forEach((snapshot, index) => {
           if (snapshot) snapshot.visible = index === visibleIndex;
         });
+        if (materialSnapshotMeshes[requestedIndex]) {
+          materialSnapshotMeshes.forEach((snapshot, index) => {
+            if (!snapshot || Math.abs(index - requestedIndex) <= 3) return;
+            scene.remove(snapshot);
+            snapshot.geometry.dispose();
+            (snapshot.material as THREE.Material).dispose();
+            materialSnapshotMeshes[index] = null;
+          });
+        }
         if (model) model.visible = false;
         if (cadEdges) cadEdges.visible = false;
+        if (simulationMesh) simulationMesh.visible = false;
+        if (simulationLowerMesh) simulationLowerMesh.visible = false;
+        if (simulationWalls) simulationWalls.visible = false;
       }
       if (turningBeforeMesh && turningAfterMesh) {
         const turningProgress = animateToolpath ? playbackRef.current.progress : 1;
@@ -1655,7 +1723,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         // while the visible IPW is now the continuously rebuilt dynamic mesh.
         turningAfterMesh.visible = false;
       }
-      if (camoticsMesh) camoticsMesh.visible = playbackRef.current.progress >= 0.999;
+      if (camoticsMesh) camoticsMesh.visible = materialSnapshotUrls.length === 0 && playbackRef.current.progress >= 0.999;
       controls.update();
       renderer.render(scene, camera);
       axisGroup.quaternion.copy(camera.quaternion).invert();
@@ -1666,6 +1734,13 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     rebuildMaterialWalls();
     animate(performance.now());
     return () => {
+      if (model) {
+        cameraMemory[cameraKey] = {
+          position: camera.position.toArray() as [number, number, number],
+          target: controls.target.toArray() as [number, number, number],
+          zoom: camera.zoom,
+        };
+      }
       disposed = true;
       cancelAnimationFrame(animation);
       observer.disconnect();
@@ -1748,7 +1823,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       host.removeChild(renderer.domElement);
       axisHost.removeChild(axisRenderer.domElement);
     };
-  }, [activeOperationId, animateToolpath, cameraContentKey, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, materialSnapshotUrls, modelUrl, operationTools, profileBoundaries, simulation, spatialDefects, toolpathLoaded, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
+  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationTools, playbackKey, profileBoundaries, simulation, spatialDefects, toolpathLoaded, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
   const activeFormingStage = formingPreview?.stages.length
@@ -1776,8 +1851,22 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     sheet_inspection: "● 正在扫描最终样品",
   };
   const playbackChapters = formingPreview
-    ? formingPreview.stages.map((stage) => stage.operation_id)
-    : Array.from(new Set(toolpathSegments.map((segment) => segment.operation_id)));
+    ? formingPreview.stages.map((stage, index) => ({ id: stage.operation_id, progress: index / formingPreview.stages.length }))
+    : (() => {
+        const weights = toolpathSegments.map((segment) => Math.max(0.01,
+          Math.hypot(segment.x2 - segment.x1, segment.y2 - segment.y1, segment.z2 - segment.z1) / (segment.motion === "rapid" ? 4 : 1),
+        ));
+        const total = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+        let weight = 0;
+        const chapters: { id: string; progress: number }[] = [];
+        toolpathSegments.forEach((segment, index) => {
+          if (!chapters.some((chapter) => chapter.id === segment.operation_id)) {
+            chapters.push({ id: segment.operation_id, progress: weight / total });
+          }
+          weight += weights[index];
+        });
+        return chapters;
+      })();
   const visibleActiveDefect = activeDefect
     ? spatialDefects?.regions.find((region) => region.id === activeDefect.id) ?? null
     : null;
@@ -1828,8 +1917,9 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         </div>}
       </div>}
       {animateToolpath && !formingPreview && toolpathLoaded && activeOperationId && toolpathSegments.length === 0 && <div className="empty-toolpath-notice">
-        当前任务没有可播放的有效 FreeCAD 切削刀路
+        {materialSnapshotStages.length ? "当前工序的材料帧已就绪，但有效切削刀路尚未生成；请检查工序预生成结果。" : "当前任务没有可播放的有效 FreeCAD 切削刀路"}
       </div>}
+      {viewMode === "仿真" && snapshotLoadError && <div className="empty-toolpath-notice">{snapshotLoadError}</div>}
       {animateToolpath && (toolpathSegments.length > 0 || formingPreview) && <div className="playback-controls">
         {!formingPreview && <div className="playback-mode-toggle" aria-label="播放模式">
           <button className={playbackMode === "single" ? "active" : ""} onClick={() => onPlaybackModeChange?.("single")}>单工序</button>
@@ -1842,8 +1932,8 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         <select aria-label="播放速度" value={speed} onChange={(event) => updateSpeed(Number(event.target.value))}>
           <option value="1">1×</option><option value="5">5×</option><option value="20">20×</option>
         </select>
-        <div className="playback-chapters">{playbackChapters.map((operationId) => <i key={operationId} className={(activeFormingStage?.operation_id ?? activeMotion?.operation) === operationId ? "active" : ""} title={operationId} />)}</div>
-        <em>{activeFormingStage ? `${activeFormingStage.operation_id} · ${activeFormingStage.name}` : activeMotion ? `${activeMotion.operation} · ${activeMotion.motion === "cut" ? activeMotion.removesMaterial ? "切削 · 正在去除材料" : "翻面/成形刀路 · 轨迹回放" : "快移 · 不去除材料"}` : playbackMode === "single" && initialToolpathSegments.length ? "准备播放 · 前置工序余料已加载" : "准备播放 · 完整毛坯"}</em>
+        <div className="playback-chapters" aria-label="工序时间轴">{playbackChapters.map((chapter) => <button type="button" key={chapter.id} className={(activeFormingStage?.operation_id ?? activeMotion?.operation) === chapter.id ? "active" : ""} title={`跳转到 ${chapter.id}`} aria-label={`跳转到 ${chapter.id}`} onClick={() => updateProgress(Math.min(1, chapter.progress + 1e-6))} />)}</div>
+        <em>{activeFormingStage ? `${activeFormingStage.operation_id} · ${activeFormingStage.name}` : activeMotion ? `${playbackMode === "single" ? "单工序" : "累计"} · ${activeMotion.operation} · ${activeMotion.motion === "cut" ? activeMotion.removesMaterial ? "切削 · 几何余料逐帧展示" : "轨迹回放" : "快移 · 不去除材料"}` : playbackMode === "single" ? "单工序 · 从本工序加工前余料开始" : "累计 · 从原始毛坯开始"}</em>
       </div>}
     </div>
   );

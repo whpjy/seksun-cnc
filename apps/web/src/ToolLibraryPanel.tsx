@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Check, LoaderCircle, Pencil, Plus, Search, X } from "lucide-react";
+import { Check, LoaderCircle, Pencil, Search, X } from "lucide-react";
 import type { Tool } from "./types";
 import { ToolKindIcon } from "./ToolKindIcon";
 import { toolKindLabel } from "./toolKindLabels";
@@ -55,7 +55,6 @@ export function ToolLibraryPanel({
   onClose: () => void;
   readOnly: boolean;
 }) {
-  const [tab, setTab] = useState<"physical" | "catalog">("physical");
   const [tools, setTools] = useState<PhysicalTool[]>([]);
   const [loading, setLoading] = useState(Boolean(machineInstanceId));
   const [saving, setSaving] = useState(false);
@@ -100,7 +99,6 @@ export function ToolLibraryPanel({
       measured_holder_diameter_mm: String(tool.measured_holder_diameter_mm ?? ""),
       notes: tool.notes, active: tool.active,
     } : { ...EMPTY_FORM });
-    setTab("physical");
     setShowForm(true);
   }
 
@@ -142,21 +140,20 @@ export function ToolLibraryPanel({
   return <section className="inspection-popover tool-library-popover" aria-label="刀具库">
     <header>
       <div><small>TOOL LIBRARY</small><strong>刀具库</strong></div>
-      <span>{tools.filter((tool) => tool.active).length} 把现场登记</span>
+      <span>{catalogTools.length} 款刀具</span>
       <button aria-label="关闭刀具库" onClick={onClose}><X size={15} /></button>
     </header>
     <div className="tool-library-controls">
-      <div className="tool-library-tabs">
-        <button className={tab === "physical" ? "active" : ""} onClick={() => { setTab("physical"); setSearch(""); }}>现场刀具</button>
-        <button className={tab === "catalog" ? "active" : ""} onClick={() => { setTab("catalog"); setSearch(""); setShowForm(false); }}>标准目录</button>
-      </div>
       <label className="tool-library-search"><Search size={13} /><input aria-label="搜索刀具" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="编号、名称或刀位" /></label>
     </div>
     <div className="tool-library-content">
-      {tab === "physical" && <>
-        <div className="tool-library-scope"><strong>{machineInstanceId ?? "未绑定 L32 实例"}</strong><span>现场记录不等于装配与刀路审核</span></div>
-        {!machineInstanceId ? <p className="tool-library-empty">先在 L32 CAM 中绑定设备实例，再登记这台机器的实物刀具。</p> : <>
-          {!readOnly && !showForm && <button className="tool-library-add" onClick={() => beginEdit()}><Plus size={14} />登记现场刀具</button>}
+      <div className="tool-library-list">{filteredCatalog.map((tool) => <article key={tool.id}>
+        <div className="tool-library-item-layout"><ToolKindIcon kind={tool.kind} /><div className="tool-library-item-detail">
+          <div className="tool-library-item-head"><strong>{tool.id}</strong></div>
+          <p>{tool.name}</p><small>{toolKindLabel(tool.kind)} · {tool.cutting_width_mm != null ? `刃宽 ${tool.cutting_width_mm} mm` : `直径 Ø${tool.diameter_mm} mm`} · 伸出参考 {tool.stickout_mm} mm</small>
+        </div></div>
+      </article>)}</div>
+      {machineInstanceId && <>
           {showForm && <div className="tool-library-form">
             <strong>{editingId ? `编辑 ${editingId}` : "登记现场刀具"}</strong>
             <div className="tool-library-form-preview"><ToolKindIcon kind={selectedTemplate?.kind ?? form.custom_kind} /><span>{toolKindLabel(selectedTemplate?.kind ?? form.custom_kind)}<small>类型示意图</small></span></div>
@@ -174,7 +171,7 @@ export function ToolLibraryPanel({
             {editingId && <label className="tool-library-active"><input type="checkbox" checked={form.active} onChange={(event) => setForm({ ...form, active: event.target.checked })} />在用</label>}
             <div className="tool-library-form-actions"><button onClick={() => setShowForm(false)}>取消</button><button className="primary" disabled={saving || !form.inventory_id.trim() || (!selectedTemplate && (!form.custom_name.trim() || !form.custom_kind))} onClick={saveTool}>{saving ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}保存记录</button></div>
           </div>}
-          {loading ? <p className="tool-library-empty">正在读取现场刀具…</p> : filteredPhysical.length === 0 && !showForm ? <p className="tool-library-empty">尚无现场刀具记录。标准目录中的刀具不会自动视为已安装。</p> : <div className="tool-library-list">{filteredPhysical.map((tool) => <article key={tool.inventory_id} className={!tool.active ? "inactive" : ""}>
+          {!loading && filteredPhysical.length > 0 && <div className="tool-library-list">{filteredPhysical.map((tool) => <article key={tool.inventory_id} className={!tool.active ? "inactive" : ""}>
             <div className="tool-library-item-layout"><ToolKindIcon kind={tool.tool_kind} /><div className="tool-library-item-detail">
               <div className="tool-library-item-head"><strong>{tool.inventory_id}</strong><span>{tool.active ? "已登记" : "停用"}</span></div>
               <p>{tool.catalog_tool_name}</p>
@@ -183,14 +180,8 @@ export function ToolLibraryPanel({
             </div></div>
             {!readOnly && <button aria-label={`编辑 ${tool.inventory_id}`} onClick={() => beginEdit(tool)}><Pencil size={12} />编辑</button>}
           </article>)}</div>}
-        </>}
       </>}
-      {tab === "catalog" && <><p className="tool-library-catalog-note">这些是系统刀具模板，不代表现场库存或已装刀。图标仅表示刀具类型。</p><div className="tool-library-list">{filteredCatalog.map((tool) => <article key={tool.id}>
-        <div className="tool-library-item-layout"><ToolKindIcon kind={tool.kind} /><div className="tool-library-item-detail">
-          <div className="tool-library-item-head"><strong>{tool.id}</strong><span>模板</span></div>
-          <p>{tool.name}</p><small>{toolKindLabel(tool.kind)} · {tool.cutting_width_mm != null ? `刃宽 ${tool.cutting_width_mm} mm` : `直径 Ø${tool.diameter_mm} mm`} · 伸出参考 {tool.stickout_mm} mm</small>
-        </div></div>
-      </article>)}</div></>}
+      {filteredCatalog.length === 0 && filteredPhysical.length === 0 && <p className="tool-library-empty">没有匹配的刀具</p>}
       {error && <p className="tool-library-error" role="alert">{error}</p>}
     </div>
   </section>;

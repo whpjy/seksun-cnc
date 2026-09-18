@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
-from math import radians, tan
+from math import isfinite, radians, tan
 import os
 import shutil
 import subprocess
@@ -714,6 +714,7 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
     front_profile_radius = max(point.radius for point in source_profile.points if front_min - 1e-6 <= point.z <= front_max + 1e-6)
     grooves: dict[str, dict[str, float]] = {}
     pockets: dict[str, dict[str, object]] = {}
+    cutoffs: dict[str, dict[str, float]] = {}
     stages: list[dict[str, object]] = []
     for operation in operations:
         if operation.enabled is False:
@@ -742,6 +743,19 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
                     "floor_radius": min(feature.radius_start, feature.radius_end),
                 }
                 stages.append({"operation_id": operation.id, "kind": "groove", "rough": False})
+        elif operation.type == "turn_cutoff":
+            try:
+                width = float(operation.parameters["cutting_width_mm"])
+                center = float(operation.parameters["z_mm"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            lower, upper = center - width / 2, center + width / 2
+            # The sacrificial kerf must remain behind the retained STEP part.
+            # An invalid or overlapping setup cannot be represented as verified IPW.
+            if not all(isfinite(value) for value in (width, center, lower, upper)) or width <= 0 or upper > min(float(region[0]), float(region[1])) + 1e-6:
+                continue
+            cutoffs[operation.id] = {"minimum": lower, "maximum": upper}
+            stages.append({"operation_id": operation.id, "kind": "cutoff", "rough": False})
         elif operation.type == "live_tool_contour_roughing":
             stages.append({"operation_id": operation.id, "kind": "exterior", "rough": True})
         elif operation.type == "live_tool_contour_finishing":
@@ -780,11 +794,12 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
         ),
         "face_overhang": float(job.plan.stock.get("allowance_mm", {}).get("axial", 2.0)),
         "grooves": grooves,
+        "cutoffs": cutoffs,
         "pockets": pockets,
     }
     stages_json = json.dumps({"stages": stages, "context": context}, separators=(",", ":"))
     signature = hashlib.sha256(
-        f"material-binary-v10:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
+        f"material-binary-v11:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
     ).hexdigest()
     manifest_path = directory / "l32-material-snapshots.json"
     stages_path = directory / "l32-material-stages.json"

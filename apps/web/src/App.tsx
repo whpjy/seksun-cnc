@@ -10,7 +10,6 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDot,
-  Cog,
   FileUp,
   FolderOpen,
   History,
@@ -110,6 +109,61 @@ function l32DraftsToSegments(operation: Operation, drafts: L32GeometricDraft[]):
   ) > 1e-6);
 }
 
+function l32TurningPreviewToSegments(preview: L32TurningPreview, sourceAxis: RotationalFeatureAnalysis["axes"][number]): ToolpathSegment[] {
+  const axisLength = Math.hypot(sourceAxis.direction.x, sourceAxis.direction.y, sourceAxis.direction.z) || 1;
+  const axis = { x: sourceAxis.direction.x / axisLength, y: sourceAxis.direction.y / axisLength, z: sourceAxis.direction.z / axisLength };
+  const helper = Math.abs(axis.z) < 0.9 ? { x: 0, y: 0, z: 1 } : { x: 0, y: 1, z: 0 };
+  const cross = { x: axis.y * helper.z - axis.z * helper.y, y: axis.z * helper.x - axis.x * helper.z, z: axis.x * helper.y - axis.y * helper.x };
+  const crossLength = Math.hypot(cross.x, cross.y, cross.z) || 1;
+  const radial = { x: cross.x / crossLength, y: cross.y / crossLength, z: cross.z / crossLength };
+  const point = (x: number, z: number) => {
+    const axial = preview.channelId === "sub" ? preview.sourceCutoffZ - z : z;
+    const radius = Math.abs(x) / 2;
+    return { x: sourceAxis.origin.x + axis.x * axial + radial.x * radius, y: sourceAxis.origin.y + axis.y * axial + radial.y * radius, z: sourceAxis.origin.z + axis.z * axial + radial.z * radius };
+  };
+  const segments: ToolpathSegment[] = [];
+  for (const channel of preview.draft.toolpath.channels) {
+    const position: Record<string, number> = {};
+    for (const command of channel.commands) {
+      const previous = { ...position };
+      for (const [name, value] of Object.entries(command.axes)) position[name.toUpperCase()] = value;
+      if (!["rapid_move", "feed_move", "arc_move"].includes(command.type)
+        || previous.X === undefined || previous.Z === undefined || position.X === undefined || position.Z === undefined) continue;
+      const start = point(previous.X, previous.Z), end = point(position.X, position.Z);
+      if (Math.hypot(end.x - start.x, end.y - start.y, end.z - start.z) <= 1e-6) continue;
+      segments.push({ operation_id: preview.operationId, motion: command.type === "rapid_move" ? "rapid" : "cut", x1: start.x, y1: start.y, z1: start.z, x2: end.x, y2: end.y, z2: end.z, setup_id: channel.id, work_axis: radial });
+    }
+  }
+  return segments;
+}
+
+function l32GroovePreviewToSegments(preview: L32GroovePreview, sourceAxis: RotationalFeatureAnalysis["axes"][number]): ToolpathSegment[] {
+  const axisLength = Math.hypot(sourceAxis.direction.x, sourceAxis.direction.y, sourceAxis.direction.z) || 1;
+  const axis = { x: sourceAxis.direction.x / axisLength, y: sourceAxis.direction.y / axisLength, z: sourceAxis.direction.z / axisLength };
+  const helper = Math.abs(axis.z) < 0.9 ? { x: 0, y: 0, z: 1 } : { x: 0, y: 1, z: 0 };
+  const cross = { x: axis.y * helper.z - axis.z * helper.y, y: axis.z * helper.x - axis.x * helper.z, z: axis.x * helper.y - axis.y * helper.x };
+  const crossLength = Math.hypot(cross.x, cross.y, cross.z) || 1;
+  const radial = { x: cross.x / crossLength, y: cross.y / crossLength, z: cross.z / crossLength };
+  const point = (z: number, radius: number) => ({
+    x: sourceAxis.origin.x + axis.x * z + radial.x * radius,
+    y: sourceAxis.origin.y + axis.y * z + radial.y * radius,
+    z: sourceAxis.origin.z + axis.z * z + radial.z * radius,
+  });
+  const segments: ToolpathSegment[] = [];
+  for (const strip of preview.strips) {
+    const axial = (strip.z_min_mm + strip.z_max_mm) / 2;
+    const safe = point(axial, preview.stockRadius + 0.5);
+    const start = point(axial, preview.stockRadius);
+    const end = point(axial, strip.cut_to_radius_mm);
+    segments.push(
+      { operation_id: preview.operationId, motion: "rapid", x1: safe.x, y1: safe.y, z1: safe.z, x2: start.x, y2: start.y, z2: start.z, setup_id: "main", work_axis: radial },
+      { operation_id: preview.operationId, motion: "cut", x1: start.x, y1: start.y, z1: start.z, x2: end.x, y2: end.y, z2: end.z, setup_id: "main", work_axis: radial },
+      { operation_id: preview.operationId, motion: "rapid", x1: end.x, y1: end.y, z1: end.z, x2: safe.x, y2: safe.y, z2: safe.z, setup_id: "main", work_axis: radial },
+    );
+  }
+  return segments;
+}
+
 const PLANNING_STAGE_ORDER = [
   "uploading", "geometry_analysis", "draft_planning", "drawing_analysis", "ai_planning",
   "process_generation", "coverage_validation", "completed",
@@ -120,6 +174,10 @@ const DEVICE_OPERATION_GROUP_ALIASES: Record<string, string[]> = {
   "小型型腔": ["型腔加工"],
   "雕刻": ["engraving"],
 };
+const L32_DEVICE_ID = "citizen-cincom-l32";
+const l32First = (devices: DeviceLibrary["devices"]) => [...devices].sort(
+  (left, right) => Number(right.id === L32_DEVICE_ID) - Number(left.id === L32_DEVICE_ID),
+);
 
 function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   open: boolean;
@@ -145,8 +203,9 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
     fetch(apiUrl("/api/v1/device-library"))
       .then((response) => response.ok ? response.json() : Promise.reject())
       .then((payload: DeviceLibrary) => {
-        setNewJobDevices(payload.devices);
-        setSelectedNewJobDeviceId((current) => current || payload.devices[0]?.id || "");
+        const devices = l32First(payload.devices);
+        setNewJobDevices(devices);
+        setSelectedNewJobDeviceId((current) => current || devices[0]?.id || "");
       })
       .catch(() => setError("加工设备暂时无法加载"));
   }, [newJobDevices.length, open]);
@@ -283,12 +342,10 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
         </div>
         <section className="new-job-device-picker" aria-label="选择加工设备">
           <div><strong>加工设备</strong><small>工艺将按照所选设备能力生成</small></div>
-          <div>
-            {newJobDevices.map((device) => <button className={selectedNewJobDeviceId === device.id ? "active" : ""} key={device.id} onClick={() => setSelectedNewJobDeviceId(device.id)}>
-              <Cog size={16} />
-              <span><strong>{device.display_name}</strong><small>{device.category_label}</small></span>
-            </button>)}
-          </div>
+          <select aria-label="加工设备" value={selectedNewJobDeviceId} onChange={(event) => setSelectedNewJobDeviceId(event.target.value)}>
+            {newJobDevices.length === 0 && <option value="">正在加载设备…</option>}
+            {newJobDevices.map((device) => <option key={device.id} value={device.id}>{device.display_name} · {device.category_label}</option>)}
+          </select>
         </section>
         {error && <div className="inline-error"><AlertTriangle size={15} />{error}</div>}
         <button className="primary-action" disabled={!stepFile || !drawingFile || !selectedNewJobDeviceId || busy} onClick={submit}>
@@ -438,6 +495,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [toolDraftId, setToolDraftId] = useState(selectedOperation?.tool.id ?? "");
   const [operationPopoverPosition, setOperationPopoverPosition] = useState({ top: 110, left: 326, anchorY: 28 });
   const [playbackMode, setPlaybackMode] = useState<"single" | "cumulative">("single");
+  const [playbackResetToken, setPlaybackResetToken] = useState(0);
   const [showL32Workbench, setShowL32Workbench] = useState(false);
   const [showL32Program, setShowL32Program] = useState(false);
   const [showProcessDesigner, setShowProcessDesigner] = useState(false);
@@ -446,7 +504,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [l32OperationPreview, setL32OperationPreview] = useState<L32TurningPreview | null>(null);
   const [l32TurningPreviews, setL32TurningPreviews] = useState<Record<string, L32TurningPreview>>({});
   const [l32GroovePreviews, setL32GroovePreviews] = useState<Record<string, L32GroovePreview>>({});
-  const [, setL32MillingPreviews] = useState<Record<string, ToolpathSegment[]>>({});
+  const [l32MillingPreviews, setL32MillingPreviews] = useState<Record<string, ToolpathSegment[]>>({});
+  const [l32GrooveSegments, setL32GrooveSegments] = useState<Record<string, ToolpathSegment[]>>({});
   const [l32MaterialSnapshots, setL32MaterialSnapshots] = useState<{ key: string; files: Record<string, string[]> } | null>(null);
   const [l32MaterialSnapshotError, setL32MaterialSnapshotError] = useState<{ key: string; message: string } | null>(null);
   const [l32MillingPreview, setL32MillingPreview] = useState<{
@@ -458,6 +517,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const l32PreviewResponseCacheRef = useRef(new Map<string, Promise<CachedPreviewResponse<unknown>>>());
   const l32PrewarmedOperationIdsRef = useRef(new Set<string>());
   const [loadingL32Program, setLoadingL32Program] = useState(initialJob.device_id === "citizen-cincom-l32");
+  const [warmingL32Previews, setWarmingL32Previews] = useState(false);
 
   const fetchL32PreviewJson = useCallback(<T,>(
     key: string,
@@ -726,8 +786,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     fetch(apiUrl("/api/v1/device-library"))
       .then((response) => response.ok ? response.json() : Promise.reject())
       .then((payload: DeviceLibrary) => {
-        setDeviceLibrary(payload);
-        setSelectedLibraryDeviceId((current) => current || payload.devices[0]?.id || "");
+        const devices = l32First(payload.devices);
+        setDeviceLibrary({ ...payload, devices });
+        setSelectedLibraryDeviceId((current) => current || devices[0]?.id || "");
       })
       .catch(() => setDeviceLibrary({ schema_version: "1.0.0", devices: [] }));
   }, []);
@@ -783,14 +844,16 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         results = grooveResults;
         const groove = grooveResults[0].payload.grooves.find((item) => item.operation_id === operation.id);
         if (!cancelled && grooveResults.every((result) => result.ok) && groove) {
+          const preview = {
+            operationId: operation.id,
+            stockRadius: groove.draft.stock_radius_mm,
+            strips: groove.draft.strips,
+          };
           setL32GroovePreviews((current) => ({
             ...current,
-            [operation.id]: {
-              operationId: operation.id,
-              stockRadius: groove.draft.stock_radius_mm,
-              strips: groove.draft.strips,
-            },
+            [operation.id]: preview,
           }));
+          if (l32Axis) setL32GrooveSegments((current) => ({ ...current, [operation.id]: l32GroovePreviewToSegments(preview, l32Axis) }));
         }
       } else if (operation.type === "pocket_roughing" || operation.type === "pocket_finishing") {
         const featureId = operation.feature_ids.find((id) => id.startsWith("MF-"));
@@ -868,6 +931,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       }
     };
     void (async () => {
+      setWarmingL32Previews(true);
       let nextIndex = 0;
       const worker = async () => {
         while (!cancelled) {
@@ -881,9 +945,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         }
       };
       await Promise.all(Array.from({ length: Math.min(3, operations.length) }, worker));
+      if (!cancelled) setWarmingL32Previews(false);
     })();
     return () => { cancelled = true; };
-  }, [fetchL32PreviewJson, isL32, job.id, job.machine_configuration_hash, job.machine_instance_id, job.plan?.stock.diameter_mm, l32Rotational, operations]);
+  }, [fetchL32PreviewJson, isL32, job.id, job.machine_configuration_hash, job.machine_instance_id, job.plan?.stock.diameter_mm, l32Axis, l32Rotational, operations]);
 
   useEffect(() => {
     if (!isL32 || !job.plan) return undefined;
@@ -988,35 +1053,35 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
 
   const l32OperationPreviewSegments = useMemo<ToolpathSegment[]>(() => {
     if (l32MillingPreview?.operationId === selectedOperation?.id) return l32MillingPreview?.segments ?? EMPTY_TOOLPATH_SEGMENTS;
-    if (!l32OperationPreview || !l32Axis || l32OperationPreview.operationId !== selectedOperation?.id) return EMPTY_TOOLPATH_SEGMENTS;
-    const axisLength = Math.hypot(l32Axis.direction.x, l32Axis.direction.y, l32Axis.direction.z) || 1;
-    const axis = { x: l32Axis.direction.x / axisLength, y: l32Axis.direction.y / axisLength, z: l32Axis.direction.z / axisLength };
-    const helper = Math.abs(axis.z) < 0.9 ? { x: 0, y: 0, z: 1 } : { x: 0, y: 1, z: 0 };
-    const cross = { x: axis.y * helper.z - axis.z * helper.y, y: axis.z * helper.x - axis.x * helper.z, z: axis.x * helper.y - axis.y * helper.x };
-    const crossLength = Math.hypot(cross.x, cross.y, cross.z) || 1;
-    const radial = { x: cross.x / crossLength, y: cross.y / crossLength, z: cross.z / crossLength };
-    const point = (x: number, z: number) => {
-      const axial = l32OperationPreview.channelId === "sub" ? l32OperationPreview.sourceCutoffZ - z : z;
-      const radius = Math.abs(x) / 2;
-      return { x: l32Axis.origin.x + axis.x * axial + radial.x * radius, y: l32Axis.origin.y + axis.y * axial + radial.y * radius, z: l32Axis.origin.z + axis.z * axial + radial.z * radius };
-    };
-    const segments: ToolpathSegment[] = [];
-    for (const channel of l32OperationPreview.draft.toolpath.channels) {
-      const position: Record<string,number> = {};
-      for (const command of channel.commands) {
-        const previous = { ...position };
-        for (const [name,value] of Object.entries(command.axes)) position[name.toUpperCase()] = value;
-        if (!["rapid_move","feed_move","arc_move"].includes(command.type)
-          || previous.X === undefined || previous.Z === undefined || position.X === undefined || position.Z === undefined) continue;
-        const start = point(previous.X,previous.Z), end = point(position.X,position.Z);
-        if (Math.hypot(end.x-start.x,end.y-start.y,end.z-start.z) <= 1e-6) continue;
-        segments.push({ operation_id: l32OperationPreview.operationId, motion: command.type === "rapid_move" ? "rapid" : "cut", x1:start.x,y1:start.y,z1:start.z,x2:end.x,y2:end.y,z2:end.z,setup_id:channel.id,work_axis:radial });
-      }
-    }
-    return segments;
-  }, [l32Axis, l32MillingPreview, l32OperationPreview, selectedOperation?.id]);
+    if (!selectedOperation) return EMPTY_TOOLPATH_SEGMENTS;
+    const cachedMilling = l32MillingPreviews[selectedOperation.id];
+    if (cachedMilling?.length) return cachedMilling;
+    const groove = l32GrooveSegments[selectedOperation.id];
+    if (groove?.length) return groove;
+    const preview = l32OperationPreview?.operationId === selectedOperation.id
+      ? l32OperationPreview : l32TurningPreviews[selectedOperation.id];
+    return preview && l32Axis ? l32TurningPreviewToSegments(preview, l32Axis) : EMPTY_TOOLPATH_SEGMENTS;
+  }, [l32Axis, l32GrooveSegments, l32MillingPreview, l32MillingPreviews, l32OperationPreview, l32TurningPreviews, selectedOperation]);
 
   const l32PreviewOperationId = l32OperationPreview?.operationId ?? l32MillingPreview?.operationId;
+
+  const l32AvailableToolpathSegments = useMemo<ToolpathSegment[]>(() => {
+    if (!isL32) return EMPTY_TOOLPATH_SEGMENTS;
+    return operations.flatMap((operation) => {
+      if (operation.enabled === false) return EMPTY_TOOLPATH_SEGMENTS;
+      if (operation.id === selectedOperation?.id && l32PreviewOperationId === operation.id && l32OperationPreviewSegments.length) {
+        return l32OperationPreviewSegments;
+      }
+      const wholeProgramSegments = l32ToolpathSegments.filter((segment) => segment.operation_id === operation.id);
+      if (wholeProgramSegments.some((segment) => segment.motion === "cut")) return wholeProgramSegments;
+      const milling = l32MillingPreviews[operation.id];
+      if (milling?.some((segment) => segment.motion === "cut")) return milling;
+      const groove = l32GrooveSegments[operation.id];
+      if (groove?.some((segment) => segment.motion === "cut")) return groove;
+      const turning = l32TurningPreviews[operation.id];
+      return turning && l32Axis ? l32TurningPreviewToSegments(turning, l32Axis) : EMPTY_TOOLPATH_SEGMENTS;
+    });
+  }, [isL32, l32Axis, l32GrooveSegments, l32MillingPreviews, l32OperationPreviewSegments, l32PreviewOperationId, l32ToolpathSegments, l32TurningPreviews, operations, selectedOperation?.id]);
 
   const visibleTurningStage = useMemo<TurningStageView | null>(() => {
     if (!isL32 || activeMode !== "仿真" || !selectedOperation || !l32Axis) return null;
@@ -1120,8 +1185,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }, [activeMode, isL32, l32Axis, l32GroovePreviews, l32OperationPreview, l32Program, l32TurningPreviews, l32WholePartBlocked, operations, selectedOperation]);
 
   const visibleToolpathSegments = useMemo(() => {
-    if (isL32 && l32PreviewOperationId === selectedOperation?.id) return l32OperationPreviewSegments;
-    if (isL32 && l32WholePartBlocked) return EMPTY_TOOLPATH_SEGMENTS;
+    if (isL32 && playbackMode === "single" && l32OperationPreviewSegments.some((segment) => segment.motion === "cut")) return l32OperationPreviewSegments;
+    if (isL32 && l32WholePartBlocked && activeMode !== "仿真") return EMPTY_TOOLPATH_SEGMENTS;
     if (activeMode === "刀路") return isL32 ? l32ToolpathSegments : camResult?.preview_segments ?? [];
     if (activeMode !== "仿真" || !selectedOperation) return EMPTY_TOOLPATH_SEGMENTS;
     const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
@@ -1129,28 +1194,42 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       (playbackMode === "single"
         ? operations.slice(Math.max(selectedIndex, 0), Math.max(selectedIndex, 0) + 1)
         : operations.slice(0, Math.max(selectedIndex, 0) + 1)
-      ).map((operation) => operation.id),
+      ).filter((operation) => operation.enabled !== false).map((operation) => operation.id),
     );
-    const sourceSegments = isL32 ? l32ToolpathSegments : camResult?.preview_segments ?? EMPTY_TOOLPATH_SEGMENTS;
+    const sourceSegments = isL32 ? l32AvailableToolpathSegments : camResult?.preview_segments ?? EMPTY_TOOLPATH_SEGMENTS;
+    const operationOrder = new Map(operations.map((operation, index) => [operation.id, index]));
     const visibleSegments = sourceSegments.filter(
       (segment) => visibleOperationIds.has(segment.operation_id),
-    );
+    ).sort((left, right) => (operationOrder.get(left.operation_id) ?? 0) - (operationOrder.get(right.operation_id) ?? 0));
     return visibleSegments.some((segment) => segment.motion === "cut") ? visibleSegments : EMPTY_TOOLPATH_SEGMENTS;
   },
-    [activeMode, camResult?.preview_segments, isL32, l32OperationPreviewSegments, l32PreviewOperationId, l32ToolpathSegments, l32WholePartBlocked, operations, playbackMode, selectedOperation],
+    [activeMode, camResult?.preview_segments, isL32, l32AvailableToolpathSegments, l32OperationPreviewSegments, l32ToolpathSegments, l32WholePartBlocked, operations, playbackMode, selectedOperation],
   );
   const l32MaterialRequestKey = `${job.id}:${job.machine_configuration_hash ?? "unbound"}:${JSON.stringify(job.plan?.setups ?? [])}`;
-  const visibleMaterialSnapshots = useMemo(
-    () => isL32 && activeMode === "仿真" && selectedOperation && l32MaterialSnapshots?.key === l32MaterialRequestKey
-      ? l32MaterialSnapshots.files[selectedOperation.id] ?? []
-      : [],
-    [activeMode, isL32, l32MaterialRequestKey, l32MaterialSnapshots, selectedOperation],
-  );
+  const visibleMaterialSnapshots = useMemo(() => {
+    const urls: string[] = [];
+    const stages: { operationId: string; start: number; count: number }[] = [];
+    if (isL32 && activeMode === "仿真" && selectedOperation && l32MaterialSnapshots?.key === l32MaterialRequestKey) {
+      const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
+      const included = playbackMode === "single"
+        ? [selectedOperation]
+        : operations.slice(0, selectedIndex + 1).filter((operation) => operation.enabled !== false);
+      for (const operation of included) {
+        const files = l32MaterialSnapshots.files[operation.id] ?? [];
+        stages.push({ operationId: operation.id, start: urls.length, count: files.length });
+        urls.push(...files);
+      }
+    }
+    return { urls, stages };
+  }, [activeMode, isL32, l32MaterialRequestKey, l32MaterialSnapshots, operations, playbackMode, selectedOperation]);
+  const missingMaterialStages = visibleMaterialSnapshots.stages
+    .filter((stage) => stage.count === 0 && visibleToolpathSegments.some((segment) => segment.operation_id === stage.operationId && segment.motion === "cut"))
+    .map((stage) => stage.operationId);
   const awaitingL32MaterialSnapshots = isL32 && activeMode === "仿真"
     && selectedOperation != null
     && selectedOperation.enabled !== false
-    && ["turn_facing", "turn_od_roughing", "turn_od_finishing", "turn_grooving", "live_tool_contour_roughing", "live_tool_contour_finishing", "pocket_roughing", "pocket_finishing"].includes(selectedOperation.type)
-    && visibleMaterialSnapshots.length === 0;
+    && ["turn_facing", "turn_od_roughing", "turn_od_finishing", "turn_grooving", "turn_cutoff", "live_tool_contour_roughing", "live_tool_contour_finishing", "pocket_roughing", "pocket_finishing"].includes(selectedOperation.type)
+    && (l32MaterialSnapshots?.key !== l32MaterialRequestKey || !(l32MaterialSnapshots.files[selectedOperation.id]?.length));
   const initialToolpathSegments = useMemo(() => {
     if (activeMode !== "仿真" || playbackMode !== "single" || !selectedOperation) return EMPTY_TOOLPATH_SEGMENTS;
     const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
@@ -1271,7 +1350,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   };
 
   const openOperationDetails = (operation: Operation, anchor: HTMLElement) => {
-    chooseOperation(operation);
+    setSelectedOperation(operation);
+    setSelectedFeatureIds(operation.feature_ids);
+    setActiveMode("工艺");
     setEditingOperationDetails(false);
     setToolDraftId(operation.tool.id);
     setParameterEdits({});
@@ -1293,6 +1374,19 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       anchorY: Math.min(panelHeight - 24, Math.max(24, anchorCenter - top)),
     });
     setShowOperationDetails(true);
+  };
+
+  const openOperationSimulation = (operation: Operation) => {
+    if (operation.enabled === false) return;
+    if (camResult && !isL32 && !cutOperationIds.has(operation.id)) return;
+    setSelectedOperation(operation);
+    setSelectedFeatureIds(operation.feature_ids);
+    setEditingOperationDetails(false);
+    setShowOperationDetails(false);
+    setPlaybackResetToken((current) => current + 1);
+    setLoadingCam(!camResult && !isL32);
+    setActiveMode("仿真");
+    if (isL32) void previewL32Operation(operation);
   };
 
   const cancelOperationEdit = () => {
@@ -1437,7 +1531,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     setL32OperationPreview(null);
     setL32TurningPreviews({});
     setL32GroovePreviews({});
+    setL32GrooveSegments({});
     setL32MillingPreviews({});
+    setWarmingL32Previews(false);
     setL32MaterialSnapshots(null);
     setL32MaterialSnapshotError(null);
     setL32MillingPreview(null);
@@ -1507,37 +1603,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         if (!groove) throw new Error("未找到当前切槽工序对应的精确轮廓");
         if (!groove.draft.actual_tool_fits_floor) throw new Error("当前切槽刀宽度大于槽底宽度");
         if (!sweep.target_gouge_check_passed) throw new Error("切槽刀路未通过原始 STEP 过切检查");
-        setL32GroovePreviews((current) => ({
-          ...current,
-          [operation.id]: {
-            operationId: operation.id,
-            stockRadius: groove.draft.stock_radius_mm,
-            strips: groove.draft.strips,
-          },
-        }));
-        const axisLength = Math.hypot(l32Axis.direction.x, l32Axis.direction.y, l32Axis.direction.z) || 1;
-        const axis = { x:l32Axis.direction.x/axisLength, y:l32Axis.direction.y/axisLength, z:l32Axis.direction.z/axisLength };
-        const helper = Math.abs(axis.z) < 0.9 ? { x:0,y:0,z:1 } : { x:0,y:1,z:0 };
-        const cross = { x:axis.y*helper.z-axis.z*helper.y, y:axis.z*helper.x-axis.x*helper.z, z:axis.x*helper.y-axis.y*helper.x };
-        const crossLength = Math.hypot(cross.x,cross.y,cross.z) || 1;
-        const radial = { x:cross.x/crossLength,y:cross.y/crossLength,z:cross.z/crossLength };
-        const point = (z:number,radius:number) => ({
-          x:l32Axis.origin.x+axis.x*z+radial.x*radius,
-          y:l32Axis.origin.y+axis.y*z+radial.y*radius,
-          z:l32Axis.origin.z+axis.z*z+radial.z*radius,
-        });
-        const segments: ToolpathSegment[] = [];
-        for (const strip of groove.draft.strips) {
-          const axial = (strip.z_min_mm + strip.z_max_mm) / 2;
-          const safe = point(axial, groove.draft.stock_radius_mm + 0.5);
-          const start = point(axial, groove.draft.stock_radius_mm);
-          const end = point(axial, strip.cut_to_radius_mm);
-          segments.push(
-            { operation_id:previewOperation.id,motion:"rapid",x1:safe.x,y1:safe.y,z1:safe.z,x2:start.x,y2:start.y,z2:start.z,setup_id:"main",work_axis:radial },
-            { operation_id:previewOperation.id,motion:"cut",x1:start.x,y1:start.y,z1:start.z,x2:end.x,y2:end.y,z2:end.z,setup_id:"main",work_axis:radial },
-            { operation_id:previewOperation.id,motion:"rapid",x1:end.x,y1:end.y,z1:end.z,x2:safe.x,y2:safe.y,z2:safe.z,setup_id:"main",work_axis:radial },
-          );
-        }
+        const preview = { operationId: operation.id, stockRadius: groove.draft.stock_radius_mm, strips: groove.draft.strips };
+        const segments = l32GroovePreviewToSegments(preview, l32Axis);
+        setL32GroovePreviews((current) => ({ ...current, [operation.id]: preview }));
+        setL32GrooveSegments((current) => ({ ...current, [operation.id]: segments }));
         if (requestId === l32PreviewRequestRef.current) {
           setL32OperationPreview(null);
           setL32MillingPreview({ operationId:operation.id, segments });
@@ -1950,7 +2019,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       </header>
       <nav className="compact-mode-toolbar" aria-label="工作模式">
         {["特征", "工艺", "刀路", "仿真"].map((mode) => <button key={mode} className={activeMode === mode ? "active" : ""} onClick={() => chooseMode(mode)}>{isSheetForming && mode === "刀路" ? "成形" : mode}</button>)}
-        {isL32 && <button className="l32-mode-entry" onClick={() => setShowL32Program(true)}>L32 CAM</button>}
       </nav>
 
       {showL32Program && <L32ProgramViewer
@@ -2006,14 +2074,13 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           <div className="operation-library-body">
           <div className="operation-library-content">
             <section className="operation-device-picker" aria-label="选择设备">
-              <div><strong>选择设备</strong><small>左右滑动查看更多设备</small></div>
-              <div className="operation-device-scroll">
-                {(deviceLibrary?.devices ?? []).map((device) => <div className={`operation-device-option ${selectedLibraryDevice?.id === device.id ? "active" : ""}`} key={device.id}>
-                  <button className="operation-device-select" onClick={() => setSelectedLibraryDeviceId(device.id)}>
-                    <Cog size={15} /><span><strong>{device.display_name}</strong><small>{device.category_label}</small></span>
-                  </button>
-                  <button className={`operation-device-info ${deviceInfoId === device.id ? "active" : ""}`} aria-label={`查看 ${device.display_name} 设备详情`} title="设备详情" onClick={() => setDeviceInfoId((current) => current === device.id ? null : device.id)}><Info size={11} strokeWidth={2} /></button>
-                </div>)}
+              <div><strong>选择设备</strong></div>
+              <div className="operation-device-dropdown">
+                <select aria-label="工序库设备" value={selectedLibraryDevice?.id ?? ""} onChange={(event) => { setSelectedLibraryDeviceId(event.target.value); setDeviceInfoId(null); }}>
+                  {!deviceLibrary && <option value="">正在加载设备…</option>}
+                  {(deviceLibrary?.devices ?? []).map((device) => <option key={device.id} value={device.id}>{device.display_name} · {device.category_label}</option>)}
+                </select>
+                <button className={`operation-device-info ${deviceInfoId === selectedLibraryDevice?.id ? "active" : ""}`} aria-label={`查看 ${selectedLibraryDevice?.display_name ?? "当前设备"} 设备详情`} title="设备详情" disabled={!selectedLibraryDevice} onClick={() => setDeviceInfoId((current) => current === selectedLibraryDevice?.id ? null : selectedLibraryDevice?.id ?? null)}><Info size={14} strokeWidth={2} /></button>
               </div>
             </section>
             <div className="operation-library-grid">
@@ -2070,9 +2137,14 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
                 <div key={setup.id} className="setup-tree">
                   <div className="tree-section"><strong><Rotate3D size={15} /> {setup.name}</strong><small>{setup.fixture}</small></div>
                   {setup.operations.map((operation) => (
-                    <button key={operation.id} disabled={activeMode === "仿真" && Boolean(camResult) && !cutOperationIds.has(operation.id)} className={`${selectedOperation?.id === operation.id ? "selected" : ""} ${operation.enabled === false ? "suppressed" : ""} ${generatingCam && camProgress?.operation_id === operation.id ? "stream-active" : ""} ${activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? "unavailable" : ""}`} onClick={(event) => openOperationDetails(operation, event.currentTarget)}>
-                      <span>{operation.id}</span><div><strong>{operation.name}</strong><small>{operation.tool.name}{activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id) ? " · 无有效刀路" : ""}</small></div>
-                    </button>
+                    <div key={operation.id} className={`operation-tree-row ${selectedOperation?.id === operation.id ? "selected" : ""} ${operation.enabled === false ? "suppressed" : ""} ${generatingCam && camProgress?.operation_id === operation.id ? "stream-active" : ""}`}>
+                      <button className="operation-tree-main" title={`查看 ${operation.id} 仿真`} disabled={operation.enabled === false || (Boolean(camResult) && !isL32 && !cutOperationIds.has(operation.id))} onClick={() => openOperationSimulation(operation)}>
+                        <span>{operation.id}</span><div><strong>{operation.name}</strong><small>{operation.tool.name}</small></div>
+                      </button>
+                      <div className="operation-tree-actions">
+                        <button aria-label={`查看 ${operation.id} 工序详情`} title="查看工序详情" onClick={(event) => openOperationDetails(operation, event.currentTarget)}><Info size={15} /></button>
+                      </div>
+                    </div>
                   ))}
                 </div>
               ))}
@@ -2134,10 +2206,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
                 </>
               ) : <p className="empty-panel">选择一道工序查看规划依据。</p>}
             </div>
-            <footer className={`operation-edit-footer ${!readOnly && editingOperationDetails ? "editing" : ""}`}>
-              <span className="compact-confidence">置信度 <strong>{Math.round(selectedOperation.confidence * 100)}%</strong></span>
-              {!readOnly && editingOperationDetails && <><button onClick={cancelOperationEdit} disabled={operationBusy}>取消</button><button className="primary" onClick={saveOperationEdits} disabled={operationBusy}>{operationBusy ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} />}{operationBusy ? "保存并校核中…" : "保存并重新检验"}</button></>}
-            </footer>
+            {!readOnly && editingOperationDetails && <footer className="operation-edit-footer editing">
+              <button onClick={cancelOperationEdit} disabled={operationBusy}>取消</button><button className="primary" onClick={saveOperationEdits} disabled={operationBusy}>{operationBusy ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} />}{operationBusy ? "保存并校核中…" : "保存并重新检验"}</button>
+            </footer>}
           </section>}
         </aside>
 
@@ -2161,29 +2232,35 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             {l32MaterialSnapshotError?.key === l32MaterialRequestKey || l32MaterialSnapshots?.key === l32MaterialRequestKey ? <AlertTriangle size={15} /> : <LoaderCircle className="spin" size={15} />}
             <span>{l32MaterialSnapshotError?.key === l32MaterialRequestKey ? l32MaterialSnapshotError.message : l32MaterialSnapshots?.key === l32MaterialRequestKey ? "当前工序没有可用的实体材料帧；画面仅供刀路参考。" : "正在预生成实体材料的逐帧变化；当前显示暂不代表加工结果。"}</span>
           </div>}
+          {isL32 && activeMode === "仿真" && playbackMode === "cumulative" && missingMaterialStages.length > 0 && <div className="l32-material-snapshot-status failed">
+            <AlertTriangle size={15} />
+            <span>{missingMaterialStages.join("、")} 没有实体材料帧；累计播放在这些工序只展示刀路，不代表已验证的材料去除。</span>
+          </div>}
           <ModelViewer
             modelUrl={`${apiUrl(job.model_url)}?solid=${selectedSolidIndex}`}
             features={viewerFeatures}
             selectedFeatureIds={selectedFeatureIds}
             onSelectFeature={chooseFeature}
             toolpathSegments={visibleToolpathSegments}
-            materialSnapshotUrls={visibleMaterialSnapshots}
+            materialSnapshotUrls={visibleMaterialSnapshots.urls}
+            materialSnapshotStages={visibleMaterialSnapshots.stages}
             initialToolpathSegments={initialToolpathSegments}
             profileBoundaries={visibleProfileBoundaries}
             simulation={visibleSimulation}
-            simulationBlocked={isL32 && playbackMode === "cumulative" && l32WholePartBlocked && l32PreviewOperationId !== selectedOperation?.id && previewingL32OperationId !== selectedOperation?.id && (activeMode === "仿真" || activeMode === "刀路")}
-            turningStage={visibleMaterialSnapshots.length ? null : visibleTurningStage}
+            simulationBlocked={isL32 && playbackMode === "cumulative" && l32WholePartBlocked && visibleMaterialSnapshots.urls.length === 0 && l32PreviewOperationId !== selectedOperation?.id && previewingL32OperationId !== selectedOperation?.id && (activeMode === "仿真" || activeMode === "刀路")}
+            turningStage={visibleMaterialSnapshots.urls.length ? null : visibleTurningStage}
             camoticsSurface={visibleCamoticsSurface}
             fixtureComponents={visibleFixtureComponents}
-            animateToolpath={activeMode === "仿真" && (playbackMode === "single" || !l32WholePartBlocked || l32PreviewOperationId === selectedOperation?.id)}
+            animateToolpath={activeMode === "仿真" && (playbackMode === "single" || !l32WholePartBlocked || visibleMaterialSnapshots.urls.length > 0 || l32PreviewOperationId === selectedOperation?.id)}
             initialProgress={initialSimulationProgress}
+            playbackResetToken={playbackResetToken}
             operationTools={operationTools}
             topologyEdges={visibleTopologyEdges}
             activeOperationId={selectedOperation?.id}
             isFinalOperation={selectedOperation?.id === operations[operations.length - 1]?.id}
             playbackMode={playbackMode}
             onPlaybackModeChange={setPlaybackMode}
-            toolpathLoaded={isL32 ? !loadingL32Program : !loadingCam}
+            toolpathLoaded={isL32 ? !loadingL32Program && (l32Program !== null || !warmingL32Previews) : !loadingCam}
             formingPreview={activeMode === "仿真" ? camResult?.forming_preview ?? null : null}
             spatialDefects={activeMode === "仿真" ? spatialDefects : null}
             onSelectDefect={chooseSpatialDefect}
@@ -2192,17 +2269,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             activeOperationLabel={selectedOperation?.name}
           />
           <nav className="inspection-rail" aria-label="工程检查与工艺工具">
-            {drawingRequirements && <button className={`inspection-card ${drawingRequirements.status} ${inspectionPanel === "drawing" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => setInspectionPanel((current) => current === "drawing" ? null : "drawing")} title="查看图纸要求绑定状态">
-              {drawingRequirements.unresolved_requirement_ids.length > 0 && <em>{drawingRequirements.unresolved_requirement_ids.length}</em>}
+            {drawingRequirements && <button className={`inspection-card ${inspectionPanel === "drawing" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => setInspectionPanel((current) => current === "drawing" ? null : "drawing")} title="查看图纸要求绑定状态">
               <FileUp size={19} />
               <strong>图纸要求</strong>
               <small>{drawingRequirements.summary.matched}/{drawingRequirements.summary.total}</small>
-            </button>}
-            {coverage && <button className={`inspection-card ${coverage.status} ${inspectionPanel === "coverage" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => setInspectionPanel((current) => current === "coverage" ? null : "coverage")} title="查看制造特征与工序覆盖状态">
-              {coverage.unresolved_count > 0 && <em>{coverage.unresolved_count}</em>}
-              <CircleDot size={19} />
-              <strong>工艺覆盖</strong>
-              <small>{Math.round(coverage.score * 100)}%</small>
             </button>}
             {reviewCount > 0 && <button className="inspection-card review" onClick={openReviewQueue} title="查看待人工复核的制造特征">
               <em>{reviewCount}</em>
@@ -2224,11 +2294,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               <Wrench size={19} />
               <strong>刀具库</strong>
               <small>现场刀具</small>
-            </button>}
-            {isL32 && <button className="inspection-card l32" onClick={() => setShowL32Program(true)} title="打开 L32 CAM 程序">
-              <Cog size={19} />
-              <strong>L32 CAM</strong>
-              <small>真实刀路</small>
             </button>}
           </nav>
           {inspectionPanel === "tools" && <section ref={inspectionPanelRef} className="tool-library-container"><ToolLibraryPanel machineInstanceId={job.machine_instance_id} catalogTools={catalogs?.tools ?? []} apiUrl={apiUrl} onClose={() => setInspectionPanel(null)} readOnly={readOnly} /></section>}
