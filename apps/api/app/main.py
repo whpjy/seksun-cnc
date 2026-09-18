@@ -697,12 +697,52 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
     region = job.plan.stock.get("nonrotational_region_z_mm")
     if not isinstance(region, list) or len(region) != 2:
         raise HTTPException(status_code=422, detail="Nonrotational stock region is unavailable")
+    source_profile = next(
+        (profile for profile in rotational.profiles if profile.id == job.plan.stock.get("rotational_profile_id")),
+        None,
+    )
+    if source_profile is None or source_profile.review_state != "accepted":
+        raise HTTPException(status_code=422, detail="Accepted outer rotational profile is unavailable")
+    face_operation = next((item for item in operations if item.enabled is not False and item.type == "turn_facing"), None)
+    rough_operation = next((item for item in operations if item.enabled is not False and item.type == "turn_od_roughing"), None)
+    front_min = max(max(float(region[0]), float(region[1])), min(point.z for point in source_profile.points))
+    front_max = float(face_operation.parameters.get("face_z_mm", max(point.z for point in source_profile.points))) if face_operation else max(point.z for point in source_profile.points)
+    if front_max <= front_min:
+        raise HTTPException(status_code=422, detail="Front turning region has no axial extent")
+    stock_radius = float(job.plan.stock["diameter_mm"]) / 2
+    rough_allowance = float(rough_operation.parameters.get("radial_allowance_mm", 0.3)) if rough_operation else 0.3
+    front_profile_radius = max(point.radius for point in source_profile.points if front_min - 1e-6 <= point.z <= front_max + 1e-6)
+    grooves: dict[str, dict[str, float]] = {}
     pockets: dict[str, dict[str, object]] = {}
     stages: list[dict[str, object]] = []
     for operation in operations:
         if operation.enabled is False:
             continue
-        if operation.type == "live_tool_contour_roughing":
+        if operation.type == "turn_facing":
+            stages.append({"operation_id": operation.id, "kind": "face", "rough": False})
+        elif operation.type in {"turn_od_roughing", "turn_od_finishing"}:
+            stages.append({"operation_id": operation.id, "kind": "front", "rough": operation.type == "turn_od_roughing"})
+        elif operation.type == "turn_grooving" and operation.workpiece_side == "front":
+            feature = next((item for item in rotational.features if item.id in operation.feature_ids and item.kind == "external_groove_candidate"), None)
+            if feature:
+                try:
+                    draft = build_front_groove_geometry_draft(
+                        source_profile, feature,
+                        stock_radius_mm=stock_radius,
+                        actual_planned_tool_width_mm=float(operation.tool.cutting_width_mm or 0),
+                    )
+                except (TypeError, ValueError):
+                    # An unconfigured groove must not prevent other operations
+                    # from obtaining their independently valid stock snapshots.
+                    continue
+                grooves[operation.id] = {
+                    "minimum": min(strip.z_min_mm for strip in draft.strips),
+                    "maximum": max(strip.z_max_mm for strip in draft.strips),
+                    "radius": max(feature.radius_start, feature.radius_end) + feature.depth_mm,
+                    "floor_radius": min(feature.radius_start, feature.radius_end),
+                }
+                stages.append({"operation_id": operation.id, "kind": "groove", "rough": False})
+        elif operation.type == "live_tool_contour_roughing":
             stages.append({"operation_id": operation.id, "kind": "exterior", "rough": True})
         elif operation.type == "live_tool_contour_finishing":
             stages.append({"operation_id": operation.id, "kind": "exterior", "rough": False})
@@ -726,14 +766,25 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
     context = {
         "axis_origin": axis.origin.model_dump(mode="json"),
         "axis_direction": axis.direction.model_dump(mode="json"),
-        "stock_radius": float(job.plan.stock["diameter_mm"]) / 2,
+        "stock_radius": stock_radius,
         "region_min": min(float(region[0]), float(region[1])),
         "region_max": max(float(region[0]), float(region[1])),
+        "front_region_min": front_min,
+        "front_region_max": front_max,
+        "front_rough_radius": min(stock_radius, front_profile_radius + rough_allowance),
+        "front_floor_radius": min(
+            (point.radius for point in source_profile.points
+             if front_min - 1e-6 <= point.z <= front_max + 1e-6
+             and not any(groove["minimum"] <= point.z <= groove["maximum"] for groove in grooves.values())),
+            default=min(point.radius for point in source_profile.points if front_min - 1e-6 <= point.z <= front_max + 1e-6),
+        ),
+        "face_overhang": float(job.plan.stock.get("allowance_mm", {}).get("axial", 2.0)),
+        "grooves": grooves,
         "pockets": pockets,
     }
     stages_json = json.dumps({"stages": stages, "context": context}, separators=(",", ":"))
     signature = hashlib.sha256(
-        f"material-binary-v7:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
+        f"material-binary-v10:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
     ).hexdigest()
     manifest_path = directory / "l32-material-snapshots.json"
     stages_path = directory / "l32-material-stages.json"

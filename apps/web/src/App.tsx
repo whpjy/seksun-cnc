@@ -1148,7 +1148,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   );
   const awaitingL32MaterialSnapshots = isL32 && activeMode === "仿真"
     && selectedOperation != null
-    && /^(OP34-NR-R|OP36-NR-F|OP52-P1-R|OP53-P1-F)$/.test(selectedOperation.id)
+    && selectedOperation.enabled !== false
+    && ["turn_facing", "turn_od_roughing", "turn_od_finishing", "turn_grooving", "live_tool_contour_roughing", "live_tool_contour_finishing", "pocket_roughing", "pocket_finishing"].includes(selectedOperation.type)
     && visibleMaterialSnapshots.length === 0;
   const initialToolpathSegments = useMemo(() => {
     if (activeMode !== "仿真" || playbackMode !== "single" || !selectedOperation) return EMPTY_TOOLPATH_SEGMENTS;
@@ -2156,9 +2157,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             {previewingL32OperationId === selectedOperation.id ? <LoaderCircle className="spin" size={15} /> : l32PreviewOperationId === selectedOperation.id ? <Check size={15} /> : <Info size={15} />}
             <span>{operationMessage}</span>
           </div>}
-          {awaitingL32MaterialSnapshots && <div className={`l32-material-snapshot-status ${l32MaterialSnapshotError?.key === l32MaterialRequestKey ? "failed" : ""}`}>
-            {l32MaterialSnapshotError?.key === l32MaterialRequestKey ? <AlertTriangle size={15} /> : <LoaderCircle className="spin" size={15} />}
-            <span>{l32MaterialSnapshotError?.key === l32MaterialRequestKey ? l32MaterialSnapshotError.message : "正在预生成实体材料的逐帧变化；当前显示暂不代表加工结果。"}</span>
+          {awaitingL32MaterialSnapshots && <div className={`l32-material-snapshot-status ${l32MaterialSnapshotError?.key === l32MaterialRequestKey || l32MaterialSnapshots?.key === l32MaterialRequestKey ? "failed" : ""}`}>
+            {l32MaterialSnapshotError?.key === l32MaterialRequestKey || l32MaterialSnapshots?.key === l32MaterialRequestKey ? <AlertTriangle size={15} /> : <LoaderCircle className="spin" size={15} />}
+            <span>{l32MaterialSnapshotError?.key === l32MaterialRequestKey ? l32MaterialSnapshotError.message : l32MaterialSnapshots?.key === l32MaterialRequestKey ? "当前工序没有可用的实体材料帧；画面仅供刀路参考。" : "正在预生成实体材料的逐帧变化；当前显示暂不代表加工结果。"}</span>
           </div>}
           <ModelViewer
             modelUrl={`${apiUrl(job.model_url)}?solid=${selectedSolidIndex}`}
@@ -2171,7 +2172,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             profileBoundaries={visibleProfileBoundaries}
             simulation={visibleSimulation}
             simulationBlocked={isL32 && playbackMode === "cumulative" && l32WholePartBlocked && l32PreviewOperationId !== selectedOperation?.id && previewingL32OperationId !== selectedOperation?.id && (activeMode === "仿真" || activeMode === "刀路")}
-            turningStage={visibleTurningStage}
+            turningStage={visibleMaterialSnapshots.length ? null : visibleTurningStage}
             camoticsSurface={visibleCamoticsSurface}
             fixtureComponents={visibleFixtureComponents}
             animateToolpath={activeMode === "仿真" && (playbackMode === "single" || !l32WholePartBlocked || l32PreviewOperationId === selectedOperation?.id)}

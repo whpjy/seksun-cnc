@@ -86,6 +86,33 @@ def main():
         start,
         axis,
     )
+    front_min = float(context["front_region_min"])
+    front_max = float(context["front_region_max"])
+    front_length = front_max - front_min
+    front_start = origin + axis * front_min
+    face_cap = Part.makeCylinder(
+        float(context["stock_radius"]),
+        float(context["face_overhang"]),
+        origin + axis * front_max,
+        axis,
+    )
+    front_stock = Part.makeCylinder(float(context["stock_radius"]), front_length, front_start, axis)
+    rough_core = Part.makeCylinder(float(context["front_rough_radius"]), front_length, front_start, axis)
+    groove_shapes = {
+        operation_id: Part.makeCylinder(
+            float(groove["radius"]),
+            float(groove["maximum"]) - float(groove["minimum"]),
+            origin + axis * float(groove["minimum"]),
+            axis,
+        ).cut(target)
+        for operation_id, groove in context.get("grooves", {}).items()
+    }
+    groove_fill = Part.makeCompound(list(groove_shapes.values())) if groove_shapes else None
+    front_removal = front_stock.cut(target)
+    if groove_fill is not None:
+        front_removal = front_removal.cut(groove_fill)
+    front_rough = front_removal.cut(rough_core)
+    front_finish = front_removal.cut(front_rough)
 
     pocket_shapes = {
         feature_id: pocket_fill(draft)
@@ -103,7 +130,16 @@ def main():
     stage_kinds = {(stage["kind"], stage.get("feature_id"), stage["rough"]) for stage in stages}
     stage_volumes = []
     for stage in stages:
-        if stage["kind"] == "exterior":
+        if stage["kind"] == "face":
+            stage_volumes.append(face_cap.cut(target))
+        elif stage["kind"] == "front":
+            paired = ("front", None, not stage["rough"]) in stage_kinds
+            stage_volumes.append(
+                (front_rough if stage["rough"] else front_finish) if paired else front_removal
+            )
+        elif stage["kind"] == "groove":
+            stage_volumes.append(groove_shapes[stage["operation_id"]])
+        elif stage["kind"] == "exterior":
             paired = ("exterior", None, not stage["rough"]) in stage_kinds
             stage_volumes.append(
                 (exterior_rough if stage["rough"] else exterior_finish) if paired else exterior_removal
@@ -121,6 +157,20 @@ def main():
         files = []
         volumes = []
         frame_count = 20
+        radial_limits = None
+        if stage["kind"] == "face":
+            radial_limits = (0.0, float(context["stock_radius"]), front_max, front_max + float(context["face_overhang"]))
+        elif stage["kind"] == "front":
+            paired = ("front", None, not stage["rough"]) in stage_kinds
+            minimum = float(context["front_rough_radius"]) if paired and stage["rough"] else float(context["front_floor_radius"])
+            maximum = float(context["front_rough_radius"]) if paired and not stage["rough"] else float(context["stock_radius"])
+            radial_limits = (minimum, maximum, front_min, front_max)
+        elif stage["kind"] == "groove":
+            groove = context["grooves"][stage["operation_id"]]
+            radial_limits = (
+                float(groove["floor_radius"]), float(groove["radius"]),
+                float(groove["minimum"]), float(groove["maximum"]),
+            )
         bounds = removal.BoundBox
         lengths = [bounds.XLength, bounds.YLength, bounds.ZLength]
         axis_index = max(range(3), key=lengths.__getitem__)
@@ -133,10 +183,19 @@ def main():
             elif frame == frame_count - 1:
                 remaining = None
             else:
-                candidates = [
-                    removal.cut(bounds_box(removal, axis_index, ratio)),
-                    removal.common(remaining_box(removal, axis_index, ratio)),
-                ]
+                if radial_limits is not None:
+                    min_radius, max_radius, min_z, max_z = radial_limits
+                    keep_radius = max_radius - (max_radius - min_radius) * ratio
+                    keep_cylinder = Part.makeCylinder(
+                        keep_radius, max_z - min_z + 0.2,
+                        origin + axis * (min_z - 0.1), axis,
+                    )
+                    candidates = [removal.common(keep_cylinder)]
+                else:
+                    candidates = [
+                        removal.cut(bounds_box(removal, axis_index, ratio)),
+                        removal.common(remaining_box(removal, axis_index, ratio)),
+                    ]
                 valid = [
                     candidate for candidate in candidates
                     if not candidate.isNull() and 1e-8 < candidate.Volume <= previous_remaining.Volume + 1e-8

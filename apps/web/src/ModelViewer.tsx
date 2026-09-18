@@ -125,7 +125,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   }, [onSelectDefect]);
 
   useEffect(() => {
-    const autoPlay = Boolean(turningStage && toolpathSegments.length);
+    const autoPlay = Boolean((turningStage || materialSnapshotUrls.length) && toolpathSegments.length);
     playbackRef.current.playing = autoPlay;
     playbackRef.current.progress = 0;
     const reset = window.setTimeout(() => {
@@ -134,7 +134,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       setActiveMotion(null);
     }, 0);
     return () => window.clearTimeout(reset);
-  }, [activeOperationId, playbackMode, toolpathSegments.length, turningStage]);
+  }, [activeOperationId, materialSnapshotUrls.length, playbackMode, toolpathSegments.length, turningStage]);
 
   useEffect(() => {
     selectedIdsRef.current = selectedFeatureIds;
