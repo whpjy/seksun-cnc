@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from math import pi, sqrt
+from math import atan2, degrees, pi, sqrt
 
-from .catalogs import get_tool, resolve_machine, resolve_material
+from .catalogs import enrich_tool, get_tool, resolve_machine, resolve_material
 from .coverage import evaluate_plan_coverage
 from .manufacturing_knowledge import assess_plan_knowledge
 from .models import Bounds, GeometryAnalysis, ManufacturingRequirements, ProcessPlan, Setup, Tool, Vec3
@@ -258,6 +258,40 @@ def build_l32_process_plan(
             and item.review_state == "accepted"
             and min(item.length, item.width) >= 1.0
         ]
+        indexed_back_holes = []
+        if spindle_axis is not None:
+            axis = spindle_axis.direction
+            axis_length = sqrt(axis.x ** 2 + axis.y ** 2 + axis.z ** 2)
+            if axis_length > 1e-9:
+                axis = Vec3(x=axis.x / axis_length, y=axis.y / axis_length, z=axis.z / axis_length)
+                front_z = max(z_values)
+                back_z = finished_back_z
+                for hole in analysis.cylindrical_features:
+                    if hole.kind != "hole" or hole.review_state != "accepted":
+                        continue
+                    hole_axis_length = sqrt(hole.axis.x ** 2 + hole.axis.y ** 2 + hole.axis.z ** 2)
+                    if hole_axis_length <= 1e-9:
+                        continue
+                    parallel = abs(
+                        (hole.axis.x * axis.x + hole.axis.y * axis.y + hole.axis.z * axis.z)
+                        / hole_axis_length
+                    )
+                    projected = hole.center.x * axis.x + hole.center.y * axis.y + hole.center.z * axis.z
+                    local_projection = (
+                        (hole.center.x - spindle_axis.origin.x) * axis.x
+                        + (hole.center.y - spindle_axis.origin.y) * axis.y
+                        + (hole.center.z - spindle_axis.origin.z) * axis.z
+                    )
+                    radial_x = hole.center.x - spindle_axis.origin.x - local_projection * axis.x
+                    radial_y = hole.center.y - spindle_axis.origin.y - local_projection * axis.y
+                    radial_z = hole.center.z - spindle_axis.origin.z - local_projection * axis.z
+                    radial_offset = sqrt(radial_x ** 2 + radial_y ** 2 + radial_z ** 2)
+                    if (
+                        parallel >= 0.999
+                        and radial_offset > 0.05
+                        and abs(projected - back_z) <= abs(projected - front_z)
+                    ):
+                        indexed_back_holes.append((hole, axis, projected, radial_x, radial_y, radial_z))
         live_tool = get_tool("EM-1")
         live_tool_rpm = min(
             round(material_profile.milling_speed_m_min * 1000 / (pi * live_tool.diameter_mm)),
@@ -343,6 +377,75 @@ def build_l32_process_plan(
                     confidence=min(pocket.confidence, 0.8), status="warning",
                 ),
             ])
+        indexed_drilling_operations = []
+        for index, (hole, axis, _, radial_x, radial_y, radial_z) in enumerate(indexed_back_holes, start=1):
+            drill = enrich_tool(Tool(
+                id=f"DRILL-{hole.diameter:g}", name=f"Ø{hole.diameter:g} 麻花钻",
+                kind="drill", diameter_mm=hole.diameter, catalog_match=False,
+            ))
+            drill_rpm = min(
+                round(material_profile.drilling_speed_m_min * 1000 / (pi * drill.diameter_mm)),
+                drill.max_rpm,
+                6000,
+            )
+            # Back-face drilling enters from the minimum spindle-axis side.
+            entry = Vec3(
+                x=hole.center.x - axis.x * hole.length / 2,
+                y=hole.center.y - axis.y * hole.length / 2,
+                z=hole.center.z - axis.z * hole.length / 2,
+            )
+            programmed_depth = hole.length + (0.5 if hole.end_type == "through" else 0.0)
+            end = Vec3(
+                x=entry.x + axis.x * programmed_depth,
+                y=entry.y + axis.y * programmed_depth,
+                z=entry.z + axis.z * programmed_depth,
+            )
+            # Build a stable radial basis around any cardinal spindle direction.
+            reference = Vec3(x=1, y=0, z=0) if abs(axis.x) < 0.9 else Vec3(x=0, y=1, z=0)
+            reference_dot = reference.x * axis.x + reference.y * axis.y + reference.z * axis.z
+            basis_u = Vec3(
+                x=reference.x - reference_dot * axis.x,
+                y=reference.y - reference_dot * axis.y,
+                z=reference.z - reference_dot * axis.z,
+            )
+            basis_length = sqrt(basis_u.x ** 2 + basis_u.y ** 2 + basis_u.z ** 2)
+            basis_u = Vec3(x=basis_u.x / basis_length, y=basis_u.y / basis_length, z=basis_u.z / basis_length)
+            basis_v = Vec3(
+                x=axis.y * basis_u.z - axis.z * basis_u.y,
+                y=axis.z * basis_u.x - axis.x * basis_u.z,
+                z=axis.x * basis_u.y - axis.y * basis_u.x,
+            )
+            index_angle = degrees(atan2(
+                radial_x * basis_v.x + radial_y * basis_v.y + radial_z * basis_v.z,
+                radial_x * basis_u.x + radial_y * basis_u.y + radial_z * basis_u.z,
+            )) % 360
+            indexed_drilling_operations.append(create_operation_instance(
+                id=f"OP70-H{index}", sequence=69 + index, type="drilling",
+                name=f"背面 C 轴分度钻孔 {index}（Ø{hole.diameter:g}）",
+                channel_id="sub", spindle_id="sub", workpiece_side="back",
+                synchronization_group="TRANSFER-1", feature_ids=[hole.id], tool=drill,
+                parameters={
+                    "depth_mm": round(programmed_depth, 6),
+                    "feature_depth_mm": round(hole.length, 6),
+                    "breakthrough_mm": 0.5 if hole.end_type == "through" else 0.0,
+                    "peck": programmed_depth > drill.diameter_mm * 2,
+                    "spindle_rpm": drill_rpm,
+                    "feed_rate_mm_min": round(drill_rpm * material_profile.drill_feed_per_rev_mm, 1),
+                    "required_module": "U151B",
+                    "required_capability": "back_live_tool_milling",
+                    "indexed_spindle": True,
+                    "index_angle_deg": round(index_angle, 3),
+                    "entry_x_mm": round(entry.x, 6), "entry_y_mm": round(entry.y, 6), "entry_z_mm": round(entry.z, 6),
+                    "end_x_mm": round(end.x, 6), "end_y_mm": round(end.y, 6), "end_z_mm": round(end.z, 6),
+                    "axis_x": round(axis.x, 9), "axis_y": round(axis.y, 9), "axis_z": round(axis.z, 9),
+                    "hole_diameter_mm": round(hole.diameter, 6),
+                },
+                rationale=[
+                    "偏心孔轴线与主轴平行，需在背轴夹持后使用 C 轴分度定位",
+                    "使用 U151B 背面动力刀具逐孔钻削；当前仅生成几何 DRAFT，不生成生产 NC",
+                ],
+                confidence=min(hole.confidence, 0.8), status="warning",
+            ))
         inner_profile = max(
             accepted_inner_profiles,
             key=lambda item: max(point.z for point in item.points) - min(point.z for point in item.points),
@@ -802,6 +905,7 @@ def build_l32_process_plan(
                     rationale=["仅精车背面切断邻域，不重复加工完整外圆", "绑定具备 back_turning 能力的设备实例后启用"],
                     confidence=min(profile.confidence, 0.75), status="warning",
                 )] if backside_turning_candidate is None and protected_limit is None else []),
+                *indexed_drilling_operations,
                 ],
             ))
 

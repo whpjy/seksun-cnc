@@ -129,6 +129,10 @@ def evaluate_plan_coverage(
             operation for operation in by_feature.get(profile_id, [])
             if operation.type in turning_required
         ]
+        back_profile_operations = [
+            operation for operation in by_feature.get(f"{profile_id}-BACK", [])
+            if operation.type in turning_required
+        ]
         found_types = {operation.type for operation in profile_operations}
         review_state = str(plan.stock.get("profile_review_state", "review"))
         protected_limit = plan.stock.get("nonrotational_turning_limit_z_mm")
@@ -162,7 +166,7 @@ def evaluate_plan_coverage(
             label="L32 outer rotational profile",
             state=state,
             required_operation_types=sorted(turning_required),
-            covered_by=[operation.id for operation in profile_operations],
+            covered_by=[operation.id for operation in [*profile_operations, *back_profile_operations]],
             source_feature_ids=[profile_id] if profile_id else [],
         ))
         if plan.stock.get("nonrotational_turning_limit_z_mm") is not None:

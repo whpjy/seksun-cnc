@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import { Brush, Evaluator, SUBTRACTION } from "three-bvh-csg";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import type { FixtureComponent, FormingPreview, ManufacturingFeature, SimulationResult, SpatialDefectRegion, SpatialDefectSample, ToolpathSegment, TurningStageView, Vec3 } from "./types";
+import type { DrillingStageView, FixtureComponent, FormingPreview, ManufacturingFeature, SimulationResult, SpatialDefectRegion, SpatialDefectSample, ToolpathSegment, TurningStageView, Vec3 } from "./types";
 
 type ViewMode = "特征" | "工艺" | "刀路" | "仿真";
 
@@ -21,10 +22,12 @@ type Props = {
   simulation?: SimulationResult | null;
   simulationBlocked?: boolean;
   turningStage?: TurningStageView | null;
+  drillingStage?: DrillingStageView | null;
   camoticsSurface?: { url: string; frame: { x: Vec3; y: Vec3; z: Vec3 } } | null;
   fixtureComponents?: FixtureComponent[];
   animateToolpath?: boolean;
   initialProgress?: number;
+  staticProgress?: number;
   playbackResetToken?: number;
   operationTools?: Record<string, { name: string; tool_name: string; diameter_mm: number; stickout_mm: number; holder_diameter_mm: number; kind: string; drill_point_angle_deg: number; spindle_rpm: number; feed_rate_mm_min: number }>;
   topologyEdges?: Vec3[][];
@@ -54,7 +57,7 @@ function featureMarkerColor(feature: ManufacturingFeature) {
   return 0x18b89a;
 }
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], materialSnapshotUrls = [], materialSnapshotStages = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", workAxis = null, activeOperationLabel = "" }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], materialSnapshotUrls = [], materialSnapshotStages = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, simulationBlocked = false, turningStage = null, drillingStage = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, staticProgress = 1, playbackResetToken = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", workAxis = null, activeOperationLabel = "" }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
@@ -136,12 +139,12 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
 
   useEffect(() => {
     if (lastPlaybackResetTokenRef.current !== playbackResetToken) {
-      progressByModeRef.current[playbackKey] = 0;
+      progressByModeRef.current[playbackKey] = initialProgress;
       lastPlaybackResetTokenRef.current = playbackResetToken;
     }
     const savedProgress = progressByModeRef.current[playbackKey];
     playbackRef.current.playing = false;
-    playbackRef.current.progress = savedProgress ?? 0;
+    playbackRef.current.progress = savedProgress ?? initialProgress;
     const reset = window.setTimeout(() => {
       setPlaying(playbackRef.current.playing);
       setProgress(playbackRef.current.progress);
@@ -149,7 +152,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       setSnapshotLoadError(null);
     }, 0);
     return () => window.clearTimeout(reset);
-  }, [playbackKey, playbackResetToken, viewMode]);
+  }, [initialProgress, playbackKey, playbackResetToken, viewMode]);
 
   useEffect(() => {
     selectedIdsRef.current = selectedFeatureIds;
@@ -444,11 +447,18 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           samples: TurningStageView["before_samples"],
           color: number,
           opacity: number,
+          holes: DrillingStageView["before_holes"],
         ) => {
           const ordered = [...samples].sort((left, right) => left.z - right.z);
+          const innerProfile = ordered.some((sample) => sample.inner_radius > 1e-6)
+            ? ordered.slice().reverse().map((sample) => new THREE.Vector2(Math.max(sample.inner_radius, 0), sample.z))
+            : [
+                new THREE.Vector2(0, ordered[ordered.length - 1].z),
+                new THREE.Vector2(0, ordered[0].z),
+              ];
           const profile = [
             ...ordered.map((sample) => new THREE.Vector2(Math.max(sample.outer_radius, 0), sample.z)),
-            ...ordered.slice().reverse().map((sample) => new THREE.Vector2(Math.max(sample.inner_radius, 0), sample.z)),
+            ...innerProfile,
           ];
           const stockGeometry = new THREE.LatheGeometry(profile, 64);
           stockGeometry.computeVertexNormals();
@@ -463,15 +473,50 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
             side: THREE.DoubleSide,
             depthWrite: opacity > 0.75,
           });
-          const mesh = new THREE.Mesh(stockGeometry, material);
+          let mesh: THREE.Mesh = new Brush(stockGeometry, material);
           mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axisDirection);
           mesh.position.copy(axisOrigin).sub(modelCenter);
+          mesh.updateMatrixWorld(true);
+          if (holes.length) {
+            const evaluator = new Evaluator();
+            evaluator.useGroups = false;
+            for (const hole of holes) {
+              const entry = new THREE.Vector3(hole.entry.x, hole.entry.y, hole.entry.z).sub(modelCenter);
+              const end = new THREE.Vector3(hole.end.x, hole.end.y, hole.end.z).sub(modelCenter);
+              const direction = end.clone().sub(entry);
+              const cutLength = direction.length();
+              if (cutLength <= 1e-6 || hole.diameter_mm <= 0) continue;
+              direction.normalize();
+              const outsideExtension = Math.max(0.5, hole.diameter_mm * 0.15);
+              const cutterStart = entry.clone().addScaledVector(direction, -outsideExtension);
+              const cutterLength = cutLength + outsideExtension;
+              const cutter = new Brush(
+                new THREE.CylinderGeometry(hole.diameter_mm / 2, hole.diameter_mm / 2, cutterLength, 40),
+                material,
+              );
+              cutter.position.copy(cutterStart).addScaledVector(direction, cutterLength / 2);
+              cutter.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction);
+              cutter.updateMatrixWorld(true);
+              const previous = mesh;
+              try {
+                mesh = evaluator.evaluate(previous as Brush, cutter, SUBTRACTION);
+                if (previous !== mesh) previous.geometry.dispose();
+              } catch (error) {
+                // Keep the last valid cumulative IPW visible if the preview
+                // boolean encounters a degenerate triangle. Detailed animation
+                // generation still uses the authoritative OCC material engine.
+                console.warn(`Unable to apply preview removal for ${hole.operation_id}`, error);
+              }
+              cutter.geometry.dispose();
+            }
+            mesh.material = material;
+          }
           mesh.castShadow = true;
           mesh.receiveShadow = true;
           return mesh;
         };
-        turningBeforeMesh = makeStockMesh(turningStage.before_samples, 0x7f8c92, 0.78);
-        turningAfterMesh = makeStockMesh(turningStage.after_samples, 0x268b7a, 0.28);
+        turningBeforeMesh = makeStockMesh(turningStage.before_samples, 0x7f8c92, 0.78, drillingStage?.before_holes ?? []);
+        turningAfterMesh = makeStockMesh(turningStage.after_samples, 0x268b7a, 0.28, drillingStage?.after_holes ?? []);
         turningBeforeSamples = [...turningStage.before_samples].sort((left, right) => left.z - right.z);
         turningAfterSamples = [...turningStage.after_samples].sort((left, right) => left.z - right.z);
         turningBeforeMesh.renderOrder = 3;
@@ -1163,7 +1208,12 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       });
       const profile = [
         ...dynamicSamples.map((sample) => new THREE.Vector2(Math.max(sample.outer_radius, 0), sample.z)),
-        ...dynamicSamples.slice().reverse().map((sample) => new THREE.Vector2(Math.max(sample.inner_radius, 0), sample.z)),
+        ...(dynamicSamples.some((sample) => sample.inner_radius > 1e-6)
+          ? dynamicSamples.slice().reverse().map((sample) => new THREE.Vector2(Math.max(sample.inner_radius, 0), sample.z))
+          : [
+              new THREE.Vector2(0, dynamicSamples[dynamicSamples.length - 1].z),
+              new THREE.Vector2(0, dynamicSamples[0].z),
+            ]),
       ];
       const previousGeometry = turningBeforeMesh.geometry;
       turningBeforeMesh.geometry = new THREE.LatheGeometry(profile, 64);
@@ -1672,7 +1722,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       const elapsed = Math.min((time - lastFrameTime) / 1000, 0.1);
       lastFrameTime = time;
       if (animateToolpath && playbackRef.current.playing && (toolpathSegments.length || formingPreview)) {
-        const duration = formingPreview ? 18 : turningStage ? 8 : materialSnapshotUrls.length ? 12 * Math.max(1, materialSnapshotStages.length) : 30;
+        const duration = formingPreview ? 18 : turningStage ? 12 : materialSnapshotUrls.length ? 16 * Math.max(1, materialSnapshotStages.length) : 30;
         const proposedProgress = Math.min(1, playbackRef.current.progress + elapsed * playbackRef.current.speed / duration);
         const nextSnapshotIndex = snapshotIndexForProgress(proposedProgress);
         if (materialSnapshotUrls.length && !materialSnapshotMeshes[nextSnapshotIndex]) requestMaterialSnapshot(nextSnapshotIndex);
@@ -1713,15 +1763,33 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         if (simulationWalls) simulationWalls.visible = false;
       }
       if (turningBeforeMesh && turningAfterMesh) {
-        const turningProgress = animateToolpath ? playbackRef.current.progress : 1;
-        updateTurningMaterial(turningProgress);
         const beforeMaterial = turningBeforeMesh.material as THREE.MeshPhysicalMaterial;
-        beforeMaterial.opacity = 0.96;
-        beforeMaterial.visible = true;
-        beforeMaterial.depthWrite = true;
-        // The authoritative final mesh remains available for bounds checking,
-        // while the visible IPW is now the continuously rebuilt dynamic mesh.
-        turningAfterMesh.visible = false;
+        const afterMaterial = turningAfterMesh.material as THREE.MeshPhysicalMaterial;
+        if (animateToolpath) {
+          updateTurningMaterial(playbackRef.current.progress);
+          beforeMaterial.opacity = 0.96;
+          beforeMaterial.visible = true;
+          beforeMaterial.depthWrite = true;
+          // The authoritative final mesh remains available for bounds checking,
+          // while the visible IPW is the continuously rebuilt dynamic mesh.
+          turningBeforeMesh.visible = true;
+          turningAfterMesh.visible = false;
+        } else {
+          // Result comparison is deliberately independent from playback. Show
+          // the two authoritative endpoint meshes directly instead of driving
+          // the animation interpolator with a synthetic 0/100% progress value.
+          // This also prevents a previously rebuilt dynamic geometry from
+          // making the before and after buttons appear identical.
+          const showAfter = staticProgress >= 0.5;
+          beforeMaterial.opacity = 0.96;
+          beforeMaterial.visible = true;
+          beforeMaterial.depthWrite = true;
+          afterMaterial.opacity = 0.96;
+          afterMaterial.visible = true;
+          afterMaterial.depthWrite = true;
+          turningBeforeMesh.visible = !showAfter;
+          turningAfterMesh.visible = showAfter;
+        }
       }
       if (camoticsMesh) camoticsMesh.visible = materialSnapshotUrls.length === 0 && playbackRef.current.progress >= 0.999;
       controls.update();
@@ -1823,7 +1891,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       host.removeChild(renderer.domElement);
       axisHost.removeChild(axisRenderer.domElement);
     };
-  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationTools, playbackKey, profileBoundaries, simulation, spatialDefects, toolpathLoaded, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
+  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, drillingStage, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationTools, playbackKey, profileBoundaries, simulation, spatialDefects, staticProgress, toolpathLoaded, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
   const activeFormingStage = formingPreview?.stages.length
@@ -1879,7 +1947,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       ? activeOperationId ? `${activeOperationId} · ${activeOperationLabel || "当前工序"}` : "请选择一道工序"
       : viewMode === "刀路"
         ? toolpathLoaded ? `${toolpathSegments.length} 段运动轨迹` : "正在加载刀路数据"
-        : simulation || formingPreview ? "材料去除过程与安全校验" : "等待刀路与仿真结果";
+        : simulation || formingPreview || turningStage || materialSnapshotUrls.length ? "材料去除过程与安全校验" : "等待刀路与仿真结果";
 
   return (
     <div className={`model-viewer mode-${modeClass}`} ref={hostRef}>
@@ -1908,7 +1976,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         <small>在制品：{formingStateLabels[activeFormingStage.process] ?? activeFormingStage.process} · {Math.round(activeFormingStage.start_factor * 100)}% → {Math.round(activeFormingStage.end_factor * 100)}% 成形深度</small>
         <em>{formingActivityLabels[activeFormingStage.process] ?? "● 工艺过程预览"}</em>
       </div>}
-      {(simulation || formingPreview) && <div className="cad-view-controls" aria-label="三维视图控制">
+      {(simulation || formingPreview || turningStage || materialSnapshotUrls.length > 0) && <div className="cad-view-controls" aria-label="三维视图控制">
         <div><button onClick={() => viewApiRef.current?.setView("iso")}>轴测</button><button onClick={() => viewApiRef.current?.setView("top")}>俯视</button><button onClick={() => viewApiRef.current?.setView("front")}>前视</button><button onClick={() => viewApiRef.current?.setView("fit")}>适应</button></div>
         {!formingPreview && <div>
           <button className={targetVisible ? "active" : ""} onClick={() => { const value = !targetVisible; targetVisibleRef.current = value; setTargetVisible(value); viewApiRef.current?.setTargetVisible(value); }}>目标件</button>

@@ -31,7 +31,7 @@ import { L32ProgramViewer } from "./L32ProgramViewer";
 import { L32Workbench } from "./L32Workbench";
 import { ToolLibraryPanel } from "./ToolLibraryPanel";
 import { ProcessDesigner } from "./ProcessDesigner";
-import type { BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, ManufacturingFeature, Operation, RotationalFeatureAnalysis, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
+import type { BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, DrillingStageView, Job, ManufacturingFeature, Operation, RotationalFeatureAnalysis, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
@@ -496,6 +496,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [operationPopoverPosition, setOperationPopoverPosition] = useState({ top: 110, left: 326, anchorY: 28 });
   const [playbackMode, setPlaybackMode] = useState<"single" | "cumulative">("single");
   const [playbackResetToken, setPlaybackResetToken] = useState(0);
+  const [l32ComparisonView, setL32ComparisonView] = useState<"before" | "after">("after");
+  const [l32AnimationRequested, setL32AnimationRequested] = useState(false);
+  const [l32AnimationRequestToken, setL32AnimationRequestToken] = useState(0);
   const [showL32Workbench, setShowL32Workbench] = useState(false);
   const [showL32Program, setShowL32Program] = useState(false);
   const [showProcessDesigner, setShowProcessDesigner] = useState(false);
@@ -702,7 +705,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const sourceSolids = Number(job.analysis?.topology.source_solids ?? job.analysis?.topology.solids ?? 1);
   const solidCandidates = job.analysis?.solid_candidates ?? [];
   const selectedSolidIndex = Number(job.analysis?.topology.selected_solid_index ?? solidCandidates.find((item) => item.selected)?.index ?? 1);
-  const requestedProgress = Number(new URLSearchParams(window.location.search).get("progress") ?? 0);
+  const requestedProgressParams = new URLSearchParams(window.location.search);
+  const hasRequestedProgress = requestedProgressParams.has("progress");
+  const requestedProgress = Number(requestedProgressParams.get("progress") ?? 0);
   const initialSimulationProgress = Number.isFinite(requestedProgress) ? Math.min(1, Math.max(0, requestedProgress)) : 0;
   const validationStatus = !camResult
     ? null
@@ -951,7 +956,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }, [fetchL32PreviewJson, isL32, job.id, job.machine_configuration_hash, job.machine_instance_id, job.plan?.stock.diameter_mm, l32Axis, l32Rotational, operations]);
 
   useEffect(() => {
-    if (!isL32 || !job.plan) return undefined;
+    if (!isL32 || !job.plan || !l32AnimationRequested) return undefined;
     let cancelled = false;
     const requestKey = `${job.id}:${job.machine_configuration_hash ?? "unbound"}:${JSON.stringify(job.plan.setups)}`;
     let request = l32MaterialManifestRequests.get(requestKey);
@@ -976,7 +981,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         if (!cancelled) setL32MaterialSnapshotError({ key: requestKey, message: "实体材料逐帧预生成失败；当前零件显示不代表该工序的材料去除结果。" });
       });
     return () => { cancelled = true; };
-  }, [isL32, job.id, job.machine_configuration_hash, job.plan]);
+  }, [isL32, job.id, job.machine_configuration_hash, job.plan, l32AnimationRequested, l32AnimationRequestToken]);
 
   const l32ToolpathSegments = useMemo<ToolpathSegment[]>(() => {
     if (!l32Program || !l32Axis) return EMPTY_TOOLPATH_SEGMENTS;
@@ -1184,6 +1189,134 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     };
   }, [activeMode, isL32, l32Axis, l32GroovePreviews, l32OperationPreview, l32Program, l32TurningPreviews, l32WholePartBlocked, operations, selectedOperation]);
 
+  const instantL32TurningStage = useMemo<TurningStageView | null>(() => {
+    if (!isL32 || activeMode !== "仿真" || !selectedOperation || !l32Axis || !l32Rotational) return null;
+    const profile = l32Rotational.profiles.find(
+      (item) => item.side === "outer" && item.review_state === "accepted",
+    ) ?? l32Rotational.profiles.find((item) => item.side === "outer");
+    if (!profile?.points.length) return null;
+
+    const profilePoints = [...profile.points].sort((left, right) => left.z - right.z);
+    const profileMin = profilePoints[0].z;
+    const profileMax = profilePoints[profilePoints.length - 1].z;
+    const axialAllowance = Number((job.plan?.stock.allowance_mm as { axial?: number } | undefined)?.axial ?? 2);
+    const stockRadius = Number(job.plan?.stock.diameter_mm ?? 0) / 2
+      || Math.max(...profilePoints.map((point) => point.radius));
+    const sampleCount = 120;
+    const finishedBackZ = Number(job.plan?.stock.finished_back_z_mm ?? profileMin);
+    // Include the sacrificial bar extension on both ends. OP40 removes the
+    // back extension and hands the retained workpiece to the sub spindle.
+    const stockMin = Math.min(profileMin, finishedBackZ) - Math.max(axialAllowance, 0);
+    const stockMax = profileMax + Math.max(axialAllowance, 0);
+    const interpolateRadius = (z: number) => {
+      if (z <= profileMin) return profilePoints[0].radius;
+      if (z >= profileMax) return profilePoints[profilePoints.length - 1].radius;
+      let upperIndex = profilePoints.findIndex((point) => point.z >= z);
+      if (upperIndex <= 0) upperIndex = 1;
+      const lower = profilePoints[upperIndex - 1];
+      const upper = profilePoints[upperIndex];
+      const span = upper.z - lower.z;
+      const ratio = span > 1e-9 ? (z - lower.z) / span : 0;
+      return lower.radius + (upper.radius - lower.radius) * ratio;
+    };
+    const freshStock = () => Array.from({ length: sampleCount + 1 }, (_, index) => ({
+      z: stockMin + (stockMax - stockMin) * index / sampleCount,
+      outer_radius: stockRadius,
+      inner_radius: 0,
+    }));
+    const applyOperation = (samples: ReturnType<typeof freshStock>, operation: Operation) => {
+      if (operation.type === "turn_facing") {
+        const isBackside = operation.channel_id === "sub";
+        const localFaceZ = Number(operation.parameters.face_z_mm ?? (isBackside ? 0 : profileMax));
+        const faceZ = isBackside ? finishedBackZ - localFaceZ : localFaceZ;
+        return samples.filter((sample) => isBackside
+          ? sample.z >= faceZ - 1e-6
+          : sample.z <= faceZ + 1e-6);
+      }
+      if (operation.type === "turn_od_roughing" || operation.type === "turn_od_finishing") {
+        const lower = Number(operation.parameters.profile_z_min_mm ?? operation.parameters.source_region_z_min_mm ?? profileMin);
+        const upper = Number(operation.parameters.profile_z_max_mm ?? operation.parameters.source_region_z_max_mm ?? profileMax);
+        const allowance = operation.type === "turn_od_roughing"
+          ? Math.max(Number(operation.parameters.radial_allowance_mm ?? 0.3), 0)
+          : 0;
+        return samples.map((sample) => sample.z >= lower - 1e-6 && sample.z <= upper + 1e-6
+          ? { ...sample, outer_radius: Math.min(sample.outer_radius, interpolateRadius(sample.z) + allowance) }
+          : sample);
+      }
+      if (operation.type === "turn_grooving") {
+        const groove = l32GroovePreviews[operation.id];
+        if (!groove) return samples;
+        return samples.map((sample) => {
+          const strip = groove.strips.find((item) => sample.z >= item.z_min_mm - 1e-6 && sample.z <= item.z_max_mm + 1e-6);
+          return strip ? { ...sample, outer_radius: Math.min(sample.outer_radius, strip.cut_to_radius_mm) } : sample;
+        });
+      }
+      if (operation.type === "turn_cutoff") {
+        const cutoffZ = Number(operation.parameters.finished_back_datum_z_mm ?? operation.parameters.z_mm);
+        return Number.isFinite(cutoffZ)
+          ? samples.filter((sample) => sample.z >= cutoffZ - 1e-6)
+          : samples;
+      }
+      return samples;
+    };
+
+    const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
+    let beforeSamples = freshStock();
+    for (const operation of operations.slice(0, Math.max(selectedIndex, 0))) {
+      if (operation.enabled !== false) beforeSamples = applyOperation(beforeSamples, operation);
+    }
+    const afterSamples = applyOperation(beforeSamples.map((sample) => ({ ...sample })), selectedOperation);
+    const axisProjection = l32Axis.origin.x * l32Axis.direction.x
+      + l32Axis.origin.y * l32Axis.direction.y
+      + l32Axis.origin.z * l32Axis.direction.z;
+    return {
+      operation_id: selectedOperation.id,
+      channel_id: selectedOperation.channel_id === "sub" ? "sub" : "main",
+      before_samples: beforeSamples,
+      after_samples: afterSamples,
+      axis_origin: {
+        x: l32Axis.origin.x - l32Axis.direction.x * axisProjection,
+        y: l32Axis.origin.y - l32Axis.direction.y * axisProjection,
+        z: l32Axis.origin.z - l32Axis.direction.z * axisProjection,
+      },
+      axis_direction: l32Axis.direction,
+    };
+  }, [activeMode, isL32, job.plan?.stock, l32Axis, l32GroovePreviews, l32Rotational, operations, selectedOperation]);
+  // The local cumulative stage is the source of truth for immediate result
+  // comparison. Per-operation drafts often start from their own channel stock
+  // and therefore must not reset the IPW at the main/sub spindle handoff.
+  const effectiveTurningStage = instantL32TurningStage ?? visibleTurningStage;
+  const instantL32DrillingStage = useMemo<DrillingStageView | null>(() => {
+    if (!isL32 || activeMode !== "仿真" || !selectedOperation) return null;
+    const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
+    if (selectedIndex < 0) return null;
+    const toHole = (operation: Operation) => {
+      if (operation.type !== "drilling" || operation.parameters.indexed_spindle !== true) return null;
+      const number = (key: string) => Number(operation.parameters[key]);
+      const values = [
+        number("entry_x_mm"), number("entry_y_mm"), number("entry_z_mm"),
+        number("end_x_mm"), number("end_y_mm"), number("end_z_mm"),
+        number("hole_diameter_mm"),
+      ];
+      if (!values.every(Number.isFinite) || values[6] <= 0) return null;
+      return {
+        operation_id: operation.id,
+        diameter_mm: values[6],
+        entry: { x: values[0], y: values[1], z: values[2] },
+        end: { x: values[3], y: values[4], z: values[5] },
+      };
+    };
+    const beforeHoles = operations.slice(0, selectedIndex)
+      .filter((operation) => operation.enabled !== false)
+      .map(toHole)
+      .filter((hole): hole is NonNullable<typeof hole> => hole !== null);
+    const currentHole = selectedOperation.enabled === false ? null : toHole(selectedOperation);
+    return {
+      before_holes: beforeHoles,
+      after_holes: currentHole ? [...beforeHoles, currentHole] : beforeHoles,
+    };
+  }, [activeMode, isL32, operations, selectedOperation]);
+
   const visibleToolpathSegments = useMemo(() => {
     if (isL32 && playbackMode === "single" && l32OperationPreviewSegments.some((segment) => segment.motion === "cut")) return l32OperationPreviewSegments;
     if (isL32 && l32WholePartBlocked && activeMode !== "仿真") return EMPTY_TOOLPATH_SEGMENTS;
@@ -1226,9 +1359,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     .filter((stage) => stage.count === 0 && visibleToolpathSegments.some((segment) => segment.operation_id === stage.operationId && segment.motion === "cut"))
     .map((stage) => stage.operationId);
   const awaitingL32MaterialSnapshots = isL32 && activeMode === "仿真"
+    && l32AnimationRequested
     && selectedOperation != null
     && selectedOperation.enabled !== false
-    && ["turn_facing", "turn_od_roughing", "turn_od_finishing", "turn_grooving", "turn_cutoff", "live_tool_contour_roughing", "live_tool_contour_finishing", "pocket_roughing", "pocket_finishing"].includes(selectedOperation.type)
+    && ["turn_facing", "turn_od_roughing", "turn_od_finishing", "turn_grooving", "turn_cutoff", "live_tool_contour_roughing", "live_tool_contour_finishing", "pocket_roughing", "pocket_finishing", "drilling"].includes(selectedOperation.type)
     && (l32MaterialSnapshots?.key !== l32MaterialRequestKey || !(l32MaterialSnapshots.files[selectedOperation.id]?.length));
   const initialToolpathSegments = useMemo(() => {
     if (activeMode !== "仿真" || playbackMode !== "single" || !selectedOperation) return EMPTY_TOOLPATH_SEGMENTS;
@@ -1344,6 +1478,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     setSelectedOperation(operation);
     setSelectedFeatureIds(operation.feature_ids);
     if (isL32) {
+      setL32ComparisonView("after");
+      setPlaybackResetToken((current) => current + 1);
       setActiveMode("仿真");
       void previewL32Operation(operation);
     }
@@ -1383,10 +1519,23 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     setSelectedFeatureIds(operation.feature_ids);
     setEditingOperationDetails(false);
     setShowOperationDetails(false);
+    setL32ComparisonView("after");
     setPlaybackResetToken((current) => current + 1);
     setLoadingCam(!camResult && !isL32);
     setActiveMode("仿真");
     if (isL32) void previewL32Operation(operation);
+  };
+
+  const showL32ComparisonState = (state: "before" | "after") => {
+    setL32ComparisonView(state);
+    setPlaybackResetToken((current) => current + 1);
+  };
+
+  const requestL32Animation = () => {
+    setL32MaterialSnapshotError(null);
+    l32MaterialManifestRequests.delete(l32MaterialRequestKey);
+    setL32AnimationRequested(true);
+    setL32AnimationRequestToken((current) => current + 1);
   };
 
   const cancelOperationEdit = () => {
@@ -1534,6 +1683,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     setL32GrooveSegments({});
     setL32MillingPreviews({});
     setWarmingL32Previews(false);
+    setL32ComparisonView("after");
+    setL32AnimationRequested(false);
+    setL32AnimationRequestToken(0);
     setL32MaterialSnapshots(null);
     setL32MaterialSnapshotError(null);
     setL32MillingPreview(null);
@@ -1612,6 +1764,29 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           setL32MillingPreview({ operationId:operation.id, segments });
           setOperationMessage(`${operation.id} 精确槽形扫掠已更新；去除 ${sweep.check.removed_volume_mm3.toFixed(3)} mm³`);
         }
+        return;
+      }
+      if (previewOperation.type === "drilling" && previewOperation.parameters.indexed_spindle === true) {
+        const number = (key: string) => Number(previewOperation.parameters[key] ?? 0);
+        const entry = { x: number("entry_x_mm"), y: number("entry_y_mm"), z: number("entry_z_mm") };
+        const end = { x: number("end_x_mm"), y: number("end_y_mm"), z: number("end_z_mm") };
+        const axis = { x: number("axis_x"), y: number("axis_y"), z: number("axis_z") };
+        const safe = { x: entry.x - axis.x * 2, y: entry.y - axis.y * 2, z: entry.z - axis.z * 2 };
+        const segments: ToolpathSegment[] = [
+          {
+            operation_id: previewOperation.id, motion: "rapid",
+            x1:safe.x, y1:safe.y, z1:safe.z, x2:entry.x, y2:entry.y, z2:entry.z,
+            setup_id: previewOperation.channel_id ?? "sub", work_axis:axis,
+          },
+          {
+            operation_id: previewOperation.id, motion: "cut",
+            x1:entry.x, y1:entry.y, z1:entry.z, x2:end.x, y2:end.y, z2:end.z,
+            setup_id: previewOperation.channel_id ?? "sub", work_axis:axis,
+          },
+        ];
+        setL32OperationPreview(null);
+        setL32MillingPreview({ operationId:previewOperation.id, segments });
+        setOperationMessage(`${previewOperation.id} 背面 C 轴分度钻孔 DRAFT 已更新`);
         return;
       }
       const geometricMillingTypes = new Set([
@@ -2228,9 +2403,26 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             {previewingL32OperationId === selectedOperation.id ? <LoaderCircle className="spin" size={15} /> : l32PreviewOperationId === selectedOperation.id ? <Check size={15} /> : <Info size={15} />}
             <span>{operationMessage}</span>
           </div>}
+          {isL32 && activeMode === "仿真" && selectedOperation && <div className={`l32-result-comparison ${l32AnimationRequested && visibleMaterialSnapshots.urls.length > 0 ? "with-playback" : ""}`}>
+            <div className="l32-result-comparison-heading">
+              <span>工序作用结果</span>
+              <small>{selectedOperation.id} · 快速对比加工前后状态</small>
+            </div>
+            <div className="l32-result-comparison-actions">
+              <div className="l32-result-state-toggle" aria-label="加工前后状态">
+                <button className={l32ComparisonView === "before" ? "active" : ""} onClick={() => showL32ComparisonState("before")}>加工前</button>
+                <button className={l32ComparisonView === "after" ? "active" : ""} onClick={() => showL32ComparisonState("after")}>加工后</button>
+              </div>
+              {!l32AnimationRequested && <button className="l32-generate-animation" onClick={requestL32Animation}><Play size={13} />生成仿真动画</button>}
+              {l32AnimationRequested && l32MaterialSnapshots?.key !== l32MaterialRequestKey && l32MaterialSnapshotError?.key !== l32MaterialRequestKey && <button className="l32-generate-animation" disabled><LoaderCircle className="spin" size={13} />正在生成动画</button>}
+              {l32AnimationRequested && visibleMaterialSnapshots.urls.length > 0 && <span className="l32-animation-ready"><Check size={13} />动画已就绪</span>}
+              {l32AnimationRequested && l32MaterialSnapshots?.key === l32MaterialRequestKey && visibleMaterialSnapshots.urls.length === 0 && <span className="l32-animation-unavailable">当前工序无实体动画</span>}
+              {l32MaterialSnapshotError?.key === l32MaterialRequestKey && <button className="l32-generate-animation" onClick={requestL32Animation}>重新生成动画</button>}
+            </div>
+          </div>}
           {awaitingL32MaterialSnapshots && <div className={`l32-material-snapshot-status ${l32MaterialSnapshotError?.key === l32MaterialRequestKey || l32MaterialSnapshots?.key === l32MaterialRequestKey ? "failed" : ""}`}>
             {l32MaterialSnapshotError?.key === l32MaterialRequestKey || l32MaterialSnapshots?.key === l32MaterialRequestKey ? <AlertTriangle size={15} /> : <LoaderCircle className="spin" size={15} />}
-            <span>{l32MaterialSnapshotError?.key === l32MaterialRequestKey ? l32MaterialSnapshotError.message : l32MaterialSnapshots?.key === l32MaterialRequestKey ? "当前工序没有可用的实体材料帧；画面仅供刀路参考。" : "正在预生成实体材料的逐帧变化；当前显示暂不代表加工结果。"}</span>
+            <span>{l32MaterialSnapshotError?.key === l32MaterialRequestKey ? l32MaterialSnapshotError.message : l32MaterialSnapshots?.key === l32MaterialRequestKey ? "当前工序没有可用的实体材料帧；仍可查看工序前后快速对比。" : "正在生成详细实体动画；工序前后对比仍可使用。"}</span>
           </div>}
           {isL32 && activeMode === "仿真" && playbackMode === "cumulative" && missingMaterialStages.length > 0 && <div className="l32-material-snapshot-status failed">
             <AlertTriangle size={15} />
@@ -2248,11 +2440,13 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             profileBoundaries={visibleProfileBoundaries}
             simulation={visibleSimulation}
             simulationBlocked={isL32 && playbackMode === "cumulative" && l32WholePartBlocked && visibleMaterialSnapshots.urls.length === 0 && l32PreviewOperationId !== selectedOperation?.id && previewingL32OperationId !== selectedOperation?.id && (activeMode === "仿真" || activeMode === "刀路")}
-            turningStage={visibleMaterialSnapshots.urls.length ? null : visibleTurningStage}
+            turningStage={visibleMaterialSnapshots.urls.length ? null : effectiveTurningStage}
+            drillingStage={visibleMaterialSnapshots.urls.length ? null : instantL32DrillingStage}
             camoticsSurface={visibleCamoticsSurface}
             fixtureComponents={visibleFixtureComponents}
-            animateToolpath={activeMode === "仿真" && (playbackMode === "single" || !l32WholePartBlocked || visibleMaterialSnapshots.urls.length > 0 || l32PreviewOperationId === selectedOperation?.id)}
-            initialProgress={initialSimulationProgress}
+            animateToolpath={activeMode === "仿真" && (!isL32 || (l32AnimationRequested && visibleMaterialSnapshots.urls.length > 0)) && (playbackMode === "single" || !l32WholePartBlocked || visibleMaterialSnapshots.urls.length > 0 || l32PreviewOperationId === selectedOperation?.id)}
+            initialProgress={isL32 && activeMode === "仿真" && !hasRequestedProgress ? (l32ComparisonView === "after" ? 1 : 0) : initialSimulationProgress}
+            staticProgress={isL32 && activeMode === "仿真" ? (l32ComparisonView === "after" ? 1 : 0) : 1}
             playbackResetToken={playbackResetToken}
             operationTools={operationTools}
             topologyEdges={visibleTopologyEdges}

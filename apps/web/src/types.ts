@@ -102,6 +102,18 @@ export type TurningStageView = {
   axis_direction: Vec3;
 };
 
+export type DrillingRemovalView = {
+  operation_id: string;
+  diameter_mm: number;
+  entry: Vec3;
+  end: Vec3;
+};
+
+export type DrillingStageView = {
+  before_holes: DrillingRemovalView[];
+  after_holes: DrillingRemovalView[];
+};
+
 export type CamResult = {
   status: "completed";
   engine: string;

@@ -884,6 +884,19 @@ body { min-width: 980px; background: #eef3f9; }
 .l32-operation-preview-status.complete { color: #126a55; background: #e9f7f2e8; border-color: #9fd5c5; }
 .l32-material-snapshot-status { position: absolute; z-index: 9; top: 102px; left: 50%; max-width: min(620px, calc(100% - 220px)); padding: 8px 12px; display: flex; align-items: center; gap: 7px; color: #445a75; background: #f7f9fdee; border: 1px solid #bdc9d9; border-radius: 7px; transform: translateX(-50%); font-size: 11px; }
 .l32-material-snapshot-status.failed { color: #8c281d; background: #fff2efee; border-color: #ef9b8e; }
+.l32-result-comparison { position: absolute; z-index: 8; left: 50%; bottom: 22px; width: min(560px, calc(100% - 390px)); padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; color: #40516a; background: #f8fafdf2; border: 1px solid #b9c5d6; border-radius: 9px; box-shadow: 0 8px 26px #33434e2b; transform: translateX(-50%); }
+.l32-result-comparison.with-playback { bottom: 106px; }
+.l32-result-comparison-heading { display: grid; gap: 2px; }
+.l32-result-comparison-heading span { color: #253a59; font-size: 11px; font-weight: 700; }
+.l32-result-comparison-heading small { color: #78889d; font-size: 9px; }
+.l32-result-comparison-actions { display: flex; align-items: center; gap: 8px; }
+.l32-result-state-toggle { display: flex; gap: 2px; padding: 2px; background: #e8edf5; border-radius: 6px; }
+.l32-result-state-toggle button, .l32-generate-animation { height: 28px; padding: 0 12px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #61718a; font-size: 10px; cursor: pointer; white-space: nowrap; }
+.l32-result-state-toggle button.active { color: #fff; background: #4569e7; box-shadow: 0 2px 7px #4569e740; }
+.l32-generate-animation { display: inline-flex; align-items: center; gap: 5px; color: #17634f; background: #e8f7f1; border-color: #8fd0ba; }
+.l32-generate-animation:disabled { cursor: wait; opacity: .78; }
+.l32-animation-ready { display: inline-flex; align-items: center; gap: 4px; color: #168064; font-size: 10px; font-weight: 600; white-space: nowrap; }
+.l32-animation-unavailable { color: #8a6844; font-size: 10px; white-space: nowrap; }
 .l32-quick-blocked { max-width: 640px; }
 .l32-quick-blocked-body { padding: 24px; color: #34445b; font-size: 13px; line-height: 1.7; }
 .l32-quick-blocked-body p { margin: 0 0 12px; }

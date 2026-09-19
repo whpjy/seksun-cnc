@@ -104,6 +104,45 @@ def regional_shaft_analysis() -> GeometryAnalysis:
     return source
 
 
+def test_l32_plans_back_live_tool_drilling_for_off_axis_axial_hole() -> None:
+    analysis = regional_shaft_analysis()
+    analysis.cylindrical_features.append(type(analysis.cylindrical_features[0]).model_validate({
+        "id": "HF-BACK-1",
+        "kind": "hole",
+        "radius": 3.15,
+        "diameter": 6.3,
+        "length": 4.0,
+        "center": {"x": 5.0, "y": 0.0, "z": -18.0},
+        "axis": {"x": 0.0, "y": 0.0, "z": 1.0},
+        "access_direction": {"x": 0.0, "y": 0.0, "z": -1.0},
+        "angular_span_degrees": 360,
+        "source_face_ids": ["CF-BACK-1"],
+        "end_type": "blind",
+        "review_state": "accepted",
+        "confidence": 0.9,
+    }))
+
+    plan = build_process_plan(analysis, "S45C", "Citizen Cincom L32")
+    drilling = next(
+        operation
+        for setup in plan.setups for operation in setup.operations
+        if operation.feature_ids == ["HF-BACK-1"]
+    )
+
+    assert drilling.type == "drilling"
+    assert drilling.workpiece_side == "back"
+    assert drilling.channel_id == "sub"
+    assert drilling.tool.id == "DRILL-6.3"
+    assert drilling.parameters["required_module"] == "U151B"
+    assert drilling.parameters["required_capability"] == "back_live_tool_milling"
+    assert drilling.parameters["indexed_spindle"] is True
+    assert drilling.parameters["entry_z_mm"] == -20.0
+    assert drilling.parameters["end_z_mm"] == -16.0
+    target = next(item for item in plan.coverage.targets if item.id == "TARGET-HF-BACK-1")
+    assert target.state == "covered"
+    assert target.covered_by == [drilling.id]
+
+
 def front_form_shaft_analysis() -> GeometryAnalysis:
     source = regional_shaft_analysis()
     source.rotational_sections[0].outer_profile = [

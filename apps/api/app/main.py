@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 from .models import (
-    AxialDrillingOperationReviewRequest, BoringOperationReviewRequest, FeatureReviewRequest, GeometryAnalysis, GroovingOperationReviewRequest, JobHistoryItem, JobResponse, OperationCreateRequest,
+    AxialDrillingOperationReviewRequest, BoringOperationReviewRequest, Bounds, FeatureReviewRequest, GeometryAnalysis, GroovingOperationReviewRequest, JobHistoryItem, JobResponse, OperationCreateRequest,
     GrooveBindingConfirmRequest, ManufacturingRequirement, ManufacturingRequirements,
     ManufacturingRequirementsImportRequest, OperationReorderRequest, OperationUpdateRequest,
     ProcessPlan, SafetyConfigurationRequest, ThreadBindingConfirmRequest,
@@ -694,26 +694,51 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
     rotational = RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8"))
     if not rotational.axes:
         raise HTTPException(status_code=422, detail="No rotational axis is available")
-    region = job.plan.stock.get("nonrotational_region_z_mm")
-    if not isinstance(region, list) or len(region) != 2:
-        raise HTTPException(status_code=422, detail="Nonrotational stock region is unavailable")
     source_profile = next(
         (profile for profile in rotational.profiles if profile.id == job.plan.stock.get("rotational_profile_id")),
         None,
     )
     if source_profile is None or source_profile.review_state != "accepted":
         raise HTTPException(status_code=422, detail="Accepted outer rotational profile is unavailable")
+    axis = rotational.axes[0]
+    bounds = job.analysis.measurements.get("bounding_box") if job.analysis else None
+    profile_z_max = max(point.z for point in source_profile.points)
+    axial_offset = 0.0
+    if isinstance(bounds, Bounds):
+        solid_axis_values = [
+            x * axis.direction.x + y * axis.direction.y + z * axis.direction.z
+            for x in (bounds.minimum.x, bounds.maximum.x)
+            for y in (bounds.minimum.y, bounds.maximum.y)
+            for z in (bounds.minimum.z, bounds.maximum.z)
+        ]
+        # Exact-section profile scalars may use a translated local datum even
+        # though cutter sweeps and the STEP solid remain in source coordinates.
+        axial_offset = max(solid_axis_values) - profile_z_max
+    region = job.plan.stock.get("nonrotational_region_z_mm")
+    has_nonrotational_region = isinstance(region, list) and len(region) == 2
+    if not has_nonrotational_region:
+        region = [min(point.z for point in source_profile.points), max(point.z for point in source_profile.points)]
+    region = [float(value) + axial_offset for value in region]
     face_operation = next((item for item in operations if item.enabled is not False and item.type == "turn_facing"), None)
     rough_operation = next((item for item in operations if item.enabled is not False and item.type == "turn_od_roughing"), None)
-    front_min = max(max(float(region[0]), float(region[1])), min(point.z for point in source_profile.points))
-    front_max = float(face_operation.parameters.get("face_z_mm", max(point.z for point in source_profile.points))) if face_operation else max(point.z for point in source_profile.points)
-    if front_max <= front_min:
+    profile_front_min = (
+        max(max(float(region[0]) - axial_offset, float(region[1]) - axial_offset), min(point.z for point in source_profile.points))
+        if has_nonrotational_region
+        else float(rough_operation.parameters.get("profile_z_min_mm", min(point.z for point in source_profile.points)))
+        if rough_operation
+        else min(point.z for point in source_profile.points)
+    )
+    profile_front_max = float(face_operation.parameters.get("face_z_mm", profile_z_max)) if face_operation else profile_z_max
+    if profile_front_max <= profile_front_min:
         raise HTTPException(status_code=422, detail="Front turning region has no axial extent")
+    front_min = profile_front_min + axial_offset
+    front_max = profile_front_max + axial_offset
     stock_radius = float(job.plan.stock["diameter_mm"]) / 2
     rough_allowance = float(rough_operation.parameters.get("radial_allowance_mm", 0.3)) if rough_operation else 0.3
-    front_profile_radius = max(point.radius for point in source_profile.points if front_min - 1e-6 <= point.z <= front_max + 1e-6)
+    front_profile_radius = max(point.radius for point in source_profile.points if profile_front_min - 1e-6 <= point.z <= profile_front_max + 1e-6)
     grooves: dict[str, dict[str, float]] = {}
     pockets: dict[str, dict[str, object]] = {}
+    drills: dict[str, dict[str, object]] = {}
     cutoffs: dict[str, dict[str, float]] = {}
     stages: list[dict[str, object]] = []
     for operation in operations:
@@ -737,8 +762,8 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
                     # from obtaining their independently valid stock snapshots.
                     continue
                 grooves[operation.id] = {
-                    "minimum": min(strip.z_min_mm for strip in draft.strips),
-                    "maximum": max(strip.z_max_mm for strip in draft.strips),
+                    "minimum": min(strip.z_min_mm for strip in draft.strips) + axial_offset,
+                    "maximum": max(strip.z_max_mm for strip in draft.strips) + axial_offset,
                     "radius": max(feature.radius_start, feature.radius_end) + feature.depth_mm,
                     "floor_radius": min(feature.radius_start, feature.radius_end),
                 }
@@ -749,7 +774,7 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
                 center = float(operation.parameters["z_mm"])
             except (KeyError, TypeError, ValueError):
                 continue
-            lower, upper = center - width / 2, center + width / 2
+            lower, upper = center - width / 2 + axial_offset, center + width / 2 + axial_offset
             # The sacrificial kerf must remain behind the retained STEP part.
             # An invalid or overlapping setup cannot be represented as verified IPW.
             if not all(isfinite(value) for value in (width, center, lower, upper)) or width <= 0 or upper > min(float(region[0]), float(region[1])) + 1e-6:
@@ -773,12 +798,35 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
                     "rough": operation.type == "pocket_roughing",
                     "feature_id": feature_id,
                 })
+        elif operation.type == "drilling" and operation.parameters.get("indexed_spindle") is True:
+            try:
+                drills[operation.id] = {
+                    "diameter": float(operation.parameters["hole_diameter_mm"]),
+                    "depth": float(operation.parameters["feature_depth_mm"]),
+                    "entry": [float(operation.parameters[f"entry_{key}_mm"]) for key in ("x", "y", "z")],
+                    "axis": [float(operation.parameters[f"axis_{key}"]) for key in ("x", "y", "z")],
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            stages.append({"operation_id": operation.id, "kind": "drill", "rough": False})
 
     if not stages:
         return {"schema_version": "1.0.0", "operations": []}
-    axis = rotational.axes[0]
+    axis_origin_projection = (
+        axis.origin.x * axis.direction.x
+        + axis.origin.y * axis.direction.y
+        + axis.origin.z * axis.direction.z
+    )
+    # Rotational profile Z values are absolute projections on the spindle
+    # direction. Keep only the origin component perpendicular to that axis;
+    # adding the axial component again would translate stock away from the STEP.
+    axis_base = {
+        "x": axis.origin.x - axis.direction.x * axis_origin_projection,
+        "y": axis.origin.y - axis.direction.y * axis_origin_projection,
+        "z": axis.origin.z - axis.direction.z * axis_origin_projection,
+    }
     context = {
-        "axis_origin": axis.origin.model_dump(mode="json"),
+        "axis_origin": axis_base,
         "axis_direction": axis.direction.model_dump(mode="json"),
         "stock_radius": stock_radius,
         "region_min": min(float(region[0]), float(region[1])),
@@ -788,18 +836,19 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
         "front_rough_radius": min(stock_radius, front_profile_radius + rough_allowance),
         "front_floor_radius": min(
             (point.radius for point in source_profile.points
-             if front_min - 1e-6 <= point.z <= front_max + 1e-6
-             and not any(groove["minimum"] <= point.z <= groove["maximum"] for groove in grooves.values())),
-            default=min(point.radius for point in source_profile.points if front_min - 1e-6 <= point.z <= front_max + 1e-6),
+             if profile_front_min - 1e-6 <= point.z <= profile_front_max + 1e-6
+             and not any(groove["minimum"] <= point.z + axial_offset <= groove["maximum"] for groove in grooves.values())),
+            default=min(point.radius for point in source_profile.points if profile_front_min - 1e-6 <= point.z <= profile_front_max + 1e-6),
         ),
         "face_overhang": float(job.plan.stock.get("allowance_mm", {}).get("axial", 2.0)),
         "grooves": grooves,
         "cutoffs": cutoffs,
         "pockets": pockets,
+        "drills": drills,
     }
     stages_json = json.dumps({"stages": stages, "context": context}, separators=(",", ":"))
     signature = hashlib.sha256(
-        f"material-binary-v11:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
+        f"material-binary-v12:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
     ).hexdigest()
     manifest_path = directory / "l32-material-snapshots.json"
     stages_path = directory / "l32-material-stages.json"
@@ -1061,7 +1110,10 @@ def bind_job_machine_instance(job_id: str, request: MachineBindingRequest) -> Jo
         for setup in job.plan.setups:
             for operation in setup.operations:
                 if operation.workpiece_side == "back":
-                    if operation.type in {"pocket_roughing", "pocket_finishing"}:
+                    required_capability = operation.parameters.get("required_capability")
+                    if isinstance(required_capability, str):
+                        operation.enabled = required_capability in snapshot.validation.capabilities
+                    elif operation.type in {"pocket_roughing", "pocket_finishing"}:
                         operation.enabled = back_live_tool_available
                     else:
                         operation.enabled = back_turning_enabled and not (
@@ -1595,6 +1647,25 @@ def provision_default_l32_planning_instance(job: JobResponse, directory: Path) -
     job.machine_configuration_hash = snapshot.configuration_hash
     job.plan.stock["machine_instance_id"] = instance.id
     job.plan.stock["machine_configuration_hash"] = snapshot.configuration_hash
+    back_turning_enabled = (
+        "back_turning" in snapshot.validation.capabilities
+        and job.plan.stock.get("nonrotational_turning_limit_z_mm") is None
+    )
+    for setup in job.plan.setups:
+        for operation in setup.operations:
+            if operation.workpiece_side != "back":
+                continue
+            required_capability = operation.parameters.get("required_capability")
+            if isinstance(required_capability, str):
+                operation.enabled = required_capability in snapshot.validation.capabilities
+            elif operation.type in {"pocket_roughing", "pocket_finishing"}:
+                operation.enabled = "back_live_tool_milling" in snapshot.validation.capabilities
+            else:
+                operation.enabled = back_turning_enabled
+            operation.generation_state = "dirty"
+    job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan) if job.analysis else job.plan.coverage
+    job.plan.manufacturing_route = build_manufacturing_route(job.analysis, job.plan) if job.analysis else job.plan.manufacturing_route
+    job.plan.knowledge_assessment = assess_plan_knowledge(job.analysis, job.plan) if job.analysis else job.plan.knowledge_assessment
     instance_path = machine_instance_path(instance.id)
     instance_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(instance_path, snapshot.model_dump(mode="json"))

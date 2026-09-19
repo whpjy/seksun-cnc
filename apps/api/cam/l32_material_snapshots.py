@@ -127,6 +127,15 @@ def main():
         feature_id: pocket_fill(draft)
         for feature_id, draft in context.get("pockets", {}).items()
     }
+    drill_shapes = {
+        operation_id: Part.makeCylinder(
+            float(drill["diameter"]) / 2,
+            float(drill["depth"]),
+            App.Vector(*[float(value) for value in drill["entry"]]),
+            App.Vector(*[float(value) for value in drill["axis"]]),
+        )
+        for operation_id, drill in context.get("drills", {}).items()
+    }
     protected_pockets = list(pocket_shapes.values())
     protected_target = target.fuse(protected_pockets).removeSplitter() if protected_pockets else target
     exterior_removal = regional_stock.cut(protected_target)
@@ -155,6 +164,8 @@ def main():
             stage_volumes.append(
                 (exterior_rough if stage["rough"] else exterior_finish) if paired else exterior_removal
             )
+        elif stage["kind"] == "drill":
+            stage_volumes.append(drill_shapes[stage["operation_id"]])
         else:
             pair = pocket_partitions[stage["feature_id"]]
             paired = ("pocket", stage["feature_id"], not stage["rough"]) in stage_kinds

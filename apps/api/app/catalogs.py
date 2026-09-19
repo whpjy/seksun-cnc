@@ -28,7 +28,7 @@ TOOL_DEFINITIONS = [
     {"id": "CM-6-90", "name": "Ø6 90°倒角刀", "kind": "chamfer_mill", "diameter_mm": 6.0, "flute_count": 3, "max_rpm": 12000, "flute_length_mm": 8, "stickout_mm": 20, "holder_diameter_mm": 20},
     *[
         {"id": f"DRILL-{diameter:.1f}", "name": f"Ø{diameter:.1f} 麻花钻", "kind": "drill", "diameter_mm": diameter, "flute_count": 2, "max_rpm": 12000, "flute_length_mm": max(15, diameter * 5), "stickout_mm": max(30, diameter * 6), "holder_diameter_mm": 25}
-        for diameter in (2.0, 3.0, 4.0, 5.0, 6.0, 6.5, 7.0, 8.0, 10.0, 10.5, 11.0, 12.0, 16.0, 20.0)
+        for diameter in (2.0, 3.0, 4.0, 5.0, 6.0, 6.3, 6.5, 7.0, 8.0, 10.0, 10.5, 11.0, 12.0, 16.0, 20.0)
     ],
     *[
         {"id": f"EM-{diameter}", "name": f"Ø{diameter} 平底立铣刀", "kind": "end_mill", "diameter_mm": float(diameter), "flute_count": 3, "max_rpm": 16000, "flute_length_mm": max(12, diameter * 2.5), "stickout_mm": max(25, diameter * 3), "holder_diameter_mm": 8 if diameter <= 2 else 12 if diameter <= 4 else 20 if diameter <= 8 else 32}
