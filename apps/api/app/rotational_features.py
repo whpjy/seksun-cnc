@@ -217,6 +217,118 @@ def _edge_projection_profile(
     return _simplify_profile(profile_points, max(z_tolerance, radius_tolerance))
 
 
+def _profile_radius_at_z(points: list[RotationalProfilePoint], z_value: float) -> float | None:
+    radii = [point.radius for point in points if abs(point.z - z_value) <= 1e-7]
+    for left, right in zip(points, points[1:]):
+        delta = right.z - left.z
+        if abs(delta) <= 1e-9:
+            continue
+        if left.z - 1e-7 <= z_value <= right.z + 1e-7:
+            ratio = (z_value - left.z) / delta
+            radii.append(left.radius + ratio * (right.radius - left.radius))
+    return max(radii) if radii else None
+
+
+def _repair_outer_profile_with_axial_holes(
+    analysis: GeometryAnalysis,
+    profile: RotationalProfile,
+    origin: Vec3,
+    direction: Vec3,
+    coordinate_system: str,
+) -> tuple[RotationalProfile, list[dict[str, float | str]], list[str]]:
+    """Raise a sectional OD envelope only where full axial holes prove it too small.
+
+    A complete cylindrical hole surface at radial offset R and hole radius r proves
+    that the rotational outer envelope is at least R+r over that cylinder's axial
+    span.  This repairs section-direction loss without inventing a radius larger
+    than the maximum already observed on the source solid.
+    """
+    profile_min = min(point.z for point in profile.points)
+    profile_max = max(point.z for point in profile.points)
+    observed_max = max(point.radius for point in profile.points)
+    constraints: list[dict[str, float | str]] = []
+    rejected: list[str] = []
+    for hole in analysis.cylindrical_features:
+        if (
+            hole.kind != "hole"
+            or hole.review_state != "accepted"
+            or hole.angular_span_degrees < 359.0
+        ):
+            continue
+        hole_direction = _normalize_direction(hole.axis)
+        parallel = abs(_dot(hole_direction, direction))
+        if parallel < 0.999:
+            continue
+        delta = _subtract(hole.center, origin)
+        axial_from_origin = _dot(delta, direction)
+        radial_offset = _radial_distance(hole.center, origin, direction)
+        center_z = (
+            axial_from_origin
+            if coordinate_system in {"local", "unknown"}
+            else _dot(hole.center, direction)
+        )
+        half_length = hole.length * parallel / 2
+        minimum = max(profile_min, center_z - half_length)
+        maximum = min(profile_max, center_z + half_length)
+        if maximum < minimum + 1e-7:
+            continue
+        required = radial_offset + hole.radius
+        sample_z = {
+            minimum, maximum,
+            *(point.z for point in profile.points if minimum - 1e-7 <= point.z <= maximum + 1e-7),
+        }
+        available = min(
+            radius for z_value in sample_z
+            if (radius := _profile_radius_at_z(profile.points, z_value)) is not None
+        )
+        if required <= available + 0.05:
+            continue
+        if required > observed_max + 0.05:
+            rejected.append(hole.id)
+            continue
+        constraints.append({
+            "feature_id": hole.id,
+            "z_min_mm": minimum,
+            "z_max_mm": maximum,
+            "required_radius_mm": required,
+            "previous_min_radius_mm": available,
+        })
+    if not constraints:
+        return profile, [], rejected
+
+    repaired_points: list[RotationalProfilePoint] = []
+    boundary_values = {
+        float(item[key]) for item in constraints for key in ("z_min_mm", "z_max_mm")
+    }
+    source_points = [*profile.points]
+    for boundary in sorted(boundary_values):
+        radius = _profile_radius_at_z(profile.points, boundary)
+        if radius is not None:
+            source_points.append(RotationalProfilePoint(z=boundary, radius=radius))
+    for point in sorted(source_points, key=lambda item: item.z):
+        required = max(
+            (
+                float(item["required_radius_mm"])
+                for item in constraints
+                if float(item["z_min_mm"]) - 1e-7 <= point.z <= float(item["z_max_mm"]) + 1e-7
+            ),
+            default=point.radius,
+        )
+        candidate = RotationalProfilePoint(z=point.z, radius=max(point.radius, required))
+        if not repaired_points or (
+            abs(repaired_points[-1].z - candidate.z) > 1e-7
+            or abs(repaired_points[-1].radius - candidate.radius) > 1e-7
+        ):
+            repaired_points.append(candidate)
+    repaired = profile.model_copy(deep=True)
+    repaired.points = repaired_points
+    repaired.confidence = min(repaired.confidence, 0.68)
+    repaired.review_reasons.append(
+        "精确截面外包络已按完整轴向孔的实体包络下限修复；修复结果必须重新人工确认。"
+    )
+    return repaired, constraints, rejected
+
+
 def _candidate_score(feature: CylindricalFeature) -> float:
     review_factor = 0 if feature.review_state == "excluded" else 1
     kind_factor = 1 if feature.kind in {"boss", "cylinder"} else 0.25
@@ -704,6 +816,9 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
     if section_candidates:
         _, exact_section, reference = max(section_candidates, key=lambda item: item[0])
     direction = _normalize_direction(exact_section.axis if exact_section else reference.axis)
+    section_axis_reversed = bool(
+        exact_section is not None and _dot(exact_section.axis, direction) < 0
+    )
     axis_origin = exact_section.axis_origin if exact_section else reference.center
     axis = RotationalAxisCandidate(
         id="RA-1",
@@ -720,10 +835,16 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
     start = -reference.length / 2
     end = reference.length / 2
     if exact_section:
-        profile_points = [
-            RotationalProfilePoint(z=item.z, radius=item.radius)
-            for item in exact_section.outer_profile
-        ]
+        profile_points = sorted(
+            (
+                RotationalProfilePoint(
+                    z=-item.z if section_axis_reversed else item.z,
+                    radius=item.radius,
+                )
+                for item in exact_section.outer_profile
+            ),
+            key=lambda item: item.z,
+        )
     else:
         profile_points = projected_profile or [
             RotationalProfilePoint(z=start, radius=reference.radius),
@@ -740,6 +861,7 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
         "source_solid_count": source_solid_count,
         "reference_feature_id": reference.id,
         "profile_extraction_method": extraction_method,
+        "profile_axis_reversed_from_section": "true" if section_axis_reversed else "false",
     }
     rejection_reasons: list[str] = []
     review_reasons: list[str] = []
@@ -799,6 +921,35 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
         outer_profile.review_reasons = [
             "轮廓来自 OCCT 精确平面截线的外包络，生成刀路前仍须确认回转轴、截面方向和非回转特征。"
         ]
+        outer_profile, envelope_repairs, rejected_repairs = _repair_outer_profile_with_axial_holes(
+            analysis,
+            outer_profile,
+            axis.origin,
+            axis.direction,
+            exact_section.axial_coordinate_system,
+        )
+        if envelope_repairs:
+            evidence["outer_envelope_repair_count"] = len(envelope_repairs)
+            evidence["outer_envelope_repaired_feature_ids"] = [
+                str(item["feature_id"]) for item in envelope_repairs
+            ]
+            evidence["outer_envelope_repairs"] = [
+                json_value
+                for item in envelope_repairs
+                for json_value in [
+                    f"{item['feature_id']}:{float(item['z_min_mm']):.6f}:"
+                    f"{float(item['z_max_mm']):.6f}:{float(item['required_radius_mm']):.6f}"
+                ]
+            ]
+            status_warnings_prefix = [
+                "外回转包络已依据完整轴向孔的几何下限生成修复候选，必须重新人工确认。"
+            ]
+        else:
+            status_warnings_prefix = []
+        if rejected_repairs:
+            evidence["outer_envelope_unrepairable_feature_ids"] = rejected_repairs
+    else:
+        status_warnings_prefix = []
     profiles = [outer_profile]
     if exact_section and len(exact_section.inner_profile) >= 2:
         profiles.append(RotationalProfile(
@@ -806,10 +957,16 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
             axis_id=axis.id,
             side="inner",
             extraction_method="exact_section",
-            points=[
-                RotationalProfilePoint(z=item.z, radius=item.radius)
-                for item in exact_section.inner_profile
-            ],
+            points=sorted(
+                (
+                    RotationalProfilePoint(
+                        z=-item.z if section_axis_reversed else item.z,
+                        radius=item.radius,
+                    )
+                    for item in exact_section.inner_profile
+                ),
+                key=lambda item: item.z,
+            ),
             confidence=min(reference.confidence, 0.65),
             review_state=analysis.rotational_profile_reviews.get("RP-INNER-1", "review"),
             review_reasons=[
@@ -818,6 +975,7 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
             ],
         ))
     status_warnings = [
+        *status_warnings_prefix,
         "OCCT 精确截面已接入；当前结果仍保持人工审核状态，尚未直接驱动生产刀路。"
         if exact_section
         else (

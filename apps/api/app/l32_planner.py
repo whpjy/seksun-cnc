@@ -5,9 +5,14 @@ from math import atan2, degrees, pi, sqrt
 from .catalogs import enrich_tool, get_tool, resolve_machine, resolve_material
 from .coverage import evaluate_plan_coverage
 from .manufacturing_knowledge import assess_plan_knowledge
-from .models import Bounds, GeometryAnalysis, ManufacturingRequirements, ProcessPlan, Setup, Tool, Vec3
+from .models import (
+    Bounds, GeometryAnalysis, ManufacturingRequirements, Operation,
+    OperationCondition, OperationContract, OperationRegion,
+    ProcessPlan, Setup, Tool, Vec3,
+)
 from .operation_library import create_operation_instance
 from .rotational_features import (
+    RotationalProfile,
     bind_thread_requirements,
     clip_rotational_profile,
     infer_rotational_features,
@@ -26,18 +31,276 @@ def _turning_parameters(feed_mm_rev: float, cutting_speed_m_min: float) -> dict[
     }
 
 
-def _solid_axial_span(analysis: GeometryAnalysis, origin: Vec3, axis: Vec3) -> tuple[float, float] | None:
-    """Project the complete selected solid, not a local turning section, onto the spindle."""
+def _operation_region_limits(operation: Operation) -> dict[str, float]:
+    """Extract a conservative, machine-readable region from planner parameters."""
+    parameters = operation.parameters
+    limits: dict[str, float] = {}
+    pairs = (
+        ("z_min_mm", "source_region_z_min_mm"),
+        ("z_max_mm", "source_region_z_max_mm"),
+        ("z_min_mm", "profile_region_z_min_mm"),
+        ("z_max_mm", "profile_region_z_max_mm"),
+        ("z_min_mm", "groove_start_z_mm"),
+        ("z_max_mm", "groove_end_z_mm"),
+        ("z_min_mm", "start_z_mm"),
+        ("z_max_mm", "end_z_mm"),
+        ("diameter_mm", "final_diameter_mm"),
+        ("diameter_mm", "hole_diameter_mm"),
+        ("depth_mm", "feature_depth_mm"),
+    )
+    for target, source in pairs:
+        value = parameters.get(source)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            if target == "z_min_mm" and target in limits:
+                limits[target] = min(limits[target], numeric)
+            elif target == "z_max_mm" and target in limits:
+                limits[target] = max(limits[target], numeric)
+            else:
+                limits[target] = numeric
+    if "z_min_mm" not in limits and isinstance(parameters.get("z_mm"), (int, float)):
+        center = float(parameters["z_mm"])
+        width = float(parameters.get("cutting_width_mm", parameters.get("groove_width_mm", 0)) or 0)
+        limits.update({"z_min_mm": center - width / 2, "z_max_mm": center + width / 2})
+    return limits
+
+
+def _attach_operation_contracts(setups: list[Setup]) -> None:
+    """Bind every L32 operation to an explicit, verifiable IPW transition contract."""
+    previous_operation_id: str | None = None
+    for setup in setups:
+        for operation in setup.operations:
+            frame = operation.channel_id or operation.spindle_id or "world"
+            region = OperationRegion(
+                id=f"{operation.id}-TARGET",
+                kind="axial_radial_band" if _operation_region_limits(operation) else "feature_set",
+                feature_ids=operation.feature_ids,
+                coordinate_frame=frame,
+                limits=_operation_region_limits(operation),
+                description="本工序被允许作用的特征及轴向/径向范围",
+            )
+            preconditions = [
+                OperationCondition(
+                    code="input_state_available",
+                    description=(
+                        f"输入 IPW 必须等于 {previous_operation_id} 的输出状态"
+                        if previous_operation_id else "输入 IPW 必须来自本装夹的初始毛坯状态"
+                    ),
+                    verification="state",
+                ),
+                OperationCondition(
+                    code="target_features_resolved",
+                    description="全部目标特征必须存在且坐标系已解析",
+                    verification="geometry",
+                ),
+                OperationCondition(
+                    code="tool_compatible",
+                    description="刀具类型、有效刃长和尺寸必须覆盖目标区域",
+                    verification="tool",
+                ),
+                OperationCondition(
+                    code="machine_capability_available",
+                    description="主轴、通道、刀具模块和运动能力必须由设备实例确认",
+                    verification="machine",
+                ),
+            ]
+            if operation.workpiece_side == "back":
+                preconditions.append(OperationCondition(
+                    code="transfer_state_verified",
+                    description="背轴输入必须来自已验证的同步接料与切断状态迁移",
+                    verification="state",
+                ))
+            operation.contract = OperationContract(
+                input_state_policy=(
+                    "previous_operation_output" if previous_operation_id else "setup_stock"
+                ),
+                preconditions=preconditions,
+                target_regions=[region],
+                allowed_removal_regions=[OperationRegion(
+                    id=f"{operation.id}-ALLOWED-REMOVAL",
+                    kind="cutter_sweep",
+                    feature_ids=operation.feature_ids,
+                    coordinate_frame=frame,
+                    limits=region.limits,
+                    description="仅允许去除输入 IPW 与刀具扫掠的交集，且不得进入 STEP 目标实体",
+                )],
+                retained_regions=[OperationRegion(
+                    id="GLOBAL-TARGET-SOLID",
+                    kind="target_solid",
+                    coordinate_frame="world",
+                    description="原始 STEP 目标实体及后续装夹所需材料必须完整保留",
+                )],
+                postconditions=[
+                    OperationCondition(
+                        code="material_nonincreasing",
+                        description="输出 IPW 体积不得大于输入 IPW",
+                        verification="state",
+                    ),
+                    OperationCondition(
+                        code="target_retained",
+                        description="输出 IPW 必须仍包含完整 STEP 目标实体",
+                        verification="geometry",
+                    ),
+                    OperationCondition(
+                        code="output_state_persisted",
+                        description="输出 IPW 必须持久化并成为下一工序的唯一输入",
+                        verification="state",
+                    ),
+                    OperationCondition(
+                        code="measurable_material_removal",
+                        description="启用的切削工序必须产生可测量且位于允许区域内的材料去除",
+                        verification="state",
+                    ),
+                ],
+            )
+            previous_operation_id = operation.id
+
+
+def _absolute_axial_span(analysis: GeometryAnalysis, axis: Vec3) -> tuple[float, float] | None:
+    """Project the selected solid's bounding box on the spindle in world coordinates."""
     bounds = analysis.measurements.get("bounding_box")
     if not isinstance(bounds, Bounds):
         return None
     values = [
-        (x - origin.x) * axis.x + (y - origin.y) * axis.y + (z - origin.z) * axis.z
+        x * axis.x + y * axis.y + z * axis.z
         for x in (bounds.minimum.x, bounds.maximum.x)
         for y in (bounds.minimum.y, bounds.maximum.y)
         for z in (bounds.minimum.z, bounds.maximum.z)
     ]
     return min(values), max(values)
+
+
+def _profile_axis_coordinate_offset(
+    analysis: GeometryAnalysis,
+    profile: RotationalProfile,
+    origin: Vec3,
+    axis: Vec3,
+) -> tuple[float, str]:
+    """Resolve legacy absolute section Z versus current origin-relative section Z."""
+    section = next(
+        (item for item in analysis.rotational_sections if len(item.outer_profile) >= 2),
+        None,
+    )
+    origin_projection = origin.x * axis.x + origin.y * axis.y + origin.z * axis.z
+    if section is not None and section.axial_coordinate_system == "local":
+        return origin_projection, "local"
+    if section is not None and section.axial_coordinate_system == "absolute":
+        return 0.0, "absolute"
+
+    solid_span = _absolute_axial_span(analysis, axis)
+    if solid_span is None:
+        return origin_projection, "local"
+    profile_span = (
+        min(point.z for point in profile.points),
+        max(point.z for point in profile.points),
+    )
+
+    def overlap(left: tuple[float, float], right: tuple[float, float]) -> float:
+        return max(0.0, min(left[1], right[1]) - max(left[0], right[0]))
+
+    local_solid_span = (
+        solid_span[0] - origin_projection,
+        solid_span[1] - origin_projection,
+    )
+    absolute_overlap = overlap(profile_span, solid_span)
+    local_overlap = overlap(profile_span, local_solid_span)
+    if absolute_overlap > local_overlap + 0.05:
+        return 0.0, "absolute_legacy"
+    return origin_projection, "local_inferred"
+
+
+def _solid_axial_span(
+    analysis: GeometryAnalysis, axis: Vec3, coordinate_offset: float,
+) -> tuple[float, float] | None:
+    span = _absolute_axial_span(analysis, axis)
+    if span is None:
+        return None
+    return span[0] - coordinate_offset, span[1] - coordinate_offset
+
+
+def _profile_minimum_radius(
+    profile: RotationalProfile, minimum_z: float, maximum_z: float,
+) -> float | None:
+    """Return the smallest outer radius crossed by an axial feature interval."""
+    if maximum_z < minimum_z:
+        minimum_z, maximum_z = maximum_z, minimum_z
+    profile_minimum = min(point.z for point in profile.points)
+    profile_maximum = max(point.z for point in profile.points)
+    minimum_z = max(minimum_z, profile_minimum)
+    maximum_z = min(maximum_z, profile_maximum)
+    if maximum_z < minimum_z - 1e-6:
+        return None
+
+    radii = [
+        point.radius for point in profile.points
+        if minimum_z - 1e-6 <= point.z <= maximum_z + 1e-6
+    ]
+    for left, right in zip(profile.points, profile.points[1:]):
+        delta_z = right.z - left.z
+        if abs(delta_z) <= 1e-9:
+            continue
+        for boundary in (minimum_z, maximum_z):
+            if left.z - 1e-6 <= boundary <= right.z + 1e-6:
+                ratio = (boundary - left.z) / delta_z
+                radii.append(left.radius + ratio * (right.radius - left.radius))
+    return min(radii) if radii else None
+
+
+def _axial_hole_profile_conflicts(
+    analysis: GeometryAnalysis,
+    profile: RotationalProfile,
+    origin: Vec3,
+    axis: Vec3,
+    coordinate_offset: float,
+) -> list[dict[str, float | str]]:
+    """Find accepted axial holes that cannot physically fit inside the OD profile.
+
+    Exact section extraction can accidentally follow a hole boundary instead of the
+    material's outer envelope.  An accepted axial hole provides an independent
+    geometric invariant: its radial offset plus radius must fit inside the outer
+    profile for the complete cylindrical span.
+    """
+    conflicts: list[dict[str, float | str]] = []
+    for hole in analysis.cylindrical_features:
+        if hole.kind != "hole" or hole.review_state != "accepted":
+            continue
+        hole_axis_length = sqrt(hole.axis.x ** 2 + hole.axis.y ** 2 + hole.axis.z ** 2)
+        if hole_axis_length <= 1e-9:
+            continue
+        parallel = abs(
+            (hole.axis.x * axis.x + hole.axis.y * axis.y + hole.axis.z * axis.z)
+            / hole_axis_length
+        )
+        if parallel < 0.999:
+            continue
+        delta = Vec3(x=hole.center.x - origin.x, y=hole.center.y - origin.y, z=hole.center.z - origin.z)
+        center_z = (
+            hole.center.x * axis.x + hole.center.y * axis.y + hole.center.z * axis.z
+            - coordinate_offset
+        )
+        local_projection = delta.x * axis.x + delta.y * axis.y + delta.z * axis.z
+        radial_x = delta.x - local_projection * axis.x
+        radial_y = delta.y - local_projection * axis.y
+        radial_z = delta.z - local_projection * axis.z
+        radial_offset = sqrt(radial_x ** 2 + radial_y ** 2 + radial_z ** 2)
+        interval_half_length = hole.length * parallel / 2
+        minimum_z = center_z - interval_half_length
+        maximum_z = center_z + interval_half_length
+        available_radius = _profile_minimum_radius(profile, minimum_z, maximum_z)
+        if available_radius is None:
+            continue
+        required_radius = radial_offset + hole.radius
+        tolerance = 0.05
+        if required_radius <= available_radius + tolerance:
+            continue
+        conflicts.append({
+            "feature_id": hole.id,
+            "z_min_mm": round(minimum_z, 6),
+            "z_max_mm": round(maximum_z, 6),
+            "required_radius_mm": round(required_radius, 6),
+            "available_radius_mm": round(available_radius, 6),
+        })
+    return conflicts
 
 
 def _nonrotational_turning_limit(
@@ -122,13 +385,37 @@ def build_l32_process_plan(
         maximum_radius = max(radii)
         profile_length = max(z_values) - min(z_values)
         spindle_axis = next((item for item in rotational.axes if item.id == profile.axis_id), None)
+        profile_coordinate_offset, profile_coordinate_system = (
+            _profile_axis_coordinate_offset(
+                analysis, profile, spindle_axis.origin, spindle_axis.direction,
+            )
+            if spindle_axis is not None else (0.0, "unknown")
+        )
+        profile_consistency_issues = (
+            _axial_hole_profile_conflicts(
+                analysis, profile, spindle_axis.origin, spindle_axis.direction,
+                profile_coordinate_offset,
+            )
+            if spindle_axis is not None else []
+        )
+        inconsistent_feature_ids = {
+            str(item["feature_id"]) for item in profile_consistency_issues
+        }
+        if profile_consistency_issues:
+            issue_labels = ", ".join(sorted(inconsistent_feature_ids))
+            blocking_reasons.append(
+                f"外回转轮廓与轴向孔 {issue_labels} 的实体包络矛盾；"
+                "可能误将孔边界识别为外轮廓，禁止自动生成相关背面车削和钻孔工序。"
+            )
         protected_limit = (
             _nonrotational_turning_limit(
                 analysis, spindle_axis.origin, spindle_axis.direction, maximum_radius,
             ) if spindle_axis is not None else None
         )
         solid_span = (
-            _solid_axial_span(analysis, spindle_axis.origin, spindle_axis.direction)
+            _solid_axial_span(
+                analysis, spindle_axis.direction, profile_coordinate_offset,
+            )
             if spindle_axis is not None else None
         )
         finished_back_z = min(z_values)
@@ -143,6 +430,7 @@ def build_l32_process_plan(
             ):
                 finished_back_z = min(finished_back_z, solid_span[0])
         radial_allowance = max(1.0, round(maximum_radius * 0.05, 2))
+        back_face_allowance = 0.2
         stock_radius = maximum_radius + radial_allowance
         stock_length = max(
             profile_length,
@@ -157,8 +445,22 @@ def build_l32_process_plan(
             "profile_review_state": profile.review_state,
             "profile_extraction_method": profile.extraction_method,
             "profile_axial_complete": axial_profile_complete,
+            "profile_axis_coordinate_system": profile_coordinate_system,
+            "profile_axis_coordinate_offset_mm": round(profile_coordinate_offset, 9),
+            "profile_consistency_valid": not profile_consistency_issues,
+            "outer_envelope_repair_count": int(
+                rotational.evidence.get("outer_envelope_repair_count", 0) or 0
+            ),
+            "outer_envelope_repaired_feature_ids": list(
+                rotational.evidence.get("outer_envelope_repaired_feature_ids", []) or []
+            ),
+            "outer_envelope_repairs": list(
+                rotational.evidence.get("outer_envelope_repairs", []) or []
+            ),
             "finished_back_z_mm": round(finished_back_z, 6),
         }
+        if profile_consistency_issues:
+            stock["profile_consistency_issues"] = profile_consistency_issues
         if protected_limit is not None:
             stock["nonrotational_turning_limit_z_mm"] = round(protected_limit, 6)
             stock["nonrotational_region_z_mm"] = [
@@ -269,6 +571,8 @@ def build_l32_process_plan(
                 for hole in analysis.cylindrical_features:
                     if hole.kind != "hole" or hole.review_state != "accepted":
                         continue
+                    if hole.id in inconsistent_feature_ids:
+                        continue
                     hole_axis_length = sqrt(hole.axis.x ** 2 + hole.axis.y ** 2 + hole.axis.z ** 2)
                     if hole_axis_length <= 1e-9:
                         continue
@@ -276,11 +580,14 @@ def build_l32_process_plan(
                         (hole.axis.x * axis.x + hole.axis.y * axis.y + hole.axis.z * axis.z)
                         / hole_axis_length
                     )
-                    projected = hole.center.x * axis.x + hole.center.y * axis.y + hole.center.z * axis.z
                     local_projection = (
                         (hole.center.x - spindle_axis.origin.x) * axis.x
                         + (hole.center.y - spindle_axis.origin.y) * axis.y
                         + (hole.center.z - spindle_axis.origin.z) * axis.z
+                    )
+                    projected = (
+                        hole.center.x * axis.x + hole.center.y * axis.y + hole.center.z * axis.z
+                        - profile_coordinate_offset
                     )
                     radial_x = hole.center.x - spindle_axis.origin.x - local_projection * axis.x
                     radial_y = hole.center.y - spindle_axis.origin.y - local_projection * axis.y
@@ -796,15 +1103,16 @@ def build_l32_process_plan(
                 feature_ids=[profile.id], tool=get_tool("TURN-CUTOFF-2"),
                 parameters={
                     **_turning_parameters(0.05, cutting_speed * 0.65),
-                    "z_mm": finished_back_z - float(get_tool("TURN-CUTOFF-2").cutting_width_mm or 0) / 2,
+                    "z_mm": finished_back_z - back_face_allowance - float(get_tool("TURN-CUTOFF-2").cutting_width_mm or 0) / 2,
                     "cutting_width_mm": 2.0,
                     "breakthrough_radius_mm": 0.1,
                     "finished_back_datum_z_mm": finished_back_z,
-                    "retained_material_min_z_mm": finished_back_z,
-                    "sacrificial_extension_mm": float(get_tool("TURN-CUTOFF-2").cutting_width_mm or 0),
+                    "retained_material_min_z_mm": finished_back_z - back_face_allowance,
+                    "back_face_allowance_mm": back_face_allowance,
+                    "sacrificial_extension_mm": float(get_tool("TURN-CUTOFF-2").cutting_width_mm or 0) + back_face_allowance,
                 },
                 rationale=[
-                    "切断刀中心向成品背面外偏移半个刀宽，使完整刀缝落在牺牲余料内",
+                    "切断刀中心向成品背面外偏移半个刀宽及背面精车余量，使完整刀缝落在牺牲余料内",
                     "成品背面基准与切断刀中心分离；生成前必须确认接料和背轴 Z0",
                 ],
                 confidence=min(profile.confidence, 0.75), status="warning",
@@ -839,7 +1147,7 @@ def build_l32_process_plan(
                     feature_ids=[back_profile_id], tool=get_tool("TURN-OD-F"),
                     parameters={
                         **common_finish,
-                        "stock_allowance_mm": 0.0,
+                        "stock_allowance_mm": back_face_allowance,
                         "depth_of_cut_mm": 0.25,
                         "face_z_mm": 0.0,
                         "center_overtravel_mm": 0.15,
@@ -890,7 +1198,7 @@ def build_l32_process_plan(
                         "控制器无关 DRAFT，不代表背轴刀架和夹头实物干涉已认证",
                     ],
                     confidence=min(profile.confidence, 0.7), status="warning",
-                )] if backside_turning_candidate is not None else []),
+                )] if backside_turning_candidate is not None and not profile_consistency_issues else []),
                 *([create_operation_instance(
                     id="OP60", sequence=60, type="turn_od_finishing", name="背面切断邻域外圆清根",
                     channel_id="sub", spindle_id="sub", workpiece_side="back",
@@ -935,6 +1243,7 @@ def build_l32_process_plan(
     if stock.get("required_option") == "bar_diameter_38mm":
         warnings.append("候选棒料超过 Ø32；生成草案前必须选择并校验启用 Ø38 棒料选件的设备实例。")
 
+    _attach_operation_contracts(setups)
     plan = ProcessPlan(
         title=f"{analysis.source_file} · L32 车削工艺方案",
         material=material,

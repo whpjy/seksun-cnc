@@ -84,6 +84,21 @@ type L32GeometricDraft = {
 
 type L32MaterialSnapshotManifest = {
   operations: Array<{ operation_id: string; files: string[] }>;
+  part_state_chain?: {
+    status: "continuous" | "failed";
+    validation_level: "geometric_draft" | "mixed" | "cutter_envelope_verified" | "toolpath_sweep_verified";
+    states: Array<{ id: string; mesh_file: string; volume_mm3: number }>;
+    transitions: Array<{
+      operation_id: string;
+      input_state_id: string;
+      output_state_id: string;
+      removed_volume_mm3: number;
+      continuity_verified: boolean;
+      validation_level: "geometric_draft" | "cutter_envelope_verified" | "toolpath_sweep_verified";
+      transition_verified: boolean;
+      blocking_reasons: string[];
+    }>;
+  } | null;
 };
 
 const l32MaterialManifestRequests = new Map<string, Promise<L32MaterialSnapshotManifest>>();
@@ -496,9 +511,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [operationPopoverPosition, setOperationPopoverPosition] = useState({ top: 110, left: 326, anchorY: 28 });
   const [playbackMode, setPlaybackMode] = useState<"single" | "cumulative">("single");
   const [playbackResetToken, setPlaybackResetToken] = useState(0);
-  const [l32ComparisonView, setL32ComparisonView] = useState<"before" | "after">("after");
-  const [l32AnimationRequested, setL32AnimationRequested] = useState(false);
-  const [l32AnimationRequestToken, setL32AnimationRequestToken] = useState(0);
   const [showL32Workbench, setShowL32Workbench] = useState(false);
   const [showL32Program, setShowL32Program] = useState(false);
   const [showProcessDesigner, setShowProcessDesigner] = useState(false);
@@ -956,12 +968,13 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }, [fetchL32PreviewJson, isL32, job.id, job.machine_configuration_hash, job.machine_instance_id, job.plan?.stock.diameter_mm, l32Axis, l32Rotational, operations]);
 
   useEffect(() => {
-    if (!isL32 || !job.plan || !l32AnimationRequested) return undefined;
+    if (!isL32 || !job.plan) return undefined;
     let cancelled = false;
-    const requestKey = `${job.id}:${job.machine_configuration_hash ?? "unbound"}:${JSON.stringify(job.plan.setups)}`;
+    const baseKey = `${job.id}:${job.machine_configuration_hash ?? "unbound"}:${JSON.stringify(job.plan)}`;
+    const requestKey = `${baseKey}:animation:cumulative`;
     let request = l32MaterialManifestRequests.get(requestKey);
     if (!request) {
-      request = fetch(apiUrl(`/api/v1/jobs/${job.id}/l32/material-snapshots`), { cache: "no-store" }).then(async (response) => {
+      request = fetch(apiUrl(`/api/v1/jobs/${job.id}/l32/material-snapshots?animation=true`), { cache: "no-store" }).then(async (response) => {
         if (!response.ok) throw new Error("material snapshots unavailable");
         return response.json() as Promise<L32MaterialSnapshotManifest>;
       });
@@ -981,7 +994,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         if (!cancelled) setL32MaterialSnapshotError({ key: requestKey, message: "实体材料逐帧预生成失败；当前零件显示不代表该工序的材料去除结果。" });
       });
     return () => { cancelled = true; };
-  }, [isL32, job.id, job.machine_configuration_hash, job.plan, l32AnimationRequested, l32AnimationRequestToken]);
+  }, [isL32, job.id, job.machine_configuration_hash, job.plan]);
 
   const l32ToolpathSegments = useMemo<ToolpathSegment[]>(() => {
     if (!l32Program || !l32Axis) return EMPTY_TOOLPATH_SEGMENTS;
@@ -1338,11 +1351,18 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   },
     [activeMode, camResult?.preview_segments, isL32, l32AvailableToolpathSegments, l32OperationPreviewSegments, l32ToolpathSegments, l32WholePartBlocked, operations, playbackMode, selectedOperation],
   );
-  const l32MaterialRequestKey = `${job.id}:${job.machine_configuration_hash ?? "unbound"}:${JSON.stringify(job.plan?.setups ?? [])}`;
+  const l32MaterialRequestKey = `${job.id}:${job.machine_configuration_hash ?? "unbound"}:${JSON.stringify(job.plan ?? null)}`;
+  const l32AnimationScopeKey = `${l32MaterialRequestKey}:animation:cumulative`;
+  const l32AnimationReady = Boolean(
+    selectedOperation
+    && l32MaterialSnapshots?.key === l32AnimationScopeKey
+    && l32MaterialSnapshots.files[selectedOperation.id]?.length,
+  );
   const visibleMaterialSnapshots = useMemo(() => {
     const urls: string[] = [];
     const stages: { operationId: string; start: number; count: number }[] = [];
-    if (isL32 && activeMode === "仿真" && selectedOperation && l32MaterialSnapshots?.key === l32MaterialRequestKey) {
+    const animationReady = l32MaterialSnapshots?.key === l32AnimationScopeKey;
+    if (isL32 && activeMode === "仿真" && selectedOperation && animationReady) {
       const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
       const included = playbackMode === "single"
         ? [selectedOperation]
@@ -1354,16 +1374,15 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       }
     }
     return { urls, stages };
-  }, [activeMode, isL32, l32MaterialRequestKey, l32MaterialSnapshots, operations, playbackMode, selectedOperation]);
-  const missingMaterialStages = visibleMaterialSnapshots.stages
+  }, [activeMode, isL32, l32AnimationScopeKey, l32MaterialSnapshots, operations, playbackMode, selectedOperation]);
+  const missingMaterialStages = (l32AnimationReady ? visibleMaterialSnapshots.stages : [])
     .filter((stage) => stage.count === 0 && visibleToolpathSegments.some((segment) => segment.operation_id === stage.operationId && segment.motion === "cut"))
     .map((stage) => stage.operationId);
   const awaitingL32MaterialSnapshots = isL32 && activeMode === "仿真"
-    && l32AnimationRequested
     && selectedOperation != null
     && selectedOperation.enabled !== false
     && ["turn_facing", "turn_od_roughing", "turn_od_finishing", "turn_grooving", "turn_cutoff", "live_tool_contour_roughing", "live_tool_contour_finishing", "pocket_roughing", "pocket_finishing", "drilling"].includes(selectedOperation.type)
-    && (l32MaterialSnapshots?.key !== l32MaterialRequestKey || !(l32MaterialSnapshots.files[selectedOperation.id]?.length));
+    && (l32MaterialSnapshots?.key !== l32AnimationScopeKey || !(l32MaterialSnapshots.files[selectedOperation.id]?.length));
   const initialToolpathSegments = useMemo(() => {
     if (activeMode !== "仿真" || playbackMode !== "single" || !selectedOperation) return EMPTY_TOOLPATH_SEGMENTS;
     const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
@@ -1478,7 +1497,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     setSelectedOperation(operation);
     setSelectedFeatureIds(operation.feature_ids);
     if (isL32) {
-      setL32ComparisonView("after");
       setPlaybackResetToken((current) => current + 1);
       setActiveMode("仿真");
       void previewL32Operation(operation);
@@ -1519,23 +1537,12 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     setSelectedFeatureIds(operation.feature_ids);
     setEditingOperationDetails(false);
     setShowOperationDetails(false);
-    setL32ComparisonView("after");
     setPlaybackResetToken((current) => current + 1);
     setLoadingCam(!camResult && !isL32);
     setActiveMode("仿真");
-    if (isL32) void previewL32Operation(operation);
-  };
-
-  const showL32ComparisonState = (state: "before" | "after") => {
-    setL32ComparisonView(state);
-    setPlaybackResetToken((current) => current + 1);
-  };
-
-  const requestL32Animation = () => {
-    setL32MaterialSnapshotError(null);
-    l32MaterialManifestRequests.delete(l32MaterialRequestKey);
-    setL32AnimationRequested(true);
-    setL32AnimationRequestToken((current) => current + 1);
+    if (isL32) {
+      void previewL32Operation(operation);
+    }
   };
 
   const cancelOperationEdit = () => {
@@ -1683,9 +1690,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     setL32GrooveSegments({});
     setL32MillingPreviews({});
     setWarmingL32Previews(false);
-    setL32ComparisonView("after");
-    setL32AnimationRequested(false);
-    setL32AnimationRequestToken(0);
     setL32MaterialSnapshots(null);
     setL32MaterialSnapshotError(null);
     setL32MillingPreview(null);
@@ -2403,26 +2407,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             {previewingL32OperationId === selectedOperation.id ? <LoaderCircle className="spin" size={15} /> : l32PreviewOperationId === selectedOperation.id ? <Check size={15} /> : <Info size={15} />}
             <span>{operationMessage}</span>
           </div>}
-          {isL32 && activeMode === "仿真" && selectedOperation && <div className={`l32-result-comparison ${l32AnimationRequested && visibleMaterialSnapshots.urls.length > 0 ? "with-playback" : ""}`}>
-            <div className="l32-result-comparison-heading">
-              <span>工序作用结果</span>
-              <small>{selectedOperation.id} · 快速对比加工前后状态</small>
-            </div>
-            <div className="l32-result-comparison-actions">
-              <div className="l32-result-state-toggle" aria-label="加工前后状态">
-                <button className={l32ComparisonView === "before" ? "active" : ""} onClick={() => showL32ComparisonState("before")}>加工前</button>
-                <button className={l32ComparisonView === "after" ? "active" : ""} onClick={() => showL32ComparisonState("after")}>加工后</button>
-              </div>
-              {!l32AnimationRequested && <button className="l32-generate-animation" onClick={requestL32Animation}><Play size={13} />生成仿真动画</button>}
-              {l32AnimationRequested && l32MaterialSnapshots?.key !== l32MaterialRequestKey && l32MaterialSnapshotError?.key !== l32MaterialRequestKey && <button className="l32-generate-animation" disabled><LoaderCircle className="spin" size={13} />正在生成动画</button>}
-              {l32AnimationRequested && visibleMaterialSnapshots.urls.length > 0 && <span className="l32-animation-ready"><Check size={13} />动画已就绪</span>}
-              {l32AnimationRequested && l32MaterialSnapshots?.key === l32MaterialRequestKey && visibleMaterialSnapshots.urls.length === 0 && <span className="l32-animation-unavailable">当前工序无实体动画</span>}
-              {l32MaterialSnapshotError?.key === l32MaterialRequestKey && <button className="l32-generate-animation" onClick={requestL32Animation}>重新生成动画</button>}
-            </div>
-          </div>}
-          {awaitingL32MaterialSnapshots && <div className={`l32-material-snapshot-status ${l32MaterialSnapshotError?.key === l32MaterialRequestKey || l32MaterialSnapshots?.key === l32MaterialRequestKey ? "failed" : ""}`}>
-            {l32MaterialSnapshotError?.key === l32MaterialRequestKey || l32MaterialSnapshots?.key === l32MaterialRequestKey ? <AlertTriangle size={15} /> : <LoaderCircle className="spin" size={15} />}
-            <span>{l32MaterialSnapshotError?.key === l32MaterialRequestKey ? l32MaterialSnapshotError.message : l32MaterialSnapshots?.key === l32MaterialRequestKey ? "当前工序没有可用的实体材料帧；仍可查看工序前后快速对比。" : "正在生成详细实体动画；工序前后对比仍可使用。"}</span>
+          {awaitingL32MaterialSnapshots && <div className={`l32-material-snapshot-status ${l32MaterialSnapshotError?.key === l32AnimationScopeKey || l32MaterialSnapshots?.key === l32AnimationScopeKey ? "failed" : ""}`}>
+            {l32MaterialSnapshotError?.key === l32AnimationScopeKey || l32MaterialSnapshots?.key === l32AnimationScopeKey ? <AlertTriangle size={15} /> : <LoaderCircle className="spin" size={15} />}
+            <span>{l32MaterialSnapshotError?.key === l32AnimationScopeKey ? `${l32MaterialSnapshotError.message}；刀路播放器仍可使用。` : l32MaterialSnapshots?.key === l32AnimationScopeKey ? "当前工序没有可用的实体材料帧；刀路播放器仍可使用。" : "正在后台准备真实材料动画；刀路播放器可立即使用。"}</span>
           </div>}
           {isL32 && activeMode === "仿真" && playbackMode === "cumulative" && missingMaterialStages.length > 0 && <div className="l32-material-snapshot-status failed">
             <AlertTriangle size={15} />
@@ -2444,9 +2431,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             drillingStage={visibleMaterialSnapshots.urls.length ? null : instantL32DrillingStage}
             camoticsSurface={visibleCamoticsSurface}
             fixtureComponents={visibleFixtureComponents}
-            animateToolpath={activeMode === "仿真" && (!isL32 || (l32AnimationRequested && visibleMaterialSnapshots.urls.length > 0)) && (playbackMode === "single" || !l32WholePartBlocked || visibleMaterialSnapshots.urls.length > 0 || l32PreviewOperationId === selectedOperation?.id)}
-            initialProgress={isL32 && activeMode === "仿真" && !hasRequestedProgress ? (l32ComparisonView === "after" ? 1 : 0) : initialSimulationProgress}
-            staticProgress={isL32 && activeMode === "仿真" ? (l32ComparisonView === "after" ? 1 : 0) : 1}
+            animateToolpath={activeMode === "仿真" && (playbackMode === "single" || !l32WholePartBlocked || visibleMaterialSnapshots.urls.length > 0 || l32PreviewOperationId === selectedOperation?.id)}
+            initialProgress={initialSimulationProgress}
+            staticProgress={1}
             playbackResetToken={playbackResetToken}
             operationTools={operationTools}
             topologyEdges={visibleTopologyEdges}

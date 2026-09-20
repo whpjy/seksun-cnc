@@ -449,34 +449,52 @@ std::optional<RotationalSectionCandidate> collect_rotational_section(
     const Vec3 axis = normalize(reference->axis);
     const Vec3 helper = std::abs(axis.x) < 0.8 ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
     const Vec3 plane_normal = normalize(cross(axis, helper));
-    const Vec3 radial_direction = normalize(cross(plane_normal, axis));
-    const gp_Pln plane(
-        gp_Pnt(reference->center.x, reference->center.y, reference->center.z),
-        gp_Dir(plane_normal.x, plane_normal.y, plane_normal.z));
-    BRepAlgoAPI_Section section(shape, plane, Standard_False);
-    section.Approximation(Standard_True);
-    section.Build();
-    if (!section.IsDone()) return std::nullopt;
+    const Vec3 radial_basis_u = normalize(cross(plane_normal, axis));
+    const Vec3 radial_basis_v = normalize(cross(axis, radial_basis_u));
 
     const double diagonal = shape_diagonal(shape);
     const double sampling_tolerance = std::clamp(diagonal / 20000.0, 0.001, 0.01);
     std::vector<RotationalSectionPoint> samples;
-    TopTools_IndexedMapOfShape section_edges;
-    TopExp::MapShapes(section.Shape(), TopAbs_EDGE, section_edges);
-    for (int edge_index = 1; edge_index <= section_edges.Extent(); ++edge_index) {
-        const TopoDS_Edge edge = TopoDS::Edge(section_edges(edge_index));
-        BRepAdaptor_Curve curve(edge);
-        GCPnts_QuasiUniformDeflection points(curve, sampling_tolerance);
-        if (!points.IsDone() || points.NbPoints() < 2) continue;
-        const int stride = std::max(1, static_cast<int>(std::ceil(points.NbPoints() / 1024.0)));
-        for (int index = 1; index <= points.NbPoints(); index += stride) {
-            const Vec3 point = point_to_vec(points.Value(index));
+    constexpr int section_plane_count = 8;
+    const double pi = std::acos(-1.0);
+    for (int plane_index = 0; plane_index < section_plane_count; ++plane_index) {
+        const double angle = pi * static_cast<double>(plane_index)
+            / static_cast<double>(section_plane_count);
+        const Vec3 radial_direction{
+            std::cos(angle) * radial_basis_u.x + std::sin(angle) * radial_basis_v.x,
+            std::cos(angle) * radial_basis_u.y + std::sin(angle) * radial_basis_v.y,
+            std::cos(angle) * radial_basis_u.z + std::sin(angle) * radial_basis_v.z,
+        };
+        const Vec3 section_normal = normalize(cross(axis, radial_direction));
+        const gp_Pln plane(
+            gp_Pnt(reference->center.x, reference->center.y, reference->center.z),
+            gp_Dir(section_normal.x, section_normal.y, section_normal.z));
+        BRepAlgoAPI_Section section(shape, plane, Standard_False);
+        section.Approximation(Standard_True);
+        section.Build();
+        if (!section.IsDone()) continue;
+
+        TopTools_IndexedMapOfShape section_edges;
+        TopExp::MapShapes(section.Shape(), TopAbs_EDGE, section_edges);
+        for (int edge_index = 1; edge_index <= section_edges.Extent(); ++edge_index) {
+            const TopoDS_Edge edge = TopoDS::Edge(section_edges(edge_index));
+            BRepAdaptor_Curve curve(edge);
+            GCPnts_QuasiUniformDeflection points(curve, sampling_tolerance);
+            if (!points.IsDone() || points.NbPoints() < 2) continue;
+            const int stride = std::max(1, static_cast<int>(std::ceil(points.NbPoints() / 1024.0)));
+            for (int index = 1; index <= points.NbPoints(); index += stride) {
+                const Vec3 point = point_to_vec(points.Value(index));
+                const Vec3 delta = subtract(point, reference->center);
+                const double axial = dot(delta, axis);
+                const double radial_squared = std::max(dot(delta, delta) - axial * axial, 0.0);
+                samples.push_back({axial, std::sqrt(radial_squared)});
+            }
+            const Vec3 point = point_to_vec(points.Value(points.NbPoints()));
             const Vec3 delta = subtract(point, reference->center);
-            samples.push_back({dot(delta, axis), std::abs(dot(delta, radial_direction))});
+            const double axial = dot(delta, axis);
+            const double radial_squared = std::max(dot(delta, delta) - axial * axial, 0.0);
+            samples.push_back({axial, std::sqrt(radial_squared)});
         }
-        const Vec3 point = point_to_vec(points.Value(points.NbPoints()));
-        const Vec3 delta = subtract(point, reference->center);
-        samples.push_back({dot(delta, axis), std::abs(dot(delta, radial_direction))});
     }
     if (samples.size() < 2) return std::nullopt;
 
@@ -793,7 +811,8 @@ std::string make_json(
             json << "{\"z\":" << point.z << ",\"radius\":" << point.radius << '}';
             if (index + 1 < section.inner_profile.size()) json << ',';
         }
-        json << "],\"tolerance_mm\":" << section.tolerance_mm << ",\"warnings\":[";
+        json << "],\"tolerance_mm\":" << section.tolerance_mm
+             << ",\"axial_coordinate_system\":\"local\",\"warnings\":[";
         for (std::size_t index = 0; index < section.warnings.size(); ++index) {
             json << '\"' << json_escape(section.warnings[index]) << '\"';
             if (index + 1 < section.warnings.size()) json << ',';

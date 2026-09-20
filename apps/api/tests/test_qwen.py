@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 
+from app import main
 from app.models import GeometryAnalysis
 from app.planner import build_process_plan
 from app.qwen import (
@@ -183,3 +184,47 @@ def test_process_review_rejects_unknown_operation_type() -> None:
 
     with pytest.raises(QwenPlanningError, match="unsupported operation types"):
         review_process_plan(analysis, plan, settings=settings(), transport=transport)
+
+
+def test_ai_approval_block_is_applied_to_the_reviewed_plan() -> None:
+    _, plan = planning_input()
+
+    main._apply_ai_review_gate(plan, {
+        "approval_blocked": True,
+        "summary": "目标特征超出当前 CAM 能力。",
+    })
+
+    assert plan.automation_status == "unsupported"
+    assert plan.blocking_reasons == [
+        "AI 工艺审查阻断：目标特征超出当前 CAM 能力。",
+    ]
+
+    main._apply_ai_review_gate(plan, {"approval_blocked": False})
+
+    assert plan.automation_status == "review"
+    assert plan.blocking_reasons == []
+
+
+def test_ai_approval_block_keeps_acceptable_deterministic_plan_reviewable() -> None:
+    _, plan = planning_input()
+
+    main._apply_ai_review_gate(plan, {
+        "approval_blocked": True,
+        "deterministic_plan_assessment": "acceptable",
+        "summary": "尺寸绑定和生产 NC 仍需工程师确认。",
+    })
+
+    assert plan.automation_status == "review"
+    assert plan.blocking_reasons == []
+    assert plan.warnings[-1] == "AI 工艺审查待复核：尺寸绑定和生产 NC 仍需工程师确认。"
+
+
+def test_initial_planning_guidance_also_blocks_approval(tmp_path) -> None:
+    (tmp_path / "planning-guidance.json").write_text(json.dumps({
+        "review": {
+            "approval_blocked": True,
+            "summary": "轮廓证据不完整。",
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+
+    assert main._ai_review_block_reason(tmp_path) == "轮廓证据不完整。"

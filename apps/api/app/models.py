@@ -112,6 +112,7 @@ class RotationalSectionCandidate(BaseModel):
     outer_profile: list[RotationalSectionPoint]
     inner_profile: list[RotationalSectionPoint] = Field(default_factory=list)
     tolerance_mm: float = Field(gt=0)
+    axial_coordinate_system: Literal["local", "absolute", "unknown"] = "unknown"
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -185,6 +186,35 @@ class SafetyConfiguration(BaseModel):
     fixture_components: list[FixtureComponent] = Field(default_factory=list)
 
 
+class OperationCondition(BaseModel):
+    code: str
+    description: str
+    verification: Literal["geometry", "tool", "machine", "state", "manual"]
+    required: bool = True
+
+
+class OperationRegion(BaseModel):
+    id: str
+    kind: Literal[
+        "feature_set", "axial_radial_band", "cutter_sweep",
+        "target_solid", "ipw_remainder", "transfer_interface",
+    ]
+    feature_ids: list[str] = Field(default_factory=list)
+    coordinate_frame: Literal["main", "sub", "world"] = "world"
+    limits: dict[str, float] = Field(default_factory=dict)
+    description: str
+
+
+class OperationContract(BaseModel):
+    schema_version: str = "1.0.0"
+    input_state_policy: Literal["setup_stock", "previous_operation_output"]
+    preconditions: list[OperationCondition] = Field(default_factory=list)
+    target_regions: list[OperationRegion] = Field(default_factory=list)
+    allowed_removal_regions: list[OperationRegion] = Field(default_factory=list)
+    retained_regions: list[OperationRegion] = Field(default_factory=list)
+    postconditions: list[OperationCondition] = Field(default_factory=list)
+
+
 class Operation(BaseModel):
     id: str
     sequence: int
@@ -206,6 +236,7 @@ class Operation(BaseModel):
     spindle_id: Literal["main", "sub"] | None = None
     workpiece_side: Literal["front", "back"] | None = None
     synchronization_group: str | None = None
+    contract: OperationContract | None = None
 
 
 class Setup(BaseModel):
@@ -424,6 +455,47 @@ class ProcessPlan(BaseModel):
     manufacturing_route: ManufacturingRouteProposal | None = None
     knowledge_assessment: ProcessKnowledgeAssessment | None = None
     ai_planning: dict[str, Any] | None = None
+
+
+class PartState(BaseModel):
+    id: str
+    sequence: int = Field(ge=0)
+    source_operation_id: str | None = None
+    mesh_file: str
+    mesh_sha256: str = Field(min_length=64, max_length=64)
+    volume_mm3: float = Field(ge=0)
+
+
+class OperationStateTransition(BaseModel):
+    operation_id: str
+    sequence: int = Field(ge=1)
+    input_state_id: str
+    output_state_id: str
+    removed_volume_mm3: float = Field(ge=0)
+    previous_state_shape_delta_mm3: float = Field(ge=0)
+    continuity_verified: bool
+    validation_level: Literal[
+        "geometric_draft", "cutter_envelope_verified", "toolpath_sweep_verified",
+    ] = "geometric_draft"
+    cutter_sweep_removed_volume_mm3: float | None = Field(default=None, ge=0)
+    unreachable_removal_volume_mm3: float | None = Field(default=None, ge=0)
+    overcut_volume_mm3: float | None = Field(default=None, ge=0)
+    material_nonincreasing: bool = True
+    target_retained: bool = True
+    effect_verified: bool = True
+    transition_verified: bool = True
+    blocking_reasons: list[str] = Field(default_factory=list)
+
+
+class PartStateChain(BaseModel):
+    schema_version: str = "1.0.0"
+    job_id: str
+    status: Literal["continuous", "failed"]
+    validation_level: Literal[
+        "geometric_draft", "mixed", "cutter_envelope_verified", "toolpath_sweep_verified",
+    ] = "geometric_draft"
+    states: list[PartState]
+    transitions: list[OperationStateTransition]
 
 
 class JobResponse(BaseModel):

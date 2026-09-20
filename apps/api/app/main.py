@@ -23,7 +23,8 @@ from .models import (
     AxialDrillingOperationReviewRequest, BoringOperationReviewRequest, Bounds, FeatureReviewRequest, GeometryAnalysis, GroovingOperationReviewRequest, JobHistoryItem, JobResponse, OperationCreateRequest,
     GrooveBindingConfirmRequest, ManufacturingRequirement, ManufacturingRequirements,
     ManufacturingRequirementsImportRequest, OperationReorderRequest, OperationUpdateRequest,
-    ProcessPlan, SafetyConfigurationRequest, ThreadBindingConfirmRequest,
+    OperationStateTransition, PartState, PartStateChain, ProcessPlan,
+    SafetyConfigurationRequest, ThreadBindingConfirmRequest,
     ThreadOperationReviewRequest,
     SolidSelectionRequest,
 )
@@ -55,19 +56,21 @@ from .benchmarks import example_catalog_payload
 from .coverage import evaluate_plan_coverage
 from .remediation import apply_automatic_remediation, build_remediation_report
 from .rotational_features import (
-    RotationalFeatureAnalysis, bind_thread_requirements, infer_rotational_features,
+    RotationalFeatureAnalysis, bind_thread_requirements, clip_rotational_profile,
+    infer_rotational_features, suppress_external_grooves,
 )
 from .groove_binding import (
     DrawingGrooveRequirement, bind_groove_requirement, groove_candidate_evidence,
 )
 from .turning_draft import TurningDraftRequest, TurningDraftResult, compile_turning_draft
 from .turning_reachability import assess_turning_reachability
-from cam.providers.turning import TurningContext
+from cam.providers.turning import TurningContext, TurningProvider
 from .turning_transfer import (
     TurningTransferDraftRequest, TurningTransferDraftResult,
     compile_synchronized_transfer_draft,
 )
 from .l32_backside import BacksideDraftRequest, BacksideDraftResult, compile_backside_draft
+from .l32_backside import derive_backside_profile
 from .l32_backside_chain import (
     BacksideChainDraftRequest, BacksideChainDraftResult, compile_backside_chain_draft,
 )
@@ -93,6 +96,11 @@ CAM_STREAM_LOCK = threading.Lock()
 CAM_STREAMING_JOBS: set[str] = set()
 AI_REVIEW_LOCK = threading.Lock()
 L32_MATERIAL_SNAPSHOT_LOCK = threading.Lock()
+L32_PART_STATE_BUILD_LOCK = threading.RLock()
+L32_PART_STATE_BUILDING: set[str] = set()
+# Disabled while the product uses the original fast geometric playback path.
+# Keep the background builder available for a future opt-in validation mode.
+L32_PRECISE_VALIDATION_ENABLED = False
 AI_REVIEWING_JOBS: set[str] = set()
 JOB_EVENT_CONDITION = threading.Condition()
 JOB_EVENT_LOGS: dict[str, list[dict[str, object]]] = {}
@@ -175,6 +183,184 @@ def job_directory(job_id: str) -> Path:
 
 def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_part_state_chain(
+    job_id: str, directory: Path, operations: list[dict[str, object]],
+) -> PartStateChain:
+    if not operations:
+        raise ValueError("part-state chain requires at least one operation")
+    states: list[PartState] = []
+    transitions: list[OperationStateTransition] = []
+    first = operations[0]
+    first_files = first.get("files")
+    if not isinstance(first_files, list) or not first_files:
+        raise ValueError("initial part-state mesh is missing")
+    initial_file = str(first_files[0])
+    states.append(PartState(
+        id="IPW-000", sequence=0, source_operation_id=None,
+        mesh_file=initial_file,
+        mesh_sha256=hashlib.sha256((directory / initial_file).read_bytes()).hexdigest(),
+        volume_mm3=float(first["input_state_volume_mm3"]),
+    ))
+    previous_state_id = states[0].id
+    for sequence, operation in enumerate(operations, start=1):
+        files = operation.get("files")
+        if not isinstance(files, list) or not files:
+            raise ValueError(f"{operation.get('operation_id', sequence)} output mesh is missing")
+        output_file = str(files[-1])
+        output_state = PartState(
+            id=f"IPW-{sequence:03d}", sequence=sequence,
+            source_operation_id=str(operation["operation_id"]),
+            mesh_file=output_file,
+            mesh_sha256=hashlib.sha256((directory / output_file).read_bytes()).hexdigest(),
+            volume_mm3=float(operation["output_state_volume_mm3"]),
+        )
+        states.append(output_state)
+        continuity_delta = float(operation["previous_state_shape_delta_mm3"])
+        input_volume = float(operation["input_state_volume_mm3"])
+        output_volume = float(operation["output_state_volume_mm3"])
+        removed_volume = max(float(operation["removed_volume_mm3"]), 0.0)
+        material_nonincreasing = output_volume <= input_volume + 0.002
+        effect_verified = removed_volume > 0.000001
+        target_retained = bool(operation.get("target_retained", True))
+        validation_level = str(operation.get("validation_level", "geometric_draft"))
+        blocking_reasons = [str(item) for item in operation.get("blocking_reasons", [])]
+        continuity_verified = continuity_delta <= 0.002
+        if not continuity_verified:
+            blocking_reasons.append("相邻工序的中间毛坯实体不连续")
+        if not material_nonincreasing:
+            blocking_reasons.append("工序导致材料体积增加")
+        if not effect_verified:
+            blocking_reasons.append("切削工序未产生可测量的材料去除")
+        if not target_retained:
+            blocking_reasons.append("刀具包络与目标保留实体相交")
+        blocking_reasons = list(dict.fromkeys(blocking_reasons))
+        transition_verified = not blocking_reasons
+        transitions.append(OperationStateTransition(
+            operation_id=str(operation["operation_id"]), sequence=sequence,
+            input_state_id=previous_state_id, output_state_id=output_state.id,
+            removed_volume_mm3=removed_volume,
+            previous_state_shape_delta_mm3=continuity_delta,
+            continuity_verified=continuity_verified,
+            validation_level=validation_level,
+            cutter_sweep_removed_volume_mm3=operation.get("cutter_sweep_removed_volume_mm3"),
+            unreachable_removal_volume_mm3=operation.get("unreachable_removal_volume_mm3"),
+            overcut_volume_mm3=operation.get("overcut_volume_mm3"),
+            material_nonincreasing=material_nonincreasing,
+            target_retained=target_retained,
+            effect_verified=effect_verified,
+            transition_verified=transition_verified,
+            blocking_reasons=blocking_reasons,
+        ))
+        previous_state_id = output_state.id
+    levels = {item.validation_level for item in transitions}
+    chain_validation_level = (
+        next(iter(levels)) if len(levels) == 1 else "mixed"
+    )
+    return PartStateChain(
+        job_id=job_id,
+        status="continuous" if all(item.transition_verified for item in transitions) else "failed",
+        validation_level=chain_validation_level,
+        states=states,
+        transitions=transitions,
+    )
+
+
+def build_turning_sweep_segments(
+    operation, source_profile, *, stock_radius: float, axial_offset: float,
+    backside_cutoff_z: float | None = None,
+) -> tuple[list[dict[str, object]], list[str]]:
+    """Compile front-turning feed moves into world-aligned meridian sweep segments."""
+    is_backside = operation.workpiece_side == "back" or operation.spindle_id == "sub"
+    profile = source_profile if operation.type in {"turn_od_roughing", "turn_od_finishing"} else None
+    if is_backside:
+        if backside_cutoff_z is None:
+            return [], ["背轴刀路缺少已确认的切断坐标基准"]
+        if profile is not None:
+            region_minimum = operation.parameters.get("source_region_z_min_mm")
+            region_maximum = operation.parameters.get("source_region_z_max_mm")
+            if (region_minimum is None) != (region_maximum is None):
+                return [], ["背轴轮廓区域缺少完整的主轴 Z 边界"]
+            if region_minimum is not None:
+                profile = clip_rotational_profile(
+                    suppress_external_grooves(profile),
+                    float(region_minimum), float(region_maximum),
+                )
+            cleanup_length = (
+                float(operation.parameters.get("back_cleanup_length_mm", 1.0))
+                if operation.type == "turn_od_finishing" and region_minimum is None
+                else None
+            )
+            _, profile = derive_backside_profile(
+                profile, backside_cutoff_z, cleanup_length_mm=cleanup_length,
+            )
+    if profile is not None and (
+        "profile_z_min_mm" in operation.parameters or "profile_z_max_mm" in operation.parameters
+    ):
+        profile = clip_rotational_profile(
+            profile,
+            float(operation.parameters.get("profile_z_min_mm", min(point.z for point in profile.points))),
+            float(operation.parameters.get("profile_z_max_mm", max(point.z for point in profile.points))),
+        )
+    cut_direction = str(operation.parameters.get("cut_direction", "negative_z"))
+    if cut_direction not in {"negative_z", "positive_z"}:
+        return [], ["车削刀路的切削方向无效"]
+    try:
+        program = TurningProvider().generate(
+            operation,
+            TurningContext(
+                machine_snapshot_hash="0" * 64,
+                stock_radius_mm=stock_radius,
+                channel_id=operation.channel_id or ("sub" if is_backside else "main"),
+                cut_direction=cut_direction,
+            ),
+            profile,
+        )
+    except ValueError as error:
+        return [], [f"无法生成确定性车削刀路：{error}"]
+    segments: list[dict[str, object]] = []
+    current_x: float | None = None
+    current_z: float | None = None
+    for command in program.channels[0].commands:
+        next_x = float(command.axes.get("X", current_x)) if current_x is not None or "X" in command.axes else None
+        next_z = float(command.axes.get("Z", current_z)) if current_z is not None or "Z" in command.axes else None
+        if command.type == "feed_move" and None not in (current_x, current_z, next_x, next_z):
+            axial_width = float(command.parameters.get("axial_width_mm", 0) or 0)
+            axial_center_offset = 0.0
+            if command.parameters.get("cut_side") == "facing":
+                tool_radius = max(float(operation.tool.nose_radius_mm or 0), 0.05)
+                axial_width = tool_radius * 2
+                axial_center_offset = (
+                    tool_radius
+                    if command.parameters.get("retain_direction") == "negative_z"
+                    else -tool_radius
+                )
+            start_z = (
+                backside_cutoff_z - float(current_z)
+                if is_backside and backside_cutoff_z is not None else float(current_z)
+            ) + axial_offset
+            end_z = (
+                backside_cutoff_z - float(next_z)
+                if is_backside and backside_cutoff_z is not None else float(next_z)
+            ) + axial_offset
+            segments.append({
+                "start_radius": float(current_x) / 2,
+                "start_z": start_z,
+                "end_radius": float(next_x) / 2,
+                "end_z": end_z,
+                "tool_radius": float(operation.tool.nose_radius_mm or 0),
+                "axial_width": axial_width,
+                "axial_center_offset": -axial_center_offset if is_backside else axial_center_offset,
+                "radial_stock_envelope": (
+                    command.parameters.get("cut_side") == "external"
+                    and command.parameters.get("position_role") != "nose_center"
+                ),
+            })
+        current_x, current_z = next_x, next_z
+    if not segments:
+        return [], ["确定性刀路中没有可用于材料扫掠的切削进给"]
+    return segments, []
 
 
 def persist_rotational_analysis(
@@ -272,9 +458,14 @@ def invalidate_cam_artifacts(directory: Path) -> None:
         "turning-whole-program-timeline.json", "turning-continuous-simulation.json",
         "turning-inner-bore-chain-ir.json", "turning-inner-bore-chain-draft.json",
         "boring-reachability.json", "axial-drilling-review.json", "grooving-review.json",
+        "l32-material-snapshots.json", "l32-part-state-chain.json", "l32-material-stages.json",
+        "l32-part-state-build.json",
     ):
         (directory / filename).unlink(missing_ok=True)
-    for pattern in ("program-*.nc", "camotics-*.stl", "*.camotics"):
+    for pattern in (
+        "program-*.nc", "camotics-*.stl", "*.camotics",
+        "l32-material-*.stl", "l32-material-snapshots-*.json", "l32-part-state-*.stl",
+    ):
         for artifact in directory.glob(pattern):
             if artifact.is_file() and artifact.parent == directory:
                 artifact.unlink(missing_ok=True)
@@ -677,7 +868,9 @@ def check_l32_catalog_exterior_sweep(job_id: str) -> dict[str, object]:
 
 
 @app.get("/api/v1/jobs/{job_id}/l32/material-snapshots")
-def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
+def get_l32_material_snapshots(
+    job_id: str, animation: bool = False, operation_id: str | None = None,
+) -> dict[str, object]:
     """Generate clean, cumulative OCC solids for geometric L32 milling playback."""
     job = load_job(job_id)
     if job.device_id != "citizen-cincom-l32" or job.plan is None:
@@ -740,6 +933,18 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
     pockets: dict[str, dict[str, object]] = {}
     drills: dict[str, dict[str, object]] = {}
     cutoffs: dict[str, dict[str, float]] = {}
+    back_regions: dict[str, dict[str, float]] = {}
+    planned_cutoff = next(
+        (item for item in operations if item.enabled is not False and item.type == "turn_cutoff"),
+        None,
+    )
+    planned_back_datum = None
+    if planned_cutoff is not None:
+        raw_back_datum = planned_cutoff.parameters.get(
+            "finished_back_datum_z_mm", planned_cutoff.parameters.get("z_mm"),
+        )
+        if isinstance(raw_back_datum, (int, float)) and not isinstance(raw_back_datum, bool):
+            planned_back_datum = float(raw_back_datum)
     stages: list[dict[str, object]] = []
     for operation in operations:
         if operation.enabled is False:
@@ -747,7 +952,24 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
         if operation.type == "turn_facing":
             stages.append({"operation_id": operation.id, "kind": "face", "rough": False})
         elif operation.type in {"turn_od_roughing", "turn_od_finishing"}:
-            stages.append({"operation_id": operation.id, "kind": "front", "rough": operation.type == "turn_od_roughing"})
+            if operation.workpiece_side == "back" or operation.spindle_id == "sub":
+                minimum = operation.parameters.get("source_region_z_min_mm")
+                maximum = operation.parameters.get("source_region_z_max_mm")
+                if minimum is None or maximum is None:
+                    cleanup = float(operation.parameters.get("back_cleanup_length_mm", 1.0))
+                    if planned_back_datum is None or cleanup <= 0:
+                        continue
+                    minimum, maximum = planned_back_datum, planned_back_datum + cleanup
+                back_regions[operation.id] = {
+                    "minimum": min(float(minimum), float(maximum)) + axial_offset,
+                    "maximum": max(float(minimum), float(maximum)) + axial_offset,
+                }
+                stages.append({
+                    "operation_id": operation.id, "kind": "back_exterior",
+                    "rough": operation.type == "turn_od_roughing",
+                })
+            else:
+                stages.append({"operation_id": operation.id, "kind": "front", "rough": operation.type == "turn_od_roughing"})
         elif operation.type == "turn_grooving" and operation.workpiece_side == "front":
             feature = next((item for item in rotational.features if item.id in operation.feature_ids and item.kind == "external_groove_candidate"), None)
             if feature:
@@ -810,20 +1032,84 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
                 continue
             stages.append({"operation_id": operation.id, "kind": "drill", "rough": False})
 
+    operations_by_id = {operation.id: operation for operation in operations}
+    cutoff_operation = planned_cutoff
+    backside_cutoff_value = (
+        cutoff_operation.parameters.get("finished_back_datum_z_mm")
+        if cutoff_operation is not None else None
+    )
+    if backside_cutoff_value is None and cutoff_operation is not None:
+        backside_cutoff_value = cutoff_operation.parameters.get("z_mm")
+    backside_cutoff_z = (
+        float(backside_cutoff_value)
+        if isinstance(backside_cutoff_value, (int, float)) and not isinstance(backside_cutoff_value, bool)
+        else None
+    )
+    for stage in stages:
+        operation = operations_by_id[str(stage["operation_id"])]
+        level = "geometric_draft"
+        blockers: list[str] = []
+        if stage["kind"] == "face" and operation.id == getattr(face_operation, "id", None):
+            if operation.tool.kind == "turning_od":
+                level = "cutter_envelope_verified"
+            else:
+                blockers.append("端面工序未使用外圆车刀，无法建立刀具包络")
+        elif stage["kind"] == "groove":
+            width = float(operation.tool.cutting_width_mm or 0)
+            groove = grooves[operation.id]
+            if operation.tool.kind == "grooving" and width > 0 and width <= groove["maximum"] - groove["minimum"] + 0.001:
+                level = "cutter_envelope_verified"
+            else:
+                blockers.append("切槽刀类型或刃宽与槽区域不匹配")
+        elif stage["kind"] == "cutoff":
+            planned_width = cutoffs[operation.id]["maximum"] - cutoffs[operation.id]["minimum"]
+            tool_width = float(operation.tool.cutting_width_mm or 0)
+            if operation.tool.kind == "cutoff" and abs(tool_width - planned_width) <= 0.001:
+                level = "cutter_envelope_verified"
+            else:
+                blockers.append("切断刀类型或刃宽与切断区域不匹配")
+        elif stage["kind"] == "drill":
+            planned_diameter = float(drills[operation.id]["diameter"])
+            if operation.tool.kind == "drill" and abs(operation.tool.diameter_mm - planned_diameter) <= 0.05:
+                level = "cutter_envelope_verified"
+            else:
+                blockers.append("钻头直径与目标孔直径不匹配")
+        if (
+            operation.type in {
+                "turn_facing", "turn_od_roughing", "turn_od_finishing",
+                "turn_grooving", "turn_cutoff",
+            }
+        ):
+            sweep_segments, sweep_errors = build_turning_sweep_segments(
+                operation, source_profile,
+                stock_radius=stock_radius, axial_offset=axial_offset,
+                backside_cutoff_z=backside_cutoff_z,
+            )
+            if sweep_segments:
+                level = "toolpath_sweep_candidate"
+                stage["toolpath_sweep_segments"] = sweep_segments
+            else:
+                blockers.extend(sweep_errors)
+        stage["validation_level"] = level
+        stage["blocking_reasons"] = blockers
+        stage["workpiece_side"] = operation.workpiece_side or "front"
+
     if not stages:
-        return {"schema_version": "1.0.0", "operations": []}
+        return {"schema_version": "1.1.0", "operations": [], "part_state_chain": None}
     axis_origin_projection = (
         axis.origin.x * axis.direction.x
         + axis.origin.y * axis.direction.y
         + axis.origin.z * axis.direction.z
     )
-    # Rotational profile Z values are absolute projections on the spindle
-    # direction. Keep only the origin component perpendicular to that axis;
-    # adding the axial component again would translate stock away from the STEP.
+    profile_coordinate_offset = float(
+        job.plan.stock.get("profile_axis_coordinate_offset_mm", 0.0) or 0.0
+    )
+    # Profile Z may be a legacy absolute projection or the current analyzer's
+    # origin-relative coordinate. Reconstruct the matching world-space axis base.
     axis_base = {
-        "x": axis.origin.x - axis.direction.x * axis_origin_projection,
-        "y": axis.origin.y - axis.direction.y * axis_origin_projection,
-        "z": axis.origin.z - axis.direction.z * axis_origin_projection,
+        "x": axis.origin.x + axis.direction.x * (profile_coordinate_offset - axis_origin_projection),
+        "y": axis.origin.y + axis.direction.y * (profile_coordinate_offset - axis_origin_projection),
+        "z": axis.origin.z + axis.direction.z * (profile_coordinate_offset - axis_origin_projection),
     }
     context = {
         "axis_origin": axis_base,
@@ -845,12 +1131,46 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
         "cutoffs": cutoffs,
         "pockets": pockets,
         "drills": drills,
+        "back_regions": back_regions,
+        "back_face": {
+            "minimum": (
+                planned_back_datum - float(planned_cutoff.parameters.get("back_face_allowance_mm", 0)) + axial_offset
+                if planned_back_datum is not None and planned_cutoff is not None else 0
+            ),
+            "maximum": planned_back_datum + axial_offset if planned_back_datum is not None else 0,
+        },
     }
-    stages_json = json.dumps({"stages": stages, "context": context}, separators=(",", ":"))
+    if operation_id is not None and not animation:
+        raise HTTPException(status_code=422, detail="Operation-scoped snapshots require animation=true")
+    stage_ids = [str(stage["operation_id"]) for stage in stages]
+    if operation_id is not None and operation_id not in stage_ids:
+        raise HTTPException(status_code=404, detail="Operation is not available for material animation")
+    animation_scope = (
+        hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:12]
+        if operation_id is not None else None
+    )
+    frame_count = 20 if animation else 2
+    filename_prefix = (
+        f"l32-material-{animation_scope}"
+        if animation_scope is not None else "l32-material" if animation else "l32-part-state"
+    )
+    stages_payload = {
+        "stages": stages,
+        "context": context,
+        "frame_count": frame_count,
+        "filename_prefix": filename_prefix,
+        "animation_operation_id": operation_id,
+        "precise_validation": False,
+    }
+    stages_json = json.dumps(stages_payload, separators=(",", ":"))
     signature = hashlib.sha256(
-        f"material-binary-v12:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
+        f"material-binary-v19-fast-playback:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
     ).hexdigest()
-    manifest_path = directory / "l32-material-snapshots.json"
+    manifest_path = directory / (
+        f"l32-material-snapshots-{animation_scope}.json"
+        if animation_scope is not None else
+        "l32-material-snapshots.json" if animation else "l32-part-state-chain.json"
+    )
     stages_path = directory / "l32-material-stages.json"
     with L32_MATERIAL_SNAPSHOT_LOCK:
         if manifest_path.is_file():
@@ -861,14 +1181,14 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
                 ]
                 if (
                     cached.get("signature") == signature
-                    and len(cached.get("operations", [])) == len(stages)
+                    and len(cached.get("operations", [])) == (1 if operation_id is not None else len(stages))
                     and all((directory / name).is_file() and (directory / name).stat().st_size > 84 for name in cached_files)
                 ):
                     return cached
             except (OSError, ValueError, TypeError):
                 pass
         try:
-            write_json(stages_path, {"stages": stages, "context": context})
+            write_json(stages_path, stages_payload)
             with tempfile.TemporaryDirectory(prefix="l32-material-build-", dir=directory) as temporary:
                 completed = run_freecad_adapter(
                     FREECAD_CMD,
@@ -882,27 +1202,197 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
                     if "CNC_L32_MATERIAL " in item
                 )
                 result = json.loads(line)
-                expected_ids = [stage["operation_id"] for stage in stages]
+                expected_ids = [operation_id] if operation_id is not None else stage_ids
                 if [item["operation_id"] for item in result["operations"]] != expected_ids:
                     raise ValueError("Snapshot operations do not match the process plan")
                 names = [name for item in result["operations"] for name in item["files"]]
                 invalid_names = [
                     name for name in names if Path(name).name != name
-                    or not name.startswith("l32-material-") or not name.endswith(".stl")
+                    or not name.startswith(f"{filename_prefix}-") or not name.endswith(".stl")
                     or not (Path(temporary) / name).is_file()
                     or (Path(temporary) / name).stat().st_size <= 84
                 ]
                 if not names or invalid_names:
                     raise ValueError(f"Material snapshots missing or invalid: {invalid_names[:5]}")
-                for name in names:
+                # Consecutive PartState transitions deliberately share the
+                # same boundary mesh (previous output == next input).
+                for name in dict.fromkeys(names):
                     (Path(temporary) / name).replace(directory / name)
         except subprocess.TimeoutExpired as error:
             raise HTTPException(status_code=504, detail="L32 material snapshots timed out") from error
         except (OSError, subprocess.CalledProcessError, StopIteration, ValueError, KeyError) as error:
             raise HTTPException(status_code=502, detail=f"L32 material snapshots failed: {error}") from error
-        payload = {"schema_version": "1.0.0", "signature": signature, **result}
+        payload: dict[str, object] = {
+            "schema_version": "1.1.0", "signature": signature, **result,
+        }
+        if not animation:
+            chain = build_part_state_chain(job_id, directory, result["operations"])
+            payload["part_state_chain"] = chain.model_dump(mode="json")
         write_json(manifest_path, payload)
         return payload
+
+
+def _part_state_build_status(job_id: str) -> dict[str, object]:
+    directory = job_directory(job_id)
+    path = directory / "l32-part-state-build.json"
+    if path.is_file():
+        try:
+            status = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            status = {}
+    else:
+        status = {}
+    with L32_PART_STATE_BUILD_LOCK:
+        active = job_id in L32_PART_STATE_BUILDING
+    if status.get("state") in {"queued", "running"} and not active:
+        status.update({
+            "state": "interrupted",
+            "message": "后台实体状态生成已中断，可重新发起生成",
+        })
+    elif not status and (directory / "l32-part-state-chain.json").is_file():
+        status = {
+            "job_id": job_id,
+            "state": "ready",
+            "message": "工序前后实体状态已缓存",
+        }
+    elif not status:
+        status = {
+            "job_id": job_id,
+            "state": "not_started",
+            "message": "尚未生成工序前后实体状态",
+        }
+    status["active"] = active
+    return status
+
+
+def _l32_part_state_prerequisite_error(job: JobResponse, directory: Path) -> str | None:
+    if job.plan is None or job.plan.automation_status == "unsupported":
+        return "当前工艺计划未通过安全门禁，不能生成实体状态链"
+    if not any(operation.enabled for setup in job.plan.setups for operation in setup.operations):
+        return "当前工艺计划没有启用的切削工序"
+    rotational_path = directory / "rotational-features.json"
+    if not rotational_path.is_file():
+        return "精确回转特征分析不可用"
+    try:
+        rotational = RotationalFeatureAnalysis.model_validate_json(
+            rotational_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return "精确回转特征分析不可解析"
+    profile_id = job.plan.stock.get("rotational_profile_id")
+    profile = next((item for item in rotational.profiles if item.id == profile_id), None)
+    if profile is None or profile.review_state != "accepted":
+        return "外回转轮廓尚未人工确认，不能生成权威实体状态链"
+    return None
+
+
+def queue_l32_part_state_build(job_id: str, *, force: bool = False) -> dict[str, object]:
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.plan is None:
+        raise HTTPException(status_code=409, detail="L32 process plan is required")
+    prerequisite_error = _l32_part_state_prerequisite_error(job, job_directory(job_id))
+    if prerequisite_error:
+        raise HTTPException(
+            status_code=409,
+            detail=prerequisite_error,
+        )
+    directory = job_directory(job_id)
+    manifest_path = directory / "l32-part-state-chain.json"
+    status_path = directory / "l32-part-state-build.json"
+    with L32_PART_STATE_BUILD_LOCK:
+        if job_id in L32_PART_STATE_BUILDING:
+            return _part_state_build_status(job_id)
+        if manifest_path.is_file() and not force:
+            status = {
+                "job_id": job_id,
+                "state": "ready",
+                "message": "工序前后实体状态已缓存",
+                "completed_at": utc_now(),
+            }
+            write_json(status_path, status)
+            return {**status, "active": False}
+        L32_PART_STATE_BUILDING.add(job_id)
+    queued = {
+        "job_id": job_id,
+        "state": "queued",
+        "message": "实体状态链已进入后台生成队列",
+        "queued_at": utc_now(),
+    }
+    write_json(status_path, queued)
+
+    def worker() -> None:
+        started = {
+            **queued,
+            "state": "running",
+            "message": "正在后台执行 OCC 材料布尔校核",
+            "started_at": utc_now(),
+        }
+        write_json(status_path, started)
+        try:
+            result = get_l32_material_snapshots(job_id, animation=False)
+            chain = result.get("part_state_chain") or {}
+            transitions = chain.get("transitions") or []
+            unverified_count = sum(
+                transition.get("transition_verified") is not True
+                for transition in transitions
+                if isinstance(transition, dict)
+            )
+            chain_verified = chain.get("status") == "continuous" and unverified_count == 0
+            completed = {
+                **started,
+                "state": "ready",
+                "message": (
+                    "工序前后实体状态已缓存"
+                    if chain_verified
+                    else f"实体状态已缓存，但 {unverified_count} 道工序未通过材料去除校验"
+                ),
+                "completed_at": utc_now(),
+                "operation_count": len(result.get("operations", [])),
+                "chain_status": chain.get("status"),
+                "validation_level": chain.get("validation_level"),
+                "chain_verified": chain_verified,
+                "unverified_operation_count": unverified_count,
+            }
+            write_json(status_path, completed)
+        except Exception as error:
+            detail = getattr(error, "detail", None) or str(error)
+            write_json(status_path, {
+                **started,
+                "state": "failed",
+                "message": "实体状态链后台生成失败",
+                "failed_at": utc_now(),
+                "error": str(detail)[-2000:],
+            })
+        finally:
+            with L32_PART_STATE_BUILD_LOCK:
+                L32_PART_STATE_BUILDING.discard(job_id)
+
+    threading.Thread(
+        target=worker, name=f"l32-part-state-{job_id[:8]}", daemon=True,
+    ).start()
+    return {**queued, "active": True}
+
+
+@app.get("/api/v1/jobs/{job_id}/l32/part-states/status")
+def get_l32_part_state_build_status(job_id: str) -> dict[str, object]:
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.plan is None:
+        raise HTTPException(status_code=409, detail="L32 process plan is required")
+    prerequisite_error = _l32_part_state_prerequisite_error(job, job_directory(job_id))
+    if prerequisite_error:
+        return {
+            "job_id": job_id,
+            "state": "blocked" if job.plan.automation_status == "unsupported" else "waiting_review",
+            "active": False,
+            "message": prerequisite_error,
+            "blocking_reasons": job.plan.blocking_reasons,
+        }
+    return _part_state_build_status(job_id)
+
+
+@app.post("/api/v1/jobs/{job_id}/l32/part-states/build", status_code=202)
+def build_l32_part_states_in_background(job_id: str) -> dict[str, object]:
+    return queue_l32_part_state_build(job_id)
 
 
 @app.get("/api/v1/jobs/{job_id}/l32/front-groove-geometry")
@@ -1612,12 +2102,52 @@ def _optional_job_json(directory: Path, filename: str) -> dict[str, object] | No
 
 
 def _ai_review_block_reason(directory: Path) -> str | None:
-    payload = _optional_job_json(directory, "ai-plan.json")
+    payload = (
+        _optional_job_json(directory, "ai-plan.json")
+        or _optional_job_json(directory, "planning-guidance.json")
+    )
     review = payload.get("review") if payload else None
     if not isinstance(review, dict) or review.get("approval_blocked") is not True:
         return None
     summary = review.get("summary")
     return str(summary)[:500] if summary else "Qwen 工艺审查识别到未解决的制造风险"
+
+
+def _apply_ai_review_gate(plan: ProcessPlan, review: object) -> None:
+    """Separate production approval advice from deterministic planning safety.
+
+    AI may block production approval because an otherwise useful draft still needs
+    engineer review, requirement binding, or validated post-processing.  Those
+    reasons must not erase a deterministic review plan or prevent material-state
+    previews.  Only an explicit ``unsupported`` assessment may add a hard planning
+    blocker; production NC and approval remain guarded by ``approval_blocked``.
+    """
+    if not isinstance(review, dict):
+        return
+    prefix = "AI 工艺审查阻断："
+    review_prefix = "AI 工艺审查待复核："
+    plan.blocking_reasons = [
+        reason for reason in plan.blocking_reasons if not reason.startswith(prefix)
+    ]
+    plan.warnings = [
+        warning for warning in plan.warnings if not warning.startswith(review_prefix)
+    ]
+    if review.get("approval_blocked") is not True:
+        if plan.automation_status == "unsupported" and not plan.blocking_reasons:
+            plan.automation_status = "review"
+        return
+    summary = str(review.get("summary") or "AI 工艺审查识别到未解决的制造风险")[:500]
+    if review.get("deterministic_plan_assessment") in {"acceptable", "revise"}:
+        warning = f"{review_prefix}{summary}"
+        if warning not in plan.warnings:
+            plan.warnings.append(warning)
+        if plan.automation_status == "unsupported" and not plan.blocking_reasons:
+            plan.automation_status = "review"
+        return
+    reason = f"{prefix}{summary}"
+    plan.automation_status = "unsupported"
+    if reason not in plan.blocking_reasons:
+        plan.blocking_reasons.append(reason)
 
 
 def provision_default_l32_planning_instance(job: JobResponse, directory: Path) -> None:
@@ -1751,6 +2281,9 @@ def create_ai_plan_review(job_id: str) -> dict[str, object]:
         with AI_REVIEW_LOCK:
             AI_REVIEWING_JOBS.discard(job_id)
     write_json(directory / "ai-plan.json", result)
+    _apply_ai_review_gate(job.plan, result.get("review"))
+    write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+    save_job(directory, job)
     return result
 
 
@@ -1820,6 +2353,7 @@ def _process_new_job(
             try:
                 guidance = review_process_plan(analysis, plan)
                 write_json(directory / "planning-guidance.json", guidance)
+                write_json(directory / "ai-plan.json", guidance)
                 review = guidance.get("review", {})
                 recommended_kind = str(review.get("recommended_process_kind", ""))
                 confidence = float(review.get("confidence", 0) or 0)
@@ -1844,7 +2378,10 @@ def _process_new_job(
                     "confidence": confidence,
                     "summary": review.get("summary"),
                     "requires_engineer_review": review.get("requires_engineer_review", False),
+                    "approval_blocked": review.get("approval_blocked", False),
+                    "deterministic_plan_assessment": review.get("deterministic_plan_assessment"),
                 }
+                _apply_ai_review_gate(plan, review)
                 report(
                     "ai_planning", "AI 规划意图已纳入工艺编译", 72,
                     manufacturing_intent=review.get("manufacturing_intent"),
@@ -1880,6 +2417,12 @@ def _process_new_job(
             setup_count=len(plan.setups), operation_count=operation_count,
             coverage_score=plan.coverage.score if plan.coverage else None,
         )
+        if (
+            L32_PRECISE_VALIDATION_ENABLED
+            and job.device_id == "citizen-cincom-l32"
+            and not _l32_part_state_prerequisite_error(job, directory)
+        ):
+            queue_l32_part_state_build(job_id)
         return job
     except (subprocess.SubprocessError, OSError, ValueError) as error:
         job.status = "failed"
@@ -2227,6 +2770,12 @@ def review_job_rotational_profile(
     assert result is not None
     save_job(directory, job)
     invalidate_cam_artifacts(directory)
+    if (
+        L32_PRECISE_VALIDATION_ENABLED
+        and request.review_state == "accepted"
+        and not _l32_part_state_prerequisite_error(job, directory)
+    ):
+        queue_l32_part_state_build(job_id)
     return result
 
 
@@ -3101,11 +3650,36 @@ def reanalyze_job(job_id: str) -> JobResponse:
     model_path = directory / "model.stl"
     try:
         previous_rotational_reviews = dict(job.analysis.rotational_profile_reviews) if job.analysis else {}
+        previous_rotational_path = directory / "rotational-features.json"
+        if previous_rotational_path.is_file():
+            try:
+                previous_rotational = RotationalFeatureAnalysis.model_validate_json(
+                    previous_rotational_path.read_text(encoding="utf-8")
+                )
+                previous_rotational_reviews.update({
+                    profile.id: profile.review_state
+                    for profile in previous_rotational.profiles
+                    if profile.review_state in {"accepted", "excluded"}
+                })
+            except (OSError, ValueError):
+                pass
         selected_index = int(job.analysis.topology.get("selected_solid_index", 0)) if job.analysis else 0
         analysis = run_geometry_analyzer(
             source_path, analysis_path, model_path, selected_index or None,
         )
         analysis.rotational_profile_reviews = previous_rotational_reviews
+        preview_rotational = infer_rotational_features(analysis)
+        previous_repairs = set(
+            job.plan.stock.get("outer_envelope_repairs", [])
+            if job.plan else []
+        )
+        current_repairs = set(
+            preview_rotational.evidence.get("outer_envelope_repairs", []) or []
+        )
+        if current_repairs and current_repairs != previous_repairs:
+            for repaired_profile in preview_rotational.profiles:
+                if repaired_profile.side == "outer":
+                    analysis.rotational_profile_reviews[repaired_profile.id] = "review"
         write_json(analysis_path, analysis.model_dump(mode="json"))
         persist_rotational_analysis(directory, job, analysis)
         plan = build_process_plan(
@@ -3122,6 +3696,14 @@ def reanalyze_job(job_id: str) -> JobResponse:
         details = getattr(error, "stderr", None) or str(error)
         job.error = details[-2000:]
     save_job(directory, job)
+    if (
+        L32_PRECISE_VALIDATION_ENABLED
+        and job.status == "completed"
+        and job.device_id == "citizen-cincom-l32"
+        and job.plan is not None
+        and not _l32_part_state_prerequisite_error(job, directory)
+    ):
+        queue_l32_part_state_build(job_id)
     return job
 
 
@@ -3184,12 +3766,14 @@ def get_job_file(job_id: str, filename: str) -> FileResponse:
         "turning-whole-program-ir.json", "turning-whole-program-draft.json",
         "turning-whole-program-timeline.json", "turning-continuous-simulation.json",
         "turning-inner-bore-chain-ir.json", "turning-inner-bore-chain-draft.json",
+        "l32-material-snapshots.json", "l32-part-state-chain.json",
     }
     generated_artifact = (
         Path(filename).name == filename
         and ((filename.startswith("program-") and filename.endswith(".nc"))
              or (filename.startswith("camotics-") and filename.endswith(".stl"))
-             or (filename.startswith("l32-material-") and filename.endswith(".stl")))
+             or (filename.startswith("l32-material-") and filename.endswith(".stl"))
+             or (filename.startswith("l32-part-state-") and filename.endswith(".stl")))
     )
     if filename not in allowed and not generated_artifact:
         raise HTTPException(status_code=404, detail="File not found")

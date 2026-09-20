@@ -6,11 +6,268 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from app import main
+from app.catalogs import get_tool
 from app.main import app
-from app.models import GeometryAnalysis, JobResponse
+from app.models import GeometryAnalysis, JobResponse, Operation, ProcessPlan, Setup, Vec3
 
 
 client = TestClient(app)
+
+
+def _turning_operation(**updates) -> Operation:
+    values = {
+        "id": "OP10", "sequence": 10, "type": "turn_facing", "name": "端面",
+        "feature_ids": ["RP-1"], "tool": get_tool("TURN-OD-R"),
+        "parameters": {
+            "spindle_mode": "constant_surface_speed", "cutting_speed_m_min": 100,
+            "maximum_spindle_rpm": 8000, "feed_per_revolution_mm": 0.12,
+            "face_z_mm": 0, "center_overtravel_mm": 0.2,
+        },
+        "rationale": ["test"], "confidence": 1,
+    }
+    values.update(updates)
+    return Operation.model_validate(values)
+
+
+def test_turning_sweep_segments_reuse_deterministic_toolpath_and_world_offset() -> None:
+    segments, errors = main.build_turning_sweep_segments(
+        _turning_operation(), None, stock_radius=12, axial_offset=30,
+    )
+
+    assert errors == []
+    assert len(segments) == 2
+    facing = segments[-1]
+    assert facing["start_z"] == 30
+    assert facing["end_z"] == 30
+    assert facing["axial_width"] == 1.6
+    assert facing["axial_center_offset"] == 0.8
+    assert facing["radial_stock_envelope"] is False
+
+
+def test_turning_sweep_segments_require_explicit_backside_cutoff_datum() -> None:
+    segments, errors = main.build_turning_sweep_segments(
+        _turning_operation(workpiece_side="back", spindle_id="sub", channel_id="sub"),
+        None, stock_radius=12, axial_offset=0,
+    )
+
+    assert segments == []
+    assert "切断坐标基准" in errors[0]
+
+
+def test_turning_sweep_segments_transform_sub_spindle_z_to_main_world() -> None:
+    operation = _turning_operation(
+        workpiece_side="back", spindle_id="sub", channel_id="sub",
+    )
+    segments, errors = main.build_turning_sweep_segments(
+        operation, None, stock_radius=12, axial_offset=100, backside_cutoff_z=-25,
+    )
+
+    assert errors == []
+    facing = segments[-1]
+    assert facing["start_z"] == 75
+    assert facing["end_z"] == 75
+    assert facing["axial_center_offset"] == -0.8
+
+
+def test_part_state_chain_links_each_operation_to_previous_output(tmp_path) -> None:
+    for name, content in (
+        ("op10-before.stl", b"initial"),
+        ("op10-after.stl", b"after-op10"),
+        ("op20-before.stl", b"equivalent-after-op10"),
+        ("op20-after.stl", b"after-op20"),
+    ):
+        (tmp_path / name).write_bytes(content)
+    chain = main.build_part_state_chain("a" * 32, tmp_path, [
+        {
+            "operation_id": "OP10",
+            "files": ["op10-before.stl", "op10-after.stl"],
+            "input_state_volume_mm3": 100.0,
+            "output_state_volume_mm3": 90.0,
+            "removed_volume_mm3": 10.0,
+            "previous_state_shape_delta_mm3": 0.0,
+        },
+        {
+            "operation_id": "OP20",
+            "files": ["op20-before.stl", "op20-after.stl"],
+            "input_state_volume_mm3": 90.0,
+            "output_state_volume_mm3": 75.0,
+            "removed_volume_mm3": 15.0,
+            "previous_state_shape_delta_mm3": 0.0,
+        },
+    ])
+
+    assert chain.status == "continuous"
+    assert chain.validation_level == "geometric_draft"
+    assert [item.id for item in chain.states] == ["IPW-000", "IPW-001", "IPW-002"]
+    assert chain.transitions[0].input_state_id == "IPW-000"
+    assert chain.transitions[0].output_state_id == "IPW-001"
+    assert chain.transitions[1].input_state_id == "IPW-001"
+    assert chain.transitions[1].output_state_id == "IPW-002"
+    assert chain.transitions[1].removed_volume_mm3 == 15.0
+    assert chain.transitions[1].transition_verified is True
+
+
+def test_part_state_chain_marks_shape_discontinuity_failed(tmp_path) -> None:
+    (tmp_path / "before.stl").write_bytes(b"before")
+    (tmp_path / "after.stl").write_bytes(b"after")
+
+    chain = main.build_part_state_chain("b" * 32, tmp_path, [{
+        "operation_id": "OP10",
+        "files": ["before.stl", "after.stl"],
+        "input_state_volume_mm3": 100.0,
+        "output_state_volume_mm3": 99.0,
+        "removed_volume_mm3": 1.0,
+        "previous_state_shape_delta_mm3": 0.01,
+    }])
+
+    assert chain.status == "failed"
+    assert chain.transitions[0].continuity_verified is False
+    assert "相邻工序的中间毛坯实体不连续" in chain.transitions[0].blocking_reasons
+
+
+def test_part_state_chain_blocks_zero_removal_and_preserves_cutter_validation(tmp_path) -> None:
+    (tmp_path / "before.stl").write_bytes(b"before")
+    (tmp_path / "after.stl").write_bytes(b"after")
+
+    chain = main.build_part_state_chain("c" * 32, tmp_path, [{
+        "operation_id": "OP70-H1",
+        "files": ["before.stl", "after.stl"],
+        "input_state_volume_mm3": 100.0,
+        "output_state_volume_mm3": 100.0,
+        "removed_volume_mm3": 0.0,
+        "previous_state_shape_delta_mm3": 0.0,
+        "validation_level": "cutter_envelope_verified",
+        "cutter_sweep_removed_volume_mm3": 0.0,
+        "unreachable_removal_volume_mm3": 0.0,
+        "overcut_volume_mm3": 0.0,
+        "target_retained": True,
+    }])
+
+    transition = chain.transitions[0]
+    assert chain.status == "failed"
+    assert chain.validation_level == "cutter_envelope_verified"
+    assert transition.effect_verified is False
+    assert transition.transition_verified is False
+    assert "切削工序未产生可测量的材料去除" in transition.blocking_reasons
+
+
+def test_part_state_chain_reports_mixed_validation_levels(tmp_path) -> None:
+    for name in ("before.stl", "middle.stl", "after.stl"):
+        (tmp_path / name).write_bytes(name.encode())
+    operations = [
+        {
+            "operation_id": "OP10", "files": ["before.stl", "middle.stl"],
+            "input_state_volume_mm3": 100.0, "output_state_volume_mm3": 99.0,
+            "removed_volume_mm3": 1.0, "previous_state_shape_delta_mm3": 0.0,
+            "validation_level": "cutter_envelope_verified",
+        },
+        {
+            "operation_id": "OP20", "files": ["middle.stl", "after.stl"],
+            "input_state_volume_mm3": 99.0, "output_state_volume_mm3": 98.0,
+            "removed_volume_mm3": 1.0, "previous_state_shape_delta_mm3": 0.0,
+            "validation_level": "geometric_draft",
+        },
+    ]
+
+    chain = main.build_part_state_chain("d" * 32, tmp_path, operations)
+
+    assert chain.status == "continuous"
+    assert chain.validation_level == "mixed"
+
+
+def test_l32_part_state_build_runs_in_background_and_reports_ready(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "e" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    operation = _turning_operation()
+    plan = ProcessPlan(
+        title="test", material="S45C", machine="Citizen Cincom L32",
+        stock={"diameter_mm": 20},
+        setups=[Setup(
+            id="SETUP-1", name="main", work_axis=Vec3(x=0, y=0, z=1),
+            datum_feature_id="RP-1", fixture="test", operations=[operation],
+        )],
+        warnings=[], assumptions=[], estimated_minutes=1,
+    )
+    main.save_job(directory, JobResponse(
+        id=job_id, status="completed", filename="part.step", created_at=main.utc_now(),
+        material="S45C", machine="Citizen Cincom L32", device_id="citizen-cincom-l32",
+        plan=plan,
+    ))
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(main.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(main, "_l32_part_state_prerequisite_error", lambda *_args: None)
+    monkeypatch.setattr(main, "get_l32_material_snapshots", lambda *_args, **_kwargs: {
+        "operations": [{"operation_id": "OP10", "files": ["before.stl", "after.stl"]}],
+        "part_state_chain": {"status": "continuous", "validation_level": "toolpath_sweep_verified"},
+    })
+
+    response = main.build_l32_part_states_in_background(job_id)
+    assert response["state"] == "queued"
+    status = main.get_l32_part_state_build_status(job_id)
+    assert status["state"] == "ready"
+    assert status["operation_count"] == 1
+    assert status["chain_verified"] is True
+    assert status["unverified_operation_count"] == 0
+    assert status["active"] is False
+
+
+def test_l32_part_state_build_reports_ready_artifacts_with_failed_validation(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "9" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    operation = _turning_operation()
+    plan = ProcessPlan(
+        title="test", material="S45C", machine="Citizen Cincom L32",
+        stock={"diameter_mm": 20},
+        setups=[Setup(
+            id="SETUP-1", name="main", work_axis=Vec3(x=0, y=0, z=1),
+            datum_feature_id="RP-1", fixture="test", operations=[operation],
+        )],
+        warnings=[], assumptions=[], estimated_minutes=1,
+    )
+    main.save_job(directory, JobResponse(
+        id=job_id, status="completed", filename="part.step", created_at=main.utc_now(),
+        material="S45C", machine="Citizen Cincom L32", device_id="citizen-cincom-l32",
+        plan=plan,
+    ))
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(main.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(main, "_l32_part_state_prerequisite_error", lambda *_args: None)
+    monkeypatch.setattr(main, "get_l32_material_snapshots", lambda *_args, **_kwargs: {
+        "operations": [{"operation_id": "OP10", "files": ["before.stl", "after.stl"]}],
+        "part_state_chain": {
+            "status": "failed",
+            "validation_level": "geometric_draft",
+            "transitions": [{"operation_id": "OP10", "transition_verified": False}],
+        },
+    })
+
+    main.build_l32_part_states_in_background(job_id)
+    status = main.get_l32_part_state_build_status(job_id)
+
+    assert status["state"] == "ready"
+    assert status["chain_verified"] is False
+    assert status["unverified_operation_count"] == 1
+    assert "1 道工序未通过" in status["message"]
 
 
 def test_device_library_contains_citizen_l32() -> None:

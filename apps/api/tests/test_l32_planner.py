@@ -5,7 +5,7 @@ from app.l32_configuration import snapshot_l32_instance
 from app.l32_front_chain import FrontChainDraftRequest, compile_front_chain_draft
 from app.main import app
 from app.machine_models import MachineInstance
-from app.models import GeometryAnalysis, JobResponse, PlanarFeature, PrismaticFeature, RotationalSectionCandidate
+from app.models import Bounds, GeometryAnalysis, JobResponse, PlanarFeature, PrismaticFeature, RotationalSectionCandidate
 from app.planner import build_process_plan
 from app.rotational_features import infer_rotational_features
 from app.rotational_features import clip_rotational_profile
@@ -112,7 +112,7 @@ def test_l32_plans_back_live_tool_drilling_for_off_axis_axial_hole() -> None:
         "radius": 3.15,
         "diameter": 6.3,
         "length": 4.0,
-        "center": {"x": 5.0, "y": 0.0, "z": -18.0},
+        "center": {"x": 3.5, "y": 0.0, "z": -18.0},
         "axis": {"x": 0.0, "y": 0.0, "z": 1.0},
         "access_direction": {"x": 0.0, "y": 0.0, "z": -1.0},
         "angular_span_degrees": 360,
@@ -141,6 +141,203 @@ def test_l32_plans_back_live_tool_drilling_for_off_axis_axial_hole() -> None:
     target = next(item for item in plan.coverage.targets if item.id == "TARGET-HF-BACK-1")
     assert target.state == "covered"
     assert target.covered_by == [drilling.id]
+
+
+def test_l32_operations_publish_verifiable_ipw_transition_contracts() -> None:
+    plan = build_process_plan(regional_shaft_analysis(), "S45C", "Citizen Cincom L32")
+    operations = [operation for setup in plan.setups for operation in setup.operations]
+
+    assert operations
+    assert all(operation.contract is not None for operation in operations)
+    assert operations[0].contract.input_state_policy == "setup_stock"
+    assert all(
+        operation.contract.input_state_policy == "previous_operation_output"
+        for operation in operations[1:]
+    )
+
+    roughing = next(operation for operation in operations if operation.id == "OP20")
+    assert roughing.contract.target_regions[0].feature_ids == roughing.feature_ids
+    assert roughing.contract.allowed_removal_regions[0].kind == "cutter_sweep"
+    assert roughing.contract.retained_regions[0].id == "GLOBAL-TARGET-SOLID"
+    assert {
+        condition.code for condition in roughing.contract.postconditions
+    } >= {
+        "material_nonincreasing", "target_retained",
+        "output_state_persisted", "measurable_material_removal",
+    }
+
+    first_back = next(operation for operation in operations if operation.workpiece_side == "back")
+    assert any(
+        condition.code == "transfer_state_verified"
+        for condition in first_back.contract.preconditions
+    )
+
+
+def test_l32_blocks_back_operations_when_axial_hole_exceeds_local_outer_profile() -> None:
+    analysis = regional_shaft_analysis()
+    analysis.cylindrical_features.append(type(analysis.cylindrical_features[0]).model_validate({
+        "id": "HF-BACK-CONFLICT",
+        "kind": "hole",
+        "radius": 3.15,
+        "diameter": 6.3,
+        "length": 4.0,
+        "center": {"x": 8.15, "y": 0.0, "z": -18.0},
+        "axis": {"x": 0.0, "y": 0.0, "z": 1.0},
+        "access_direction": {"x": 0.0, "y": 0.0, "z": -1.0},
+        "angular_span_degrees": 360,
+        "source_face_ids": ["CF-BACK-CONFLICT"],
+        "end_type": "blind",
+        "review_state": "accepted",
+        "confidence": 0.9,
+    }))
+
+    plan = build_process_plan(analysis, "S45C", "Citizen Cincom L32")
+    operation_ids = {
+        operation.id for setup in plan.setups for operation in setup.operations
+    }
+
+    assert plan.automation_status == "unsupported"
+    assert plan.stock["profile_consistency_valid"] is False
+    assert plan.stock["profile_consistency_issues"] == [{
+        "feature_id": "HF-BACK-CONFLICT",
+        "z_min_mm": -20.0,
+        "z_max_mm": -16.0,
+        "required_radius_mm": 11.3,
+        "available_radius_mm": 7.4,
+    }]
+    assert not {"OP55-BACK", "OP58-BACK"} & operation_ids
+    assert not any(
+        operation.feature_ids == ["HF-BACK-CONFLICT"]
+        for setup in plan.setups for operation in setup.operations
+    )
+    target = next(
+        item for item in plan.coverage.targets
+        if item.id == "TARGET-HF-BACK-CONFLICT"
+    )
+    assert target.state == "uncovered"
+
+
+def test_l32_repairs_section_envelope_when_complete_axial_hole_proves_lower_bound() -> None:
+    analysis = regional_shaft_analysis()
+    analysis.cylindrical_features.append(type(analysis.cylindrical_features[0]).model_validate({
+        "id": "HF-BACK-REPAIRABLE",
+        "kind": "hole",
+        "radius": 3.15,
+        "diameter": 6.3,
+        "length": 4.0,
+        "center": {"x": 5.15, "y": 0.0, "z": -18.0},
+        "axis": {"x": 0.0, "y": 0.0, "z": 1.0},
+        "access_direction": {"x": 0.0, "y": 0.0, "z": -1.0},
+        "angular_span_degrees": 360,
+        "source_face_ids": ["CF-BACK-REPAIRABLE"],
+        "end_type": "blind",
+        "review_state": "accepted",
+        "confidence": 0.9,
+    }))
+
+    plan = build_process_plan(analysis, "S45C", "Citizen Cincom L32")
+
+    assert plan.automation_status == "review"
+    assert plan.stock["profile_consistency_valid"] is True
+    assert plan.stock["outer_envelope_repair_count"] == 1
+    assert plan.stock["outer_envelope_repaired_feature_ids"] == ["HF-BACK-REPAIRABLE"]
+    assert plan.stock["outer_envelope_repairs"] == [
+        "HF-BACK-REPAIRABLE:-20.000000:-16.000000:8.300000"
+    ]
+    assert not any("实体包络矛盾" in reason for reason in plan.blocking_reasons)
+
+
+def test_l32_preserves_engineer_acceptance_for_unchanged_envelope_repair() -> None:
+    analysis = regional_shaft_analysis()
+    analysis.cylindrical_features.append(type(analysis.cylindrical_features[0]).model_validate({
+        "id": "HF-BACK-REPAIRABLE",
+        "kind": "hole",
+        "radius": 3.15,
+        "diameter": 6.3,
+        "length": 4.0,
+        "center": {"x": 5.15, "y": 0.0, "z": -18.0},
+        "axis": {"x": 0.0, "y": 0.0, "z": 1.0},
+        "access_direction": {"x": 0.0, "y": 0.0, "z": -1.0},
+        "angular_span_degrees": 360,
+        "source_face_ids": ["CF-BACK-REPAIRABLE"],
+        "end_type": "blind",
+        "review_state": "accepted",
+        "confidence": 0.9,
+    }))
+
+    rotational = infer_rotational_features(analysis)
+
+    outer = next(profile for profile in rotational.profiles if profile.side == "outer")
+    assert outer.review_state == "accepted"
+    assert rotational.evidence["outer_envelope_repaired_feature_ids"] == ["HF-BACK-REPAIRABLE"]
+
+
+def test_l32_resolves_legacy_absolute_and_current_local_profile_coordinates() -> None:
+    source = shaft_analysis()
+    source.measurements["bounding_box"] = Bounds.model_validate({
+        "minimum": {"x": -10, "y": -10, "z": 50},
+        "maximum": {"x": 10, "y": 10, "z": 150},
+        "size": {"x": 20, "y": 20, "z": 100},
+    })
+    source.cylindrical_features[0].center.z = 100
+    source.rotational_sections = [RotationalSectionCandidate.model_validate({
+        "source_feature_id": "F1",
+        "axis_origin": {"x": 0, "y": 0, "z": 100},
+        "axis": {"x": 0, "y": 0, "z": 1},
+        "plane_normal": {"x": 0, "y": 1, "z": 0},
+        "outer_profile": [{"z": 50, "radius": 10}, {"z": 150, "radius": 10}],
+        "tolerance_mm": 0.005,
+    })]
+
+    legacy = build_process_plan(source, "S45C", "Citizen Cincom L32")
+
+    assert legacy.stock["profile_axis_coordinate_system"] == "absolute_legacy"
+    assert legacy.stock["profile_axis_coordinate_offset_mm"] == 0
+    assert legacy.stock["profile_axial_complete"] is True
+
+    source.rotational_sections[0] = RotationalSectionCandidate.model_validate({
+        **source.rotational_sections[0].model_dump(),
+        "outer_profile": [
+            {"z": -50, "radius": 10}, {"z": 50, "radius": 10},
+        ],
+        "axial_coordinate_system": "local",
+    })
+    current = build_process_plan(source, "S45C", "Citizen Cincom L32")
+
+    assert current.stock["profile_axis_coordinate_system"] == "local"
+    assert current.stock["profile_axis_coordinate_offset_mm"] == 100
+    assert current.stock["profile_axial_complete"] is True
+
+
+def test_l32_reverses_section_coordinates_with_canonicalized_axis() -> None:
+    source = shaft_analysis()
+    source.measurements["bounding_box"] = Bounds.model_validate({
+        "minimum": {"x": -10, "y": -10, "z": 60},
+        "maximum": {"x": 10, "y": 10, "z": 110},
+        "size": {"x": 20, "y": 20, "z": 50},
+    })
+    source.cylindrical_features[0].center.z = 100
+    source.rotational_sections = [RotationalSectionCandidate.model_validate({
+        "source_feature_id": "F1",
+        "axis_origin": {"x": 0, "y": 0, "z": 100},
+        "axis": {"x": 0, "y": 0, "z": -1},
+        "plane_normal": {"x": 0, "y": 1, "z": 0},
+        "outer_profile": [{"z": -10, "radius": 10}, {"z": 40, "radius": 10}],
+        "inner_profile": [{"z": -5, "radius": 4}, {"z": 20, "radius": 4}],
+        "axial_coordinate_system": "local",
+        "tolerance_mm": 0.005,
+    })]
+
+    rotational = infer_rotational_features(source)
+    plan = build_process_plan(source, "S45C", "Citizen Cincom L32")
+
+    assert rotational.axes[0].direction.z == 1
+    assert [point.z for point in rotational.profiles[0].points] == [-40, 10]
+    assert [point.z for point in rotational.profiles[1].points] == [-20, 5]
+    assert rotational.evidence["profile_axis_reversed_from_section"] == "true"
+    assert plan.stock["profile_axis_coordinate_system"] == "local"
+    assert plan.stock["profile_axis_coordinate_offset_mm"] == 100
+    assert plan.stock["profile_axial_complete"] is True
 
 
 def front_form_shaft_analysis() -> GeometryAnalysis:
@@ -302,10 +499,13 @@ def test_l32_builds_formal_turning_plan_from_rotational_profile() -> None:
     ]
     assert [operation.id for operation in plan.setups[1].operations] == ["OP50", "OP60"]
     cutoff = next(item for item in plan.setups[0].operations if item.id == "OP40")
-    assert cutoff.parameters["z_mm"] == -26
+    assert cutoff.parameters["z_mm"] == -26.2
     assert cutoff.parameters["finished_back_datum_z_mm"] == -25
-    assert cutoff.parameters["retained_material_min_z_mm"] == -25
-    assert cutoff.parameters["sacrificial_extension_mm"] == 2
+    assert cutoff.parameters["retained_material_min_z_mm"] == -25.2
+    assert cutoff.parameters["back_face_allowance_mm"] == 0.2
+    assert cutoff.parameters["sacrificial_extension_mm"] == 2.2
+    back_facing = next(item for item in plan.setups[1].operations if item.id == "OP50")
+    assert back_facing.parameters["stock_allowance_mm"] == 0.2
     assert all(not operation.enabled for operation in plan.setups[1].operations)
     assert all(operation.channel_id == "sub" for operation in plan.setups[1].operations)
     assert all(operation.spindle_id == "sub" for operation in plan.setups[1].operations)
@@ -345,7 +545,7 @@ def test_partial_rotational_section_cannot_define_whole_part_cutoff() -> None:
     assert plan.stock["length_mm"] == 54
     assert plan.stock["finished_back_z_mm"] == -25
     cutoff = next(item for item in plan.setups[0].operations if item.id == "OP40")
-    assert cutoff.parameters["z_mm"] == -26
+    assert cutoff.parameters["z_mm"] == -26.2
     assert cutoff.parameters["finished_back_datum_z_mm"] == -25
     assert plan.automation_status == "review"
     assert plan.coverage is not None
