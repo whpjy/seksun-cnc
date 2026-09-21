@@ -185,6 +185,29 @@ def write_json(path: Path, value: object) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def cached_preview_signature(kind: str, source: Path, payload: object) -> str:
+    """Identify an exact preview by source revision and all geometric inputs."""
+    source_revision = source.stat().st_mtime_ns if source.is_file() else 0
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(f"{kind}:{source_revision}:".encode("utf-8") + serialized.encode("utf-8")).hexdigest()
+
+
+def read_cached_preview(path: Path, signature: str) -> object | None:
+    if not path.is_file():
+        return None
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if cached.get("signature") == signature:
+            return cached["result"]
+    except (OSError, ValueError, TypeError, KeyError):
+        path.unlink(missing_ok=True)
+    return None
+
+
+def write_cached_preview(path: Path, signature: str, result: object) -> None:
+    write_json(path, {"schema_version": "1.0.0", "signature": signature, "result": result})
+
+
 def persist_rotational_analysis(
     directory: Path, job: JobResponse, analysis: GeometryAnalysis,
 ) -> RotationalFeatureAnalysis | None:
@@ -282,7 +305,10 @@ def invalidate_cam_artifacts(directory: Path) -> None:
         "boring-reachability.json", "axial-drilling-review.json", "grooving-review.json",
     ):
         (directory / filename).unlink(missing_ok=True)
-    for pattern in ("program-*.nc", "camotics-*.stl", "*.camotics"):
+    for pattern in (
+        "program-*.nc", "camotics-*.stl", "*.camotics", "turning-draft-cache-*.json",
+        "l32-preview-cache-*.json",
+    ):
         for artifact in directory.glob(pattern):
             if artifact.is_file() and artifact.parent == directory:
                 artifact.unlink(missing_ok=True)
@@ -465,6 +491,13 @@ def check_l32_catalog_back_pocket_sweep(job_id: str, feature_id: str) -> Indexed
     source = job_directory(job_id) / job.filename
     if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
         raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
+    cache_signature = cached_preview_signature(
+        "l32-pocket-sweep-v1", source, draft.model_dump(mode="json"),
+    )
+    cache_path = job_directory(job_id) / f"l32-preview-cache-pocket-{cache_signature[:20]}.json"
+    cached = read_cached_preview(cache_path, cache_signature)
+    if isinstance(cached, dict):
+        return IndexedPocketSweepCheck.model_validate(cached)
     try:
         completed = run_freecad_adapter(
             FREECAD_CMD,
@@ -489,7 +522,7 @@ def check_l32_catalog_back_pocket_sweep(job_id: str, feature_id: str) -> Indexed
         else "residual" if residual > 0.0001
         else "within_geometric_tolerance"
     )
-    return IndexedPocketSweepCheck(
+    response = IndexedPocketSweepCheck(
         feature_id=feature_id,
         bound_machine_has_required_module=draft.bound_machine_has_required_module,
         pocket_region_status=status,
@@ -499,6 +532,8 @@ def check_l32_catalog_back_pocket_sweep(job_id: str, feature_id: str) -> Indexed
         removed_pocket_region_mm3=round(float(result["region_volume_mm3"]) - residual, 6),
         stages=result["stages"],
     )
+    write_cached_preview(cache_path, cache_signature, response.model_dump(mode="json"))
+    return response
 
 
 @app.get("/api/v1/jobs/{job_id}/l32/catalog-ear-geometry")
@@ -510,6 +545,14 @@ def get_l32_catalog_ear_geometry(job_id: str) -> dict[str, object]:
     source = job_directory(job_id) / job.filename
     if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
         raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
+    cache_signature = cached_preview_signature(
+        "l32-exact-side-faces-v1", source,
+        [face.model_dump(mode="json") for face in job.analysis.planar_features],
+    )
+    cache_path = job_directory(job_id) / "l32-preview-cache-side-faces.json"
+    cached = read_cached_preview(cache_path, cache_signature)
+    if isinstance(cached, dict):
+        return cached
     try:
         completed = run_freecad_adapter(
             FREECAD_CMD, APP_ROOT / "cam" / "l32_exact_sections.py",
@@ -537,7 +580,7 @@ def get_l32_catalog_ear_geometry(job_id: str) -> dict[str, object]:
         if abs(analyzed.area - face["area_mm2"]) > max(0.01, analyzed.area * 0.001):
             continue
         faces.append({**face, "analysis_face_id": analyzed.id})
-    return {
+    payload = {
         "schema_version": "1.0.0",
         "job_id": job_id,
         "source": "original_step_exact_faces",
@@ -546,6 +589,8 @@ def get_l32_catalog_ear_geometry(job_id: str) -> dict[str, object]:
         "nc_generated": False,
         "side_faces": faces,
     }
+    write_cached_preview(cache_path, cache_signature, payload)
+    return payload
 
 
 @app.get("/api/v1/jobs/{job_id}/l32/catalog-ear-toolpaths")
@@ -601,6 +646,14 @@ def _check_l32_reference_sweep(
     source = job_directory(job_id) / job.filename
     if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
         raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
+    cache_signature = cached_preview_signature(
+        "l32-reference-sweep-v1", source,
+        {"toolpaths": toolpaths, "bound_machine_has_required_module": has_module},
+    )
+    cache_path = job_directory(job_id) / f"l32-preview-cache-sweep-{cache_signature[:20]}.json"
+    cached = read_cached_preview(cache_path, cache_signature)
+    if isinstance(cached, dict):
+        return cached
     try:
         completed = run_freecad_adapter(
             FREECAD_CMD, APP_ROOT / "cam" / "l32_side_sweep.py",
@@ -618,7 +671,7 @@ def _check_l32_reference_sweep(
     except (OSError, subprocess.CalledProcessError, StopIteration, ValueError) as error:
         raise HTTPException(status_code=502, detail=f"Exact side sweep failed: {error}") from error
     checks = result["checks"]
-    return {
+    payload = {
         "schema_version": "1.0.0",
         "job_id": job_id,
         "reference_only": True,
@@ -635,6 +688,8 @@ def _check_l32_reference_sweep(
         "whole_part_material_verified": False,
         "checks": checks,
     }
+    write_cached_preview(cache_path, cache_signature, payload)
+    return payload
 
 
 @app.get("/api/v1/jobs/{job_id}/l32/catalog-exterior-toolpaths")
@@ -932,6 +987,14 @@ def check_l32_front_groove_sweep(job_id: str) -> dict[str, object]:
     axis = next(item for item in analysis.axes if item.id == profile.axis_id)
     if axis.review_state != "accepted":
         raise HTTPException(status_code=409, detail="Groove rotation axis has not been accepted")
+    cache_signature = cached_preview_signature(
+        "l32-front-groove-sweep-v1", source,
+        {"draft": draft, "axis": axis.model_dump(mode="json")},
+    )
+    cache_path = job_directory(job_id) / f"l32-preview-cache-groove-{cache_signature[:20]}.json"
+    cached = read_cached_preview(cache_path, cache_signature)
+    if isinstance(cached, dict):
+        return cached
     try:
         completed = run_freecad_adapter(
             FREECAD_CMD, APP_ROOT / "cam" / "l32_front_groove_sweep.py",
@@ -947,7 +1010,7 @@ def check_l32_front_groove_sweep(job_id: str) -> dict[str, object]:
         raise HTTPException(status_code=504, detail="Front groove OCC sweep timed out") from error
     except (OSError, subprocess.CalledProcessError, StopIteration, ValueError) as error:
         raise HTTPException(status_code=502, detail=f"Front groove OCC sweep failed: {error}") from error
-    return {
+    payload = {
         "schema_version":"1.0.0","job_id":job_id,"reference_only":True,"nc_generated":False,
         "actual_planned_tool_fits_floor":draft["actual_tool_fits_floor"],
         "target_gouge_check_passed":bool(result["target_solid_valid"] and result["remaining_stock_valid"]
@@ -955,6 +1018,8 @@ def check_l32_front_groove_sweep(job_id: str) -> dict[str, object]:
             and result["missing_target_volume_mm3"] <= 0.000001),
         "whole_part_material_verified":False,"check":result,
     }
+    write_cached_preview(cache_path, cache_signature, payload)
+    return payload
 
 
 @app.post("/api/v1/machines/l32/instances", response_model=MachineConfigurationSnapshot)
@@ -1197,7 +1262,8 @@ def generate_turning_draft(job_id: str, request: TurningDraftRequest) -> Turning
         raise HTTPException(status_code=409, detail="Bind a validated L32 machine instance before draft generation")
     if request.machine_instance_id != job.machine_instance_id:
         raise HTTPException(status_code=422, detail="Draft request does not use the machine instance bound to this job")
-    snapshot_path = job_directory(job_id) / "machine-configuration.json"
+    directory = job_directory(job_id)
+    snapshot_path = directory / "machine-configuration.json"
     try:
         snapshot = load_machine_snapshot(snapshot_path)
         if snapshot.configuration_hash != job.machine_configuration_hash:
@@ -1216,11 +1282,32 @@ def generate_turning_draft(job_id: str, request: TurningDraftRequest) -> Turning
                 raise ValueError("stored rotational profile must be accepted before draft generation")
             if stored_profile.model_dump(mode="json") != request.profile.model_dump(mode="json"):
                 raise ValueError("submitted rotational profile does not match the accepted stored profile")
-        result = compile_turning_draft(job_id, request, snapshot)
     except (OSError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
-    directory = job_directory(job_id)
+    source = directory / job.filename
+    source_revision = source.stat().st_mtime_ns if source.is_file() else 0
+    cache_signature = hashlib.sha256(json.dumps({
+        "schema": "turning-draft-cache-v1",
+        "source_revision": source_revision,
+        "machine_configuration_hash": job.machine_configuration_hash,
+        "request": request.model_dump(mode="json"),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    operation_cache_id = hashlib.sha256(request.operation.id.encode("utf-8")).hexdigest()[:20]
+    operation_cache_path = directory / f"turning-draft-cache-{operation_cache_id}.json"
+    if operation_cache_path.is_file():
+        try:
+            cached = json.loads(operation_cache_path.read_text(encoding="utf-8"))
+            if cached.get("signature") == cache_signature:
+                return TurningDraftResult.model_validate(cached["result"])
+        except (OSError, ValueError, TypeError, KeyError):
+            operation_cache_path.unlink(missing_ok=True)
+
+    try:
+        result = compile_turning_draft(job_id, request, snapshot)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
     write_json(directory / "turning-toolpath-ir.json", result.toolpath.model_dump(mode="json"))
     write_json(directory / "turning-simulation.json", result.simulation.model_dump(mode="json"))
     if result.verification is not None:
@@ -1233,6 +1320,12 @@ def generate_turning_draft(job_id: str, request: TurningDraftRequest) -> Turning
     if result.reachability is not None:
         write_json(directory / "turning-reachability.json", result.reachability.model_dump(mode="json"))
     write_json(directory / "turning-draft.json", result.model_dump(mode="json"))
+    write_json(operation_cache_path, {
+        "schema_version": "1.0.0",
+        "signature": cache_signature,
+        "operation_id": request.operation.id,
+        "result": result.model_dump(mode="json"),
+    })
     return result
 
 

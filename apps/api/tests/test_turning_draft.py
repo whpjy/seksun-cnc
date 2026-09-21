@@ -355,8 +355,20 @@ def test_turning_draft_api_persists_reviewable_artifacts_without_nc(tmp_path, mo
     assert (directory / "turning-verification.json").is_file()
     assert (directory / "turning-reachability.json").is_file()
     assert (directory / "turning-draft.json").is_file()
+    assert len(list(directory.glob("turning-draft-cache-*.json"))) == 1
     assert not (directory / "program.nc").exists()
     assert client.get(f"/api/v1/jobs/{job_id}/files/turning-draft.json").status_code == 200
+
+    def fail_if_regenerated(*_args, **_kwargs):
+        raise AssertionError("a successful operation draft must be reused")
+
+    monkeypatch.setattr(main, "compile_turning_draft", fail_if_regenerated)
+    cached_response = client.post(
+        f"/api/v1/jobs/{job_id}/turning/draft",
+        json=_request().model_dump(mode="json"),
+    )
+    assert cached_response.status_code == 200
+    assert cached_response.json() == response.json()
 
 
 def test_turning_draft_api_requires_the_job_bound_machine_snapshot(tmp_path, monkeypatch) -> None:
