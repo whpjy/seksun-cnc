@@ -173,7 +173,16 @@ def job_directory(job_id: str) -> Path:
 
 
 def write_json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Readers and writers run in different FastAPI worker threads. Writing
+    # directly to the destination briefly truncates it to zero bytes, so a
+    # concurrent material-snapshot request can observe invalid JSON. Write a
+    # complete sibling file first and atomically replace the destination.
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def persist_rotational_analysis(

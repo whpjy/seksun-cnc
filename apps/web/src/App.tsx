@@ -941,7 +941,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }, [fetchL32PreviewJson, isL32, job.id, job.machine_configuration_hash, job.machine_instance_id, job.plan?.stock.diameter_mm, l32Axis, l32Rotational, operations]);
 
   useEffect(() => {
-    if (!isL32 || !job.plan) return undefined;
+    // The endpoint consumes rotational-features.json. Wait for the analysis
+    // request above to finish so initial page load cannot race its file write.
+    if (!isL32 || !job.plan || !l32Rotational) return undefined;
     let cancelled = false;
     const requestKey = `${job.id}:${job.machine_configuration_hash ?? "unbound"}:${JSON.stringify(job.plan.setups)}`;
     let request = l32MaterialManifestRequests.get(requestKey);
@@ -966,7 +968,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         if (!cancelled) setL32MaterialSnapshotError({ key: requestKey, message: "实体材料逐帧预生成失败；当前零件显示不代表该工序的材料去除结果。" });
       });
     return () => { cancelled = true; };
-  }, [isL32, job.id, job.machine_configuration_hash, job.plan]);
+  }, [isL32, job.id, job.machine_configuration_hash, job.plan, l32Rotational]);
 
   const l32ToolpathSegments = useMemo<ToolpathSegment[]>(() => {
     if (!l32Program || !l32Axis) return EMPTY_TOOLPATH_SEGMENTS;
