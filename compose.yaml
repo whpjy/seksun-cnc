@@ -27,6 +27,9 @@ services:
   web:
     build:
       context: apps/web
+      args:
+        VITE_APP_NAME: ${VITE_APP_NAME:-NEXUS CNC}
+        VITE_APP_LOGO_TEXT: ${VITE_APP_LOGO_TEXT:-N}
     depends_on:
       - api
     ports:

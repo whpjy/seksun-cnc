@@ -34,6 +34,8 @@ import { ProcessDesigner } from "./ProcessDesigner";
 import type { BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, ManufacturingFeature, Operation, RotationalFeatureAnalysis, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
+const APP_NAME = (import.meta.env.VITE_APP_NAME ?? "NEXUS CNC").trim() || "NEXUS CNC";
+const APP_LOGO_TEXT = (import.meta.env.VITE_APP_LOGO_TEXT ?? "N").trim().slice(0, 2) || "N";
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
 const EMPTY_PROFILE_BOUNDARIES: { operation_id: string; setup_id: string; work_axis: Vec3; points: Vec3[] }[] = [];
 function apiUrl(path: string) {
@@ -1970,7 +1972,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   return (
     <main className="workbench">
       <header className="topbar app-header">
-        <div className="brand compact"><span>S</span> SEKSUN CNC</div>
+        <div className="brand compact"><span>{APP_LOGO_TEXT}</span>{APP_NAME}</div>
         <div className="project-title"><small>当前零件</small><strong>{job.filename}</strong></div>
         <div className="top-meta">
           {sourceSolids > 1 && solidCandidates.length > 0 && <label className="header-solid-selector">
@@ -2254,11 +2256,11 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               <strong>工序库</strong>
               <small>{catalogs?.operations.length ?? 0} 项工序</small>
             </button>
-            <button className={`inspection-card process-design ${showProcessDesigner ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setShowProcessDesigner(true); }} title="逐步设计和调整工序">
+            {operations.length > 0 && <button className={`inspection-card process-design ${showProcessDesigner ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setShowProcessDesigner(true); }} title="逐步设计和调整工序">
               <Layers3 size={19} />
               <strong>工序设计</strong>
               <small>编辑与插入</small>
-            </button>
+            </button>}
             {isL32 && <button className={`inspection-card tool ${inspectionPanel === "tools" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => setInspectionPanel((current) => current === "tools" ? null : "tools")} title="打开刀具库">
               <Wrench size={19} />
               <strong>刀具库</strong>
@@ -2320,12 +2322,16 @@ export default function App() {
   const [showHistory, setShowHistory] = useState(false);
 
   useEffect(() => {
+    document.title = APP_NAME;
+  }, []);
+
+  useEffect(() => {
     const restoreFromLocation = async () => {
       const match = window.location.pathname.match(/^\/jobs\/([0-9a-f]{32})\/?$/);
       if (!match) {
         setJob(null);
         setReadOnly(false);
-        setShowNewJob(true);
+        setShowNewJob(false);
         setLoadingSession(false);
         return;
       }
@@ -2362,11 +2368,97 @@ export default function App() {
   return <>
     {job
       ? <Workbench key={job.id} initialJob={job} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} readOnly={readOnly} />
-      : <main className="empty-workspace">
-          <header><div className="brand"><span>S</span> SEKSUN CNC</div></header>
-          <section>{sessionError ? <AlertTriangle /> : <Box />}<strong>{sessionError || "尚未打开零件"}</strong><small>新任务将在当前工作台中创建</small><button onClick={() => setShowNewJob(true)}><FileUp size={15} />上传 STEP</button></section>
-        </main>}
-    <NewJobDialog open={showNewJob} canClose={Boolean(job)} onClose={() => setShowNewJob(false)} onCreated={openJob} />
+      : <EmptyWorkbench error={sessionError} onNew={() => setShowNewJob(true)} />}
+    <NewJobDialog open={showNewJob} canClose onClose={() => setShowNewJob(false)} onCreated={openJob} />
     {showHistory && job && <HistoryDialog activeJobId={job.id} onClose={() => setShowHistory(false)} onSelected={openJob} />}
   </>;
+}
+
+function EmptyWorkbench({ error, onNew }: { error: string; onNew: () => void }) {
+  const [showFileMenu, setShowFileMenu] = useState(false);
+  const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
+  const [deviceLibrary, setDeviceLibrary] = useState<DeviceLibrary | null>(null);
+  const [selectedDeviceId, setSelectedDeviceId] = useState("");
+  const [showOperationLibrary, setShowOperationLibrary] = useState(false);
+  const [showToolLibrary, setShowToolLibrary] = useState(false);
+
+  useEffect(() => {
+    fetch(apiUrl("/api/v1/catalogs"))
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((payload: Catalogs) => setCatalogs(payload))
+      .catch(() => setCatalogs(null));
+    fetch(apiUrl("/api/v1/device-library"))
+      .then((response) => response.ok ? response.json() : Promise.reject())
+      .then((payload: DeviceLibrary) => {
+        setDeviceLibrary(payload);
+        setSelectedDeviceId(payload.devices[0]?.id ?? "");
+      })
+      .catch(() => setDeviceLibrary({ schema_version: "1.0.0", devices: [] }));
+  }, []);
+
+  const selectedDevice = deviceLibrary?.devices.find((device) => device.id === selectedDeviceId) ?? deviceLibrary?.devices[0] ?? null;
+  const libraryOperations = useMemo(() => {
+    if (!selectedDevice) return catalogs?.operations ?? [];
+    const bindingIds = new Set((selectedDevice.operation_bindings ?? []).map((binding) => binding.operation_id));
+    if (bindingIds.size > 0) return (catalogs?.operations ?? []).filter((operation) => bindingIds.has(operation.id));
+    const compatibleGroups = new Set(selectedDevice.system_integration.compatible_operation_groups);
+    return (catalogs?.operations ?? []).filter((operation) =>
+      compatibleGroups.has(operation.category)
+      || [...compatibleGroups].some((group) => DEVICE_OPERATION_GROUP_ALIASES[group]?.includes(operation.category)
+        || DEVICE_OPERATION_GROUP_ALIASES[group]?.includes(operation.id)),
+    );
+  }, [catalogs?.operations, selectedDevice]);
+
+  return <main className="workbench empty-workbench">
+    <header className="topbar app-header">
+      <div className="brand compact"><span>{APP_LOGO_TEXT}</span>{APP_NAME}</div>
+      <div className="project-title empty-project-title"><strong>未打开零件</strong></div>
+      <div className="top-meta" />
+      <div className="header-actions">
+        <div className="file-menu">
+          <button className={`file-menu-trigger ${showFileMenu ? "open" : ""}`} aria-haspopup="menu" aria-expanded={showFileMenu} onClick={() => setShowFileMenu((value) => !value)}><FolderOpen size={14} />文件<ChevronDown size={13} /></button>
+          {showFileMenu && <div className="file-menu-dropdown" role="menu">
+            <button role="menuitem" onClick={() => { setShowFileMenu(false); onNew(); }}><FileUp size={15} />新建</button>
+          </div>}
+        </div>
+        <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
+      </div>
+    </header>
+
+    <section className="workspace empty-workspace-shell">
+      <section className="viewport panel empty-viewport">
+        <div className="empty-viewport-grid" />
+        <div className="empty-part-state">
+          {error ? <AlertTriangle size={27} /> : <Box size={27} />}
+          <strong>{error || "尚未打开零件"}</strong>
+          <small>新建任务并上传 STEP 模型后，这里将显示零件与工艺规划</small>
+          <button onClick={onNew}><FileUp size={15} />新建任务</button>
+        </div>
+        <nav className="inspection-rail empty-inspection-rail" aria-label="工程检查与工艺工具">
+          <button className={`inspection-card tool ${showOperationLibrary ? "active" : ""}`} onClick={() => { setShowToolLibrary(false); setShowOperationLibrary(true); }}><Library size={19} /><strong>工序库</strong><small>{catalogs?.operations.length ?? 0} 项工序</small></button>
+          <button className={`inspection-card tool ${showToolLibrary ? "active" : ""}`} onClick={() => { setShowOperationLibrary(false); setShowToolLibrary((value) => !value); }}><Wrench size={19} /><strong>刀具库</strong><small>{catalogs?.tools.length ?? 0} 款刀具</small></button>
+        </nav>
+        {showToolLibrary && <section className="tool-library-container"><ToolLibraryPanel machineInstanceId={null} catalogTools={catalogs?.tools ?? []} apiUrl={apiUrl} onClose={() => setShowToolLibrary(false)} readOnly /></section>}
+      </section>
+    </section>
+
+    {showOperationLibrary && <div className="operation-library-backdrop" onMouseDown={() => setShowOperationLibrary(false)}>
+      <section className="operation-library-dialog resource-library-dialog" onMouseDown={(event) => event.stopPropagation()}>
+        <header><div><small>OPERATION LIBRARY</small><strong>工序库</strong></div><span>{libraryOperations.length} 道工序</span><button aria-label="关闭工序库" onClick={() => setShowOperationLibrary(false)}><X size={16} /></button></header>
+        <div className="operation-library-body"><div className="operation-library-content">
+          <section className="operation-device-picker" aria-label="选择设备">
+            <div><strong>选择设备</strong></div>
+            <div className="operation-device-dropdown"><select aria-label="工序库设备" value={selectedDevice?.id ?? ""} onChange={(event) => setSelectedDeviceId(event.target.value)}>
+              {!deviceLibrary && <option value="">正在加载设备…</option>}
+              {(deviceLibrary?.devices ?? []).map((device) => <option key={device.id} value={device.id}>{device.display_name} · {device.category_label}</option>)}
+            </select></div>
+          </section>
+          <div className="operation-library-grid">
+            {libraryOperations.map((definition) => <article key={definition.id}><div><span>{definition.category}</span></div><strong>{definition.name}</strong><p>{definition.description}</p><small>{definition.engine.provider} / {definition.engine.operation}{definition.engine.modifiers.length ? ` + ${definition.engine.modifiers.join("+")}` : ""}</small></article>)}
+            {selectedDevice && libraryOperations.length === 0 && <p className="device-library-empty">该设备暂未绑定可用工序。</p>}
+          </div>
+        </div></div>
+      </section>
+    </div>}
+  </main>;
 }
