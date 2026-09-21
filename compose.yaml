@@ -13,10 +13,6 @@ services:
       CNC_MAX_UPLOAD_MB: "200"
       CNC_CORS_ORIGINS: http://localhost:5174,http://localhost:3001
       CNC_PUBLIC_BASE_URL: ${CNC_PUBLIC_BASE_URL:-}
-      CNC_MEAS_API_BASE_URL: http://measurement:8080
-      CNC_MEAS_TIMEOUT_SECONDS: ${CNC_MEAS_TIMEOUT_SECONDS:-600}
-      CNC_EXAMPLE_ROOT: /var/lib/seksun-cnc/examples
-      CNC_EXAMPLE_MANIFEST: /app/data/benchmark_manifests/l32-liquid-cooling.v1.json
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       QWEN_BASE_URL: ${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       QWEN_MODEL: ${QWEN_MODEL:-qwen3.8-max-0902}
@@ -24,33 +20,8 @@ services:
       QWEN_PLANNING_THINKING: ${QWEN_PLANNING_THINKING:-false}
     volumes:
       - ./.seksun-cnc:/var/lib/seksun-cnc
-      - "../example:/var/lib/seksun-cnc/examples:ro"
-    depends_on:
-      - measurement
     ports:
       - "8090:8090"
-    restart: unless-stopped
-
-  measurement:
-    build:
-      context: ../seksun-meas
-      dockerfile: Dockerfile.service
-    environment:
-      MEAS_MAX_UPLOAD_MB: ${MEAS_MAX_UPLOAD_MB:-200}
-      MEAS_PROCESS_TIMEOUT_SECONDS: ${MEAS_PROCESS_TIMEOUT_SECONDS:-600}
-      MEAS_MAX_CONCURRENT_JOBS: ${MEAS_MAX_CONCURRENT_JOBS:-2}
-      MEAS_STORAGE_ROOT: /var/lib/seksun-meas/jobs
-      MEAS_HISTORY_DB: /var/lib/seksun-meas/history.sqlite3
-      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
-      QWEN_BASE_URL: ${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
-      AGENT_DEFAULT_MODEL: ${AGENT_DEFAULT_MODEL:-qwen3.7-plus-2026-05-26}
-      AGENT_VISION_MODEL: ${AGENT_VISION_MODEL:-qwen3.7-plus-2026-05-26}
-      AGENT_ESCALATION_MODEL: ${AGENT_ESCALATION_MODEL:-qwen3.8-max}
-      AGENT_MODEL_MODE: ${AGENT_MODEL_MODE:-auto}
-    volumes:
-      - ../seksun-meas/.seksun-meas:/var/lib/seksun-meas
-    expose:
-      - "8080"
     restart: unless-stopped
 
   web:

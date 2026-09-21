@@ -1,15 +1,15 @@
 # 二维图纸与 PMI 制造要求接入
 
-## 已实现链路
+## 当前链路
 
-`seksun-cnc` 的新建任务要求同时上传 PDF 工程图和 STEP/STP 三维模型。PDF 与 STEP 会发送到 `seksun-meas` 的 `/api/v1/comparisons`，其 `manufacturing_specification` 结果经标准化和特征重绑定后进入工艺规划。
+`seksun-cnc` 当前以 STEP/STP 三维模型独立创建任务，不要求 PDF 工程图，也不依赖外部图纸解析服务。几何分析、工艺规划、CAM 生成和项目内置 Web 工作台都由 `seksun-cnc` 自身提供。
 
-每个任务保存：
+任务会保存 STEP、几何分析和工艺规划结果。若已有外部解析器输出的制造要求，可通过下述统一接口导入；导入后结果会经标准化和特征重绑定进入工艺规划。
 
-- `drawing.pdf`：原始二维图纸。
-- `manufacturing-specification.json`：图纸识别服务的原始结构化输出。
+导入制造要求后，任务可额外保存：
+
+- `manufacturing-specification.json`：外部解析器的原始结构化输出。
 - `manufacturing-requirements.json`：CNC 系统使用的统一制造要求。
-- `measurement-link.json`：两个系统的任务关联和处理信息。
 
 严孔径公差、形位公差和表面粗糙度已能影响铰孔、坐标基准策略、CMM 检测和粗糙度检测工序。无法唯一关联到 CNC 特征的要求会保持待复核，不允许以错误特征 ID 驱动确定性规划。
 
@@ -45,4 +45,6 @@ Content-Type: application/json
 
 ## 部署
 
-`compose.yaml` 已增加内部 `measurement` 服务，API 通过 `CNC_MEAS_API_BASE_URL=http://measurement:8080` 访问。如使用外部部署，只需将该环境变量替换为对应地址。图纸服务失败时，任务仍会以纯 STEP 模式完成，并在方案警告中保留错误原因。
+`compose.yaml` 只构建和启动 `seksun-cnc` 自身的 API 与内置 Web 工作台，不读取或构建同级的 `seksun-meas`、`seksun-web` 项目。服务器仅部署本项目即可启动核心 STEP/CAM 流程。
+
+外部图纸或 PMI 解析器是可选的数据来源；解析完成后由调用方通过 `POST /api/v1/jobs/{job_id}/manufacturing-requirements` 导入结果，不属于本项目的部署依赖。
