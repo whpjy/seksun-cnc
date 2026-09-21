@@ -66,7 +66,6 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const lastPlaybackResetTokenRef = useRef(playbackResetToken);
   const cameraByModeRef = useRef<Record<string, { position: [number, number, number]; target: [number, number, number]; zoom: number }>>({});
   const playbackKey = `${modelUrl}:${activeOperationId ?? "none"}:${playbackMode}`;
-  const cameraKey = `${playbackKey}:${viewMode}:${toolpathSegments.length}:${materialSnapshotUrls.length}`;
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(initialProgress);
   const [speed, setSpeed] = useState(1);
@@ -102,6 +101,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     camoticsSurface?.url ?? "no-camotics-surface",
     formingPreview?.stages.length ?? 0,
   ].join("|");
+  // Camera memory is valid only for the exact visible geometry revision.
+  // In particular, an asynchronously arriving L32 stock/result must not
+  // restore the camera fitted earlier to the much smaller finished model.
+  const cameraKey = `${modelUrl}:${cameraContentKey}`;
 
   const updatePlaying = (value: boolean) => {
     if (value && playbackRef.current.progress >= 0.999) {
@@ -370,7 +373,11 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     const resize = () => {
       const width = host.clientWidth;
       const height = host.clientHeight;
-      renderer.setSize(width, height, false);
+      // Keep the CSS display size equal to the viewport. With updateStyle=false
+      // a high-DPI drawing buffer (often 2×) keeps its intrinsic CSS size and
+      // the host clips its top-left quadrant, making the true canvas center
+      // appear at the viewport's bottom-right.
+      renderer.setSize(width, height, true);
       viewAspect = width / Math.max(height, 1);
       camera.left = -viewHeight * viewAspect / 2;
       camera.right = viewHeight * viewAspect / 2;
@@ -964,11 +971,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         }
         const halfWidth = (maxX - minX) / 2;
         const halfHeight = (maxY - minY) / 2;
-        // Leave enough breathing room on first display. A tighter fit makes
-        // large or elongated parts look cropped even when they technically fit.
-        // Operation details and inspection cards float over the viewport. Keep
-        // the whole part comfortably visible instead of fitting it edge-to-edge.
-        viewHeight = Math.max(halfHeight * 2, halfWidth * 2 / Math.max(viewAspect, 0.1)) / 0.42;
+        // Normal CAD views use twice the previous 19.2% size. Simulation gets
+        // a larger dedicated fit so material-removal details remain readable.
+        const fillRatio = viewMode === "仿真" ? 0.33 : 0.384;
+        viewHeight = Math.max(halfHeight * 2, halfWidth * 2 / Math.max(viewAspect, 0.1)) / fillRatio;
         const radius = viewSize / 2;
         const distance = viewSize * 2.2;
         // Center the *visible projected bounds*, not the world origin. Turning
@@ -978,12 +984,9 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         const projectedCenterY = (minY + maxY) / 2;
         const target = right.clone().multiplyScalar(projectedCenterX)
           .add(screenUp.clone().multiplyScalar(projectedCenterY));
-        // Product layout reserves visual weight in the upper-left and places
-        // controls along the bottom/right. Bias the camera target toward the
-        // lower-right so the workpiece itself appears left and up on screen.
-        // This is a screen-space composition offset and does not move geometry.
-        target.add(right.clone().multiplyScalar(viewHeight * viewAspect * 0.07));
-        target.add(screenUp.clone().multiplyScalar(-viewHeight * 0.07));
+        // Do not apply a viewport-percentage composition offset here. Such an
+        // offset makes the apparent center vary with monitor aspect ratio.
+        // Center the projected workpiece bounds in the right-hand viewport.
         controls.target.copy(target);
         camera.position.copy(target).add(direction.multiplyScalar(distance));
         camera.zoom = 1;

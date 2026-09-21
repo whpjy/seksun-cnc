@@ -38,6 +38,7 @@ const APP_NAME = (import.meta.env.VITE_APP_NAME ?? "NEXUS CNC").trim() || "NEXUS
 const APP_LOGO_TEXT = (import.meta.env.VITE_APP_LOGO_TEXT ?? "N").trim().slice(0, 2) || "N";
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
 const EMPTY_PROFILE_BOUNDARIES: { operation_id: string; setup_id: string; work_axis: Vec3; points: Vec3[] }[] = [];
+const EMPTY_MATERIAL_SNAPSHOTS: { urls: string[]; stages: { operationId: string; start: number; count: number }[] } = { urls: [], stages: [] };
 function apiUrl(path: string) {
   return `${API_BASE}${path}`;
 }
@@ -543,7 +544,11 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     const refreshWhenVisible = () => {
       if (document.visibilityState === "visible") void refreshJob();
     };
-    void refreshJob();
+    // `initialJob` is already the complete payload returned by task creation
+    // or history selection. Fetching it again immediately replaces all nested
+    // geometry arrays with new references and forces ModelViewer to tear down
+    // and reload the same STL, which produces several visible flashes. Keep
+    // synchronization for later focus/visibility changes only.
     window.addEventListener("focus", refreshJob);
     document.addEventListener("visibilitychange", refreshWhenVisible);
     return () => {
@@ -1161,7 +1166,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }, [activeMode, isL32, l32Axis, l32GroovePreviews, l32OperationPreview, l32Program, l32TurningPreviews, l32WholePartBlocked, operations, selectedOperation]);
 
   const visibleToolpathSegments = useMemo(() => {
-    if (isL32 && playbackMode === "single" && l32OperationPreviewSegments.some((segment) => segment.motion === "cut")) return l32OperationPreviewSegments;
+    if (isL32 && (activeMode === "刀路" || activeMode === "仿真") && playbackMode === "single" && l32OperationPreviewSegments.some((segment) => segment.motion === "cut")) return l32OperationPreviewSegments;
     if (isL32 && l32WholePartBlocked && activeMode !== "仿真") return EMPTY_TOOLPATH_SEGMENTS;
     if (activeMode === "刀路") return isL32 ? l32ToolpathSegments : camResult?.preview_segments ?? [];
     if (activeMode !== "仿真" || !selectedOperation) return EMPTY_TOOLPATH_SEGMENTS;
@@ -1183,18 +1188,19 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   );
   const l32MaterialRequestKey = `${job.id}:${job.machine_configuration_hash ?? "unbound"}:${JSON.stringify(job.plan?.setups ?? [])}`;
   const visibleMaterialSnapshots = useMemo(() => {
+    if (!isL32 || activeMode !== "仿真" || !selectedOperation || l32MaterialSnapshots?.key !== l32MaterialRequestKey) {
+      return EMPTY_MATERIAL_SNAPSHOTS;
+    }
     const urls: string[] = [];
     const stages: { operationId: string; start: number; count: number }[] = [];
-    if (isL32 && activeMode === "仿真" && selectedOperation && l32MaterialSnapshots?.key === l32MaterialRequestKey) {
-      const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
-      const included = playbackMode === "single"
-        ? [selectedOperation]
-        : operations.slice(0, selectedIndex + 1).filter((operation) => operation.enabled !== false);
-      for (const operation of included) {
-        const files = l32MaterialSnapshots.files[operation.id] ?? [];
-        stages.push({ operationId: operation.id, start: urls.length, count: files.length });
-        urls.push(...files);
-      }
+    const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
+    const included = playbackMode === "single"
+      ? [selectedOperation]
+      : operations.slice(0, selectedIndex + 1).filter((operation) => operation.enabled !== false);
+    for (const operation of included) {
+      const files = l32MaterialSnapshots.files[operation.id] ?? [];
+      stages.push({ operationId: operation.id, start: urls.length, count: files.length });
+      urls.push(...files);
     }
     return { urls, stages };
   }, [activeMode, isL32, l32MaterialRequestKey, l32MaterialSnapshots, operations, playbackMode, selectedOperation]);
