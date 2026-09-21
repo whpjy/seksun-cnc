@@ -61,6 +61,32 @@ API 健康检查：<http://localhost:8090/health>
 
 首次构建需下载 FreeCAD/OCCT 运行时，耗时会明显长于后续增量构建。
 
+### GitHub 访问受限的服务器构建
+
+默认的 `apps/api/Dockerfile` 用于本地和网络正常的环境，会从 FreeCAD 官方 GitHub Release 下载并校验 AppImage。服务器无法稳定下载 FreeCAD 时，可使用备份构建文件 `apps/api/Dockerfile.server`。
+
+先将官方文件放到以下位置（该大文件已被 `.gitignore` 排除，不要提交到 Git）：
+
+```text
+vendor/FreeCAD_1.1.1-Linux-x86_64-py311.AppImage
+```
+
+校验文件，SHA256 必须为 `e2006138400b2fa85fa2e160e872d00767eb32964e85075830f7e198a3a876e1`：
+
+```bash
+sha256sum vendor/FreeCAD_1.1.1-Linux-x86_64-py311.AppImage
+```
+
+使用服务器版 Dockerfile 构建 API，再构建 Web 并启动：
+
+```bash
+docker build --progress=plain -f apps/api/Dockerfile.server -t seksun-cnc-api .
+docker compose build web
+docker compose up -d --no-build
+```
+
+服务器版只将 FreeCAD 改为从本地 `vendor` 目录复制；CAMotics/cBang 源码仍来自 GitHub。已经构建成功的服务器应保留 Docker 构建缓存，或使用 `docker save` 另行备份镜像，以免清理缓存后在受限网络中无法重新构建 CAMotics。
+
 如需将任务分享给同一内网的其他人，在 `.env` 中配置本机可访问地址后重启服务：
 
 ```dotenv

@@ -10,6 +10,7 @@ __pycache__/
 *.pyc
 .seksun-cnc/
 services/geometry/build/
+vendor/*.AppImage
 
 # Local browser, renderer, simulator, and investigation artifacts
 .tmp-*/
