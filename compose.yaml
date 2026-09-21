@@ -29,6 +29,7 @@ services:
       context: apps/web
       args:
         VITE_APP_NAME: ${VITE_APP_NAME:-NEXUS CNC}
+        VITE_PAGE_TITLE: ${VITE_PAGE_TITLE:-智能工艺规划}
         VITE_APP_LOGO_TEXT: ${VITE_APP_LOGO_TEXT:-N}
     depends_on:
       - api

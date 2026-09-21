@@ -35,6 +35,7 @@ import type { BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, Manu
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 const APP_NAME = (import.meta.env.VITE_APP_NAME ?? "NEXUS CNC").trim() || "NEXUS CNC";
+const PAGE_TITLE = (import.meta.env.VITE_PAGE_TITLE ?? "智能工艺规划").trim() || "智能工艺规划";
 const APP_LOGO_TEXT = (import.meta.env.VITE_APP_LOGO_TEXT ?? "N").trim().slice(0, 2) || "N";
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
 const EMPTY_PROFILE_BOUNDARIES: { operation_id: string; setup_id: string; work_axis: Vec3; points: Vec3[] }[] = [];
@@ -431,6 +432,7 @@ function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId: stri
 
 function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initialJob: Job; onNew: () => void; onHistory: () => void; readOnly?: boolean }) {
   const [job, setJob] = useState(initialJob);
+  const jobSnapshotRef = useRef(JSON.stringify(initialJob));
   const fileMenuRef = useRef<HTMLDivElement>(null);
   const operationPopoverRef = useRef<HTMLElement>(null);
   const [showFileMenu, setShowFileMenu] = useState(false);
@@ -517,6 +519,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }, []);
 
   useEffect(() => {
+    jobSnapshotRef.current = JSON.stringify(job);
+  }, [job]);
+
+  useEffect(() => {
     let cancelled = false;
     let refreshing = false;
     const refreshJob = async () => {
@@ -527,6 +533,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         if (!response.ok || cancelled) return;
         const refreshed = await response.json() as Job;
         if (cancelled) return;
+        const refreshedSnapshot = JSON.stringify(refreshed);
+        if (refreshedSnapshot === jobSnapshotRef.current) return;
+        jobSnapshotRef.current = refreshedSnapshot;
         setJob(refreshed);
         const refreshedOperations = refreshed.plan?.setups.flatMap((setup) => setup.operations) ?? [];
         setSelectedOperation((current) => (
@@ -2328,7 +2337,7 @@ export default function App() {
   const [showHistory, setShowHistory] = useState(false);
 
   useEffect(() => {
-    document.title = APP_NAME;
+    document.title = PAGE_TITLE;
   }, []);
 
   useEffect(() => {
