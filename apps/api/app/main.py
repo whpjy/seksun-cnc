@@ -42,7 +42,6 @@ from .machine_models import MachineBindingRequest, MachineConfigurationSnapshot,
 from .manufacturing_knowledge import assess_plan_knowledge, get_manufacturing_process, manufacturing_process_payload
 from .route_planner import build_manufacturing_route
 from .requirements_adapter import import_measurement_specification, reconcile_requirement_bindings
-from .measurement_client import MeasurementServiceError, analyze_pdf_step
 from .collision import build_safety_configuration, detect_collisions
 from .conformance import compare_stock_to_target_mesh
 from .preflight import verify_cam
@@ -1692,7 +1691,6 @@ def _process_new_job(
     job = load_job(job_id)
     directory = job_directory(job_id)
     source_path = directory / job.filename
-    drawing_path = directory / "drawing.pdf"
     analysis_path = directory / "analysis.json"
     model_path = directory / "model.stl"
 
@@ -1717,33 +1715,6 @@ def _process_new_job(
 
         report("draft_planning", "正在生成确定性工艺草案", 40)
         plan = build_process_plan(analysis, material=job.material, machine=job.machine)
-        requirements = None
-        report("drawing_analysis", "正在提取图纸尺寸、公差和技术要求", 46)
-        try:
-            specification, measurement_link = analyze_pdf_step(
-                MEAS_API_BASE_URL, drawing_path, source_path,
-                timeout_seconds=MEAS_TIMEOUT_SECONDS,
-            )
-            requirements = reconcile_requirement_bindings(
-                import_measurement_specification(specification), analysis,
-            )
-            plan = build_process_plan(
-                analysis, material=job.material, machine=job.machine,
-                requirements=requirements,
-            )
-            job.measurement_job_id = measurement_link.get("measurement_job_id")
-            write_json(directory / "manufacturing-specification.json", specification)
-            write_json(directory / "manufacturing-requirements.json", requirements.model_dump(mode="json"))
-            write_json(directory / "measurement-link.json", measurement_link)
-            report(
-                "drawing_analysis", "二维图纸要求提取完成", 58,
-                requirement_count=len(requirements.requirements),
-                matched_count=requirements.summary.get("matched", 0),
-            )
-        except MeasurementServiceError as error:
-            plan.warnings.append(f"二维图纸识别未完成：{error}")
-            report("drawing_analysis", "图纸解析未完成，已使用三维几何继续规划", 58, warning=str(error))
-
         if ai_assisted:
             report("ai_planning", "AI 正在判断制造意图、装夹路线与工序策略", 64)
             try:
@@ -1761,7 +1732,7 @@ def _process_new_job(
                     report("process_generation", "正在按 AI 制造意图重新编译工艺路线", 73)
                     plan = build_process_plan(
                         analysis, material=job.material, machine=job.machine,
-                        requirements=requirements, process_kind_hint=process_kind_hint,
+                        process_kind_hint=process_kind_hint,
                     )
                 plan.ai_planning = {
                     "provider": guidance.get("provider"),
@@ -1822,7 +1793,6 @@ def _process_new_job(
 @app.post("/api/v1/jobs", response_model=JobResponse)
 async def create_job(
     step: UploadFile = File(...),
-    drawing: UploadFile = File(...),
     material: str = Form("待确认（候选：6061-T6 铝合金）"),
     machine: str = Form("待确认（候选：VMC850 三轴立式加工中心）"),
     device_id: str | None = Form(None),
@@ -1830,9 +1800,6 @@ async def create_job(
     filename = Path(step.filename or "part.step").name
     if Path(filename).suffix.lower() not in {".step", ".stp"}:
         raise HTTPException(status_code=400, detail="Only STEP/STP files are supported")
-    drawing_filename = Path(drawing.filename or "drawing.pdf").name
-    if Path(drawing_filename).suffix.lower() != ".pdf":
-        raise HTTPException(status_code=400, detail="Only PDF drawings are supported")
     if device_id:
         try:
             machine = str(get_device(device_id)["name"])
@@ -1852,16 +1819,6 @@ async def create_job(
                 raise HTTPException(status_code=413, detail="STEP file exceeds upload limit")
             output.write(chunk)
 
-    drawing_path = directory / "drawing.pdf"
-    drawing_size = 0
-    with drawing_path.open("wb") as output:
-        while chunk := await drawing.read(1024 * 1024):
-            drawing_size += len(chunk)
-            if drawing_size > MAX_UPLOAD_BYTES:
-                shutil.rmtree(directory, ignore_errors=True)
-                raise HTTPException(status_code=413, detail="PDF drawing exceeds upload limit")
-            output.write(chunk)
-
     job = JobResponse(
         id=job_id,
         status="processing",
@@ -1870,8 +1827,6 @@ async def create_job(
         material=material,
         machine=machine,
         device_id=device_id,
-        drawing_filename=drawing_filename,
-        drawing_url=f"/api/v1/jobs/{job_id}/files/drawing.pdf",
     )
     save_job(directory, job)
 
@@ -1881,7 +1836,6 @@ async def create_job(
 @app.post("/api/v1/jobs/start", response_model=JobResponse)
 async def start_job(
     step: UploadFile = File(...),
-    drawing: UploadFile = File(...),
     material: str = Form("待确认（候选：6061-T6 铝合金）"),
     machine: str = Form("待确认（候选：VMC850 三轴立式加工中心）"),
     device_id: str | None = Form(None),
@@ -1889,9 +1843,6 @@ async def start_job(
     filename = Path(step.filename or "part.step").name
     if Path(filename).suffix.lower() not in {".step", ".stp"}:
         raise HTTPException(status_code=400, detail="Only STEP/STP files are supported")
-    drawing_filename = Path(drawing.filename or "drawing.pdf").name
-    if Path(drawing_filename).suffix.lower() != ".pdf":
-        raise HTTPException(status_code=400, detail="Only PDF drawings are supported")
     if device_id:
         try:
             machine = str(get_device(device_id)["name"])
@@ -1911,16 +1862,6 @@ async def start_job(
                 raise HTTPException(status_code=413, detail="STEP file exceeds upload limit")
             output.write(chunk)
 
-    drawing_path = directory / "drawing.pdf"
-    drawing_size = 0
-    with drawing_path.open("wb") as output:
-        while chunk := await drawing.read(1024 * 1024):
-            drawing_size += len(chunk)
-            if drawing_size > MAX_UPLOAD_BYTES:
-                shutil.rmtree(directory, ignore_errors=True)
-                raise HTTPException(status_code=413, detail="PDF drawing exceeds upload limit")
-            output.write(chunk)
-
     job = JobResponse(
         id=job_id,
         status="processing",
@@ -1929,8 +1870,6 @@ async def start_job(
         material=material,
         machine=machine,
         device_id=device_id,
-        drawing_filename=drawing_filename,
-        drawing_url=f"/api/v1/jobs/{job_id}/files/drawing.pdf",
     )
     save_job(directory, job)
     with JOB_EVENT_CONDITION:
@@ -1938,7 +1877,7 @@ async def start_job(
     publish_job_progress = lambda stage, message, percent, **details: publish_job_event(
         job_id, stage, message, percent, **details,
     )
-    publish_job_progress("uploading", "二维图纸和三维模型上传完成", 6)
+    publish_job_progress("uploading", "三维模型上传完成", 6)
 
     def worker() -> None:
         try:

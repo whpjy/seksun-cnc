@@ -165,7 +165,7 @@ function l32GroovePreviewToSegments(preview: L32GroovePreview, sourceAxis: Rotat
 }
 
 const PLANNING_STAGE_ORDER = [
-  "uploading", "geometry_analysis", "draft_planning", "drawing_analysis", "ai_planning",
+  "uploading", "geometry_analysis", "draft_planning", "ai_planning",
   "process_generation", "coverage_validation", "completed",
 ];
 const DEVICE_OPERATION_GROUP_ALIASES: Record<string, string[]> = {
@@ -186,10 +186,8 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   canClose?: boolean;
 }) {
   const stepInputRef = useRef<HTMLInputElement>(null);
-  const drawingInputRef = useRef<HTMLInputElement>(null);
   const planningStreamRef = useRef<EventSource | null>(null);
   const [stepFile, setStepFile] = useState<File | null>(null);
-  const [drawingFile, setDrawingFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [progressEvents, setProgressEvents] = useState<PlanningProgressEvent[]>([]);
@@ -220,13 +218,12 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   }, [busy, canClose, onClose, open]);
 
   const submit = async () => {
-    if (!stepFile || !drawingFile || !selectedNewJobDeviceId) return;
+    if (!stepFile || !selectedNewJobDeviceId) return;
     setBusy(true);
     setError("");
-    setProgressEvents([{ stage: "uploading", message: "正在上传二维图纸和三维模型", percent: 2 }]);
+    setProgressEvents([{ stage: "uploading", message: "正在上传三维模型", percent: 2 }]);
     const form = new FormData();
     form.append("step", stepFile);
-    form.append("drawing", drawingFile);
     form.append("device_id", selectedNewJobDeviceId);
     try {
       const response = await fetch(apiUrl("/api/v1/jobs/start"), { method: "POST", body: form });
@@ -260,7 +257,6 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
               throw new Error(completedJob.detail || completedJob.error || "无法加载生成结果");
             }
             setStepFile(null);
-            setDrawingFile(null);
             onCreated(completedJob as Job);
           } catch (reason) {
             setError(reason instanceof Error ? reason.message : "无法加载生成结果");
@@ -280,7 +276,7 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
     <div className="new-job-backdrop" onMouseDown={() => canClose && !busy && onClose()}>
       <section className="new-job-dialog" role="dialog" aria-modal="true" aria-labelledby="new-job-title" onMouseDown={(event) => event.stopPropagation()}>
         <header>
-          <div><span className="dialog-icon"><FileUp size={18} /></span><div><strong id="new-job-title">新建工艺任务</strong><small>同时上传工程图和三维模型，自动规划工序</small></div></div>
+          <div><span className="dialog-icon"><FileUp size={18} /></span><div><strong id="new-job-title">新建工艺任务</strong><small>上传三维模型，自动识别特征并规划工序</small></div></div>
           {canClose && <button aria-label="关闭新建任务" disabled={busy} onClick={onClose}><X size={17} /></button>}
         </header>
         {busy ? <div className="planning-progress" aria-live="polite">
@@ -296,28 +292,7 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
               {item.operation_count !== undefined && <small>{item.setup_count} 次装夹 · {item.operation_count} 道工序</small>}
             </div>)}
           </div>
-        </div> : <><div className="upload-pair">
-          <button
-            className={`drop-zone upload-pdf ${drawingFile ? "has-file" : ""}`}
-            onClick={() => drawingInputRef.current?.click()}
-            onDragOver={(event) => { event.preventDefault(); event.currentTarget.classList.add("is-dragging"); }}
-            onDragLeave={(event) => event.currentTarget.classList.remove("is-dragging")}
-            onDrop={(event) => {
-              event.preventDefault();
-              event.currentTarget.classList.remove("is-dragging");
-              const candidate = event.dataTransfer.files?.[0];
-              if (!candidate) return;
-              if (!/\.pdf$/i.test(candidate.name)) { setError("左侧请选择 PDF 工程图"); return; }
-              setError("");
-              setDrawingFile(candidate);
-            }}
-          >
-            <input ref={drawingInputRef} type="file" accept=".pdf,application/pdf" hidden onChange={(event) => { setError(""); setDrawingFile(event.target.files?.[0] ?? null); }} />
-            <span className="upload-type">PDF</span>
-            <FileUp size={28} />
-            <strong>{drawingFile ? drawingFile.name : "二维工程图"}</strong>
-            <small>{drawingFile ? `${(drawingFile.size / 1024 / 1024).toFixed(2)} MB · 点击重新选择` : "尺寸、公差、粗糙度与技术要求"}</small>
-          </button>
+        </div> : <><div className="upload-pair single-file">
           <button
             className={`drop-zone upload-step ${stepFile ? "has-file" : ""}`}
             onClick={() => stepInputRef.current?.click()}
@@ -328,7 +303,7 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
               event.currentTarget.classList.remove("is-dragging");
               const candidate = event.dataTransfer.files?.[0];
               if (!candidate) return;
-              if (!/\.(step|stp)$/i.test(candidate.name)) { setError("右侧请选择 STEP 或 STP 三维模型"); return; }
+              if (!/\.(step|stp)$/i.test(candidate.name)) { setError("请选择 STEP 或 STP 三维模型"); return; }
               setError("");
               setStepFile(candidate);
             }}
@@ -348,7 +323,7 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
           </select>
         </section>
         {error && <div className="inline-error"><AlertTriangle size={15} />{error}</div>}
-        <button className="primary-action" disabled={!stepFile || !drawingFile || !selectedNewJobDeviceId || busy} onClick={submit}>
+        <button className="primary-action" disabled={!stepFile || !selectedNewJobDeviceId || busy} onClick={submit}>
           分析并生成工艺 <ChevronRight size={17} />
         </button>
         </>}
@@ -478,7 +453,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [safetyMessage, setSafetyMessage] = useState("");
   const [showSimulationChecks, setShowSimulationChecks] = useState(false);
   const [applyingRemediation, setApplyingRemediation] = useState(false);
-  const [inspectionPanel, setInspectionPanel] = useState<"drawing" | "coverage" | "tools" | null>(null);
+  const [inspectionPanel, setInspectionPanel] = useState<"tools" | null>(null);
   const inspectionPanelRef = useRef<HTMLElement>(null);
   const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
   const [deviceLibrary, setDeviceLibrary] = useState<DeviceLibrary | null>(null);
@@ -698,7 +673,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     return reasons;
   }, [coverage?.targets, isL32, profileAxialComplete, l32Rotational]);
   const l32WholePartBlocked = l32WholePartBlockers.length > 0;
-  const drawingRequirements = job.plan?.manufacturing_requirements;
   const sourceSolids = Number(job.analysis?.topology.source_solids ?? job.analysis?.topology.solids ?? 1);
   const solidCandidates = job.analysis?.solid_candidates ?? [];
   const selectedSolidIndex = Number(job.analysis?.topology.selected_solid_index ?? solidCandidates.find((item) => item.selected)?.index ?? 1);
@@ -2269,11 +2243,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             activeOperationLabel={selectedOperation?.name}
           />
           <nav className="inspection-rail" aria-label="工程检查与工艺工具">
-            {drawingRequirements && <button className={`inspection-card ${inspectionPanel === "drawing" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => setInspectionPanel((current) => current === "drawing" ? null : "drawing")} title="查看图纸要求绑定状态">
-              <FileUp size={19} />
-              <strong>图纸要求</strong>
-              <small>{drawingRequirements.summary.matched}/{drawingRequirements.summary.total}</small>
-            </button>}
             {reviewCount > 0 && <button className="inspection-card review" onClick={openReviewQueue} title="查看待人工复核的制造特征">
               <em>{reviewCount}</em>
               <AlertTriangle size={19} />
@@ -2297,51 +2266,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             </button>}
           </nav>
           {inspectionPanel === "tools" && <section ref={inspectionPanelRef} className="tool-library-container"><ToolLibraryPanel machineInstanceId={job.machine_instance_id} catalogTools={catalogs?.tools ?? []} apiUrl={apiUrl} onClose={() => setInspectionPanel(null)} readOnly={readOnly} /></section>}
-          {inspectionPanel && inspectionPanel !== "tools" && <section ref={inspectionPanelRef} className={`inspection-popover ${inspectionPanel}`} aria-label={inspectionPanel === "drawing" ? "图纸要求详情" : "工艺覆盖详情"}>
-            <header>
-              <div><small>{inspectionPanel === "drawing" ? "DRAWING REQUIREMENTS" : "PROCESS COVERAGE"}</small><strong>{inspectionPanel === "drawing" ? "图纸要求" : "工艺覆盖"}</strong></div>
-              <span className={inspectionPanel === "drawing" ? drawingRequirements?.status : coverage?.status}>{inspectionPanel === "drawing" ? (drawingRequirements?.status === "complete" ? "已匹配" : "需处理") : `${Math.round((coverage?.score ?? 0) * 100)}%`}</span>
-              <button aria-label="关闭检查面板" onClick={() => setInspectionPanel(null)}><X size={15} /></button>
-            </header>
-            {inspectionPanel === "drawing" && drawingRequirements ? <>
-              <div className="inspection-overview">
-                <div><small>要求总数</small><strong>{drawingRequirements.summary.total}</strong></div>
-                <div><small>已绑定</small><strong>{drawingRequirements.summary.matched}</strong></div>
-                <div><small>待处理</small><strong>{drawingRequirements.unresolved_requirement_ids.length}</strong></div>
-              </div>
-              <div className="inspection-popover-list">
-                <article className={drawingRequirements.status}>
-                  <div><span>绑定状态</span><em>{drawingRequirements.status === "complete" ? "完整" : "需复核"}</em></div>
-                  <strong>二维要求与三维特征</strong>
-                  <dl><div><dt>模糊匹配</dt><dd>{drawingRequirements.summary.ambiguous}</dd></div><div><dt>未映射</dt><dd>{drawingRequirements.summary.unmapped}</dd></div><div><dt>仅识别</dt><dd>{drawingRequirements.summary.recognized_only}</dd></div></dl>
-                </article>
-                {drawingRequirements.unresolved_requirement_ids.length > 0 && <article className="incomplete">
-                  <div><span>决策限制</span><em>{drawingRequirements.unresolved_requirement_ids.length} 项</em></div>
-                  <strong>尚未唯一绑定到三维特征</strong>
-                  <p>这些要求仅作提示，不直接用于确定性工艺决策。</p>
-                </article>}
-                <article>
-                  <div><span>来源</span><em>{drawingRequirements.source_system}</em></div>
-                  <strong>{job.drawing_filename || "工程图"}</strong>
-                  <p>{[drawingRequirements.drawing_number && `图号 ${drawingRequirements.drawing_number}`, drawingRequirements.revision && `版本 ${drawingRequirements.revision}`].filter(Boolean).join(" · ") || "未提供图号与版本"}</p>
-                </article>
-              </div>
-            </> : coverage && <>
-              <div className="inspection-overview">
-                <div><small>加工特征</small><strong>{coverage.target_count}</strong></div>
-                <div><small>已覆盖</small><strong>{coverage.covered_count}</strong></div>
-                <div><small>待处理</small><strong>{coverage.unresolved_count + coverage.review_count}</strong></div>
-              </div>
-              <div className="inspection-popover-list">
-                {coverage.targets.map((target) => <article key={target.id} className={target.state}>
-                  <div><span>{target.kind}</span><em>{target.state === "covered" ? "已覆盖" : target.state === "review" ? "待复核" : "未覆盖"}</em></div>
-                  <strong>{target.label}</strong>
-                  <p>{target.covered_by.length ? `关联工序 ${target.covered_by.join("、")}` : `需要 ${target.required_operation_types.join("、")}`}</p>
-                </article>)}
-                {[...coverage.issues, ...coverage.capability_gaps].map((message, index) => <article className="incomplete" key={`${index}-${message}`}><div><span>检查提醒</span><em>注意</em></div><p>{message}</p></article>)}
-              </div>
-            </>}
-          </section>}
           {!readOnly && activeMode === "刀路" && isL32 && <button className="viewport-generate-button l32-draft-button" onClick={() => setShowL32Program(true)}><Play size={16} />打开 L32 真实刀路</button>}
           {!readOnly && activeMode === "刀路" && !isL32 && <button className="viewport-generate-button" disabled={automationBlocked || generatingCam || applyingRemediation} onClick={generateCam} title={automationBlocked ? "当前工艺不完整，暂时无法生成刀路" : undefined}>
             {generatingCam || applyingRemediation ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}

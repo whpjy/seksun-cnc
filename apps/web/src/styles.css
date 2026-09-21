@@ -1367,6 +1367,7 @@ body { min-width: 980px; background: #eef3f9; }
 .new-job-dialog > header > button:hover { color: #33445b; background: #eef2f7; }
 .new-job-dialog > header > button:disabled { opacity: .4; cursor: wait; }
 .new-job-dialog .upload-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.new-job-dialog .upload-pair.single-file { grid-template-columns: 1fr; }
 .new-job-dialog .drop-zone {
   position: relative;
   min-width: 0;

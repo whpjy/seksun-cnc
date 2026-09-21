@@ -90,7 +90,6 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     activeOperationId ?? "",
     playbackMode,
     viewMode,
-    toolpathLoaded ? "loaded" : "loading",
     toolpathSegments.length,
     materialSnapshotUrls.join(","),
     initialToolpathSegments.length,
@@ -177,12 +176,15 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     const camera = new THREE.OrthographicCamera(-100, 100, 100, -100, 0.1, 100000);
     camera.up.set(0, 0, 1);
     camera.position.set(120, -140, 150);
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 0.92;
-    renderer.shadowMap.enabled = true;
+    // Shadows add substantial GPU work and can shimmer on dense CAD meshes
+    // while orbiting. They are useful for simulation, but not for the normal
+    // feature/process views where the environment lights already describe form.
+    renderer.shadowMap.enabled = viewMode === "仿真";
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     host.appendChild(renderer.domElement);
 
@@ -408,15 +410,18 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           clearcoat: 0.04,
           clearcoatRoughness: 0.68,
           envMapIntensity: 0.5,
-          transparent: Boolean(simulation || turningStage || formingPreview || viewMode === "特征" || viewMode === "刀路"),
-          opacity: simulation || turningStage ? 0.16 : viewMode === "特征" ? 0.58 : viewMode === "刀路" ? 0.34 : 1,
+          // Keep the normal CAD view opaque. Transparent whole-model rendering
+          // makes triangle ordering and coplanar edge overlays visibly shimmer
+          // as the camera moves.
+          transparent: Boolean(simulation || turningStage || formingPreview || viewMode === "刀路"),
+          opacity: simulation || turningStage ? 0.16 : viewMode === "刀路" ? 0.34 : 1,
           depthWrite: !simulation && !turningStage && viewMode !== "刀路",
           // Keep coplanar CAD edge overlays stable when zoomed in. Without a
           // small depth bias the edge and surface alternate at sub-pixel depth,
           // producing the broken/dotted outlines visible at high zoom.
           polygonOffset: true,
-          polygonOffsetFactor: simulation || turningStage ? -2 : 1,
-          polygonOffsetUnits: simulation || turningStage ? -2 : 1,
+          polygonOffsetFactor: simulation || turningStage ? -2 : 2,
+          polygonOffsetUnits: simulation || turningStage ? -2 : 2,
         }),
       );
       // Keep the target optional during simulation. The target and final IPW
@@ -1823,7 +1828,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       host.removeChild(renderer.domElement);
       axisHost.removeChild(axisRenderer.domElement);
     };
-  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationTools, playbackKey, profileBoundaries, simulation, spatialDefects, toolpathLoaded, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
+  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationTools, playbackKey, profileBoundaries, simulation, spatialDefects, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
   const activeFormingStage = formingPreview?.stages.length

@@ -41,15 +41,50 @@ def test_unknown_device_library_item_returns_404() -> None:
 def test_job_start_rejects_unknown_device_before_processing() -> None:
     response = client.post(
         "/api/v1/jobs/start",
-        files={
-            "step": ("part.step", b"STEP", "application/octet-stream"),
-            "drawing": ("drawing.pdf", b"PDF", "application/pdf"),
-        },
+        files={"step": ("part.step", b"STEP", "application/octet-stream")},
         data={"device_id": "unknown-device"},
     )
 
     assert response.status_code == 400
     assert "未知设备" in response.json()["detail"]
+
+
+def test_create_job_accepts_step_without_drawing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    monkeypatch.setattr(main, "_process_new_job", lambda job_id: main.load_job(job_id))
+
+    response = client.post(
+        "/api/v1/jobs",
+        files={"step": ("part.step", b"STEP", "application/step")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["drawing_filename"] is None
+    assert payload["drawing_url"] is None
+    assert not (tmp_path / payload["id"] / "drawing.pdf").exists()
+
+
+def test_start_job_accepts_step_without_drawing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        main, "threading",
+        SimpleNamespace(Thread=lambda **_kwargs: SimpleNamespace(start=lambda: None)),
+    )
+
+    response = client.post(
+        "/api/v1/jobs/start",
+        files={"step": ("part.stp", b"STEP", "application/step")},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "processing"
+    assert payload["drawing_filename"] is None
+    assert payload["drawing_url"] is None
+    directory = tmp_path / payload["id"]
+    assert (directory / "part.stp").read_bytes() == b"STEP"
+    assert not (directory / "drawing.pdf").exists()
 
 
 def test_device_names_resolve_to_matching_machine_profiles() -> None:
@@ -471,81 +506,9 @@ def test_config_exposes_session_sharing() -> None:
 def test_rejects_non_step_upload() -> None:
     response = client.post(
         "/api/v1/jobs",
-        files={
-            "step": ("notes.txt", b"not step", "text/plain"),
-            "drawing": ("part.pdf", b"%PDF-1.4", "application/pdf"),
-        },
+        files={"step": ("notes.txt", b"not step", "text/plain")},
     )
     assert response.status_code == 400
-
-
-def test_new_job_requires_pdf_and_step() -> None:
-    response = client.post(
-        "/api/v1/jobs",
-        files={"step": ("part.step", b"STEP", "application/step")},
-    )
-    assert response.status_code == 422
-
-
-def test_create_job_imports_pdf_requirements(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
-    monkeypatch.setattr(main, "MEAS_API_BASE_URL", "http://measurement:8080")
-    analysis = GeometryAnalysis.model_validate({
-        "schema_version": "0.8.0", "source_file": "part.step",
-        "topology": {"solids": 1, "faces": 8, "edges": 16},
-        "measurements": {
-            "surface_area": 1200, "volume": 4000,
-            "bounding_box": {
-                "minimum": {"x": 0, "y": 0, "z": 0},
-                "maximum": {"x": 40, "y": 30, "z": 10},
-                "size": {"x": 40, "y": 30, "z": 10},
-            },
-        },
-        "planar_features": [],
-        "cylindrical_features": [{
-            "id": "HF-1", "kind": "hole", "radius": 3, "diameter": 6, "length": 10,
-            "center": {"x": 20, "y": 15, "z": 5}, "axis": {"x": 0, "y": 0, "z": 1},
-            "confidence": 0.95, "review_state": "accepted",
-        }],
-    })
-    monkeypatch.setattr(main, "run_geometry_analyzer", lambda *_args, **_kwargs: analysis)
-    specification = {
-        "schema_version": "1.1.0",
-        "source": {"drawing_number": "PART-001", "revision": "A"},
-        "comparison_rows": [{
-            "drawing_entity": {
-                "id": "D-01", "semantic_type": "diameter", "nominal": 6.0,
-                "tolerance": {"upper": 0.01, "lower": -0.01}, "quantity": 1,
-            },
-            "mapping_status": "matched", "verification_status": "verified_geometry",
-            "cad_feature_ids": ["HF-1"], "confidence": 0.96,
-        }],
-    }
-    monkeypatch.setattr(
-        main, "analyze_pdf_step",
-        lambda *_args, **_kwargs: (specification, {"measurement_job_id": "meas-001"}),
-    )
-
-    response = client.post(
-        "/api/v1/jobs",
-        files={
-            "step": ("part.step", b"STEP", "application/step"),
-            "drawing": ("part.pdf", b"%PDF-1.4", "application/pdf"),
-        },
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["drawing_filename"] == "part.pdf"
-    assert payload["measurement_job_id"] == "meas-001"
-    assert payload["material"].startswith("待确认")
-    assert payload["machine"].startswith("待确认")
-    assert payload["plan"]["manufacturing_requirements"]["summary"]["matched"] == 1
-    route = {step["process_code"]: step for step in payload["plan"]["manufacturing_route"]["steps"]}
-    assert route["GX-C-13"]["selection"] == "required"
-    directory = tmp_path / payload["id"]
-    assert (directory / "drawing.pdf").is_file()
-    assert (directory / "manufacturing-specification.json").is_file()
 
 
 def test_excluding_feature_rebuilds_plan(tmp_path, monkeypatch) -> None:
