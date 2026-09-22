@@ -248,6 +248,43 @@ def test_clear_job_history_preserves_current_job(tmp_path, monkeypatch) -> None:
     assert deleted_id not in main.JOB_EVENT_LOGS
 
 
+def test_delete_job_removes_directory_and_progress_events(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "d" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    main.save_job(directory, JobResponse(
+        id=job_id, status="completed", filename="delete.step",
+        created_at=main.utc_now(), material="6061-T6", machine="VMC-850",
+    ))
+    (directory / "model.stl").write_bytes(b"mesh")
+    with main.JOB_EVENT_CONDITION:
+        main.JOB_EVENT_LOGS[job_id] = [{"stage": "completed"}]
+
+    response = client.delete(f"/api/v1/jobs/{job_id}")
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": True, "job_id": job_id}
+    assert not directory.exists()
+    assert job_id not in main.JOB_EVENT_LOGS
+
+
+def test_delete_job_rejects_processing_job(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "f" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    main.save_job(directory, JobResponse(
+        id=job_id, status="processing", filename="active.step",
+        created_at=main.utc_now(), material="6061-T6", machine="VMC-850",
+    ))
+
+    response = client.delete(f"/api/v1/jobs/{job_id}")
+
+    assert response.status_code == 409
+    assert directory.is_dir()
+
+
 def test_job_progress_stream_replays_structured_events(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
     job_id = "e" * 32

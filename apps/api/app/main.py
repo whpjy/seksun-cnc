@@ -1818,11 +1818,35 @@ def _process_new_job(
         report("draft_planning", "正在生成确定性工艺草案", 40)
         plan = build_process_plan(analysis, material=job.material, machine=job.machine)
         if ai_assisted:
+            ai_progress_by_phase = {
+                "ai_context": 43,
+                "ai_request": 46,
+                "ai_waiting": 49,
+                "ai_stream_manufacturing_intent": 52,
+                "ai_stream_part_family": 55,
+                "ai_stream_recommended_process_kind": 58,
+                "ai_stream_deterministic_plan_assessment": 61,
+                "ai_stream_setup_strategy": 64,
+                "ai_stream_route_recommendations": 67,
+                "ai_stream_operation_recommendations": 70,
+                "ai_stream_risks": 73,
+                "ai_stream_missing_information": 76,
+                "ai_stream_requires_engineer_review": 79,
+                "ai_response": 81,
+                "ai_schema_validation": 83,
+                "ai_capability_validation": 85,
+                "ai_review_completed": 87,
+            }
+            ai_progress_percent = 40
+
             def report_ai_progress(stage: str, message: str, **details: object) -> None:
+                nonlocal ai_progress_percent
+                target_percent = ai_progress_by_phase.get(stage, ai_progress_percent + 1)
+                ai_progress_percent = min(87, max(ai_progress_percent, target_percent))
                 report(
                     "ai_planning",
                     "AI 正在判断制造意图、装夹路线与工序策略",
-                    64,
+                    ai_progress_percent,
                     detail=message,
                     phase=stage,
                     **details,
@@ -1842,7 +1866,7 @@ def _process_new_job(
                     else None
                 )
                 if process_kind_hint and plan.process_kind != process_kind_hint:
-                    report("process_generation", "正在按 AI 制造意图重新编译工艺路线", 73)
+                    report("process_generation", "正在按 AI 制造意图重新编译工艺路线", 89)
                     plan = build_process_plan(
                         analysis, material=job.material, machine=job.machine,
                         process_kind_hint=process_kind_hint,
@@ -1859,7 +1883,7 @@ def _process_new_job(
                     "requires_engineer_review": review.get("requires_engineer_review", False),
                 }
                 report(
-                    "ai_integration", "AI 规划意图已纳入工艺编译", 72,
+                    "ai_integration", "AI 规划意图已纳入工艺编译", 89,
                     manufacturing_intent=review.get("manufacturing_intent"),
                     recommended_process_kind=recommended_kind,
                     confidence=confidence,
@@ -1867,15 +1891,15 @@ def _process_new_job(
             except QwenPlanningError as error:
                 plan.ai_planning = {"status": "fallback", "message": str(error)}
                 plan.warnings.append("AI 辅助规划不可用，本次已回退到确定性规则规划")
-                report("ai_integration", "AI 暂不可用，已自动回退到规则规划", 72, warning=str(error))
+                report("ai_integration", "AI 暂不可用，已自动回退到规则规划", 89, warning=str(error))
 
-        report("process_generation", "正在生成装夹、工序、刀具与切削参数", 78)
+        report("process_generation", "正在生成装夹、工序、刀具与切削参数", 92)
         plan.coverage = evaluate_plan_coverage(analysis, plan)
         plan.manufacturing_route = build_manufacturing_route(analysis, plan)
         plan.knowledge_assessment = assess_plan_knowledge(analysis, plan)
         operation_count = sum(len(setup.operations) for setup in plan.setups)
         report(
-            "coverage_validation", "正在检查工艺覆盖率和 CAM 能力", 88,
+            "coverage_validation", "正在检查工艺覆盖率和 CAM 能力", 96,
             setup_count=len(plan.setups), operation_count=operation_count,
             coverage_score=plan.coverage.score if plan.coverage else None,
         )
@@ -2108,6 +2132,21 @@ def clear_job_history(preserve_job_id: str | None = None) -> dict[str, int]:
             for job_id in deleted_job_ids:
                 JOB_EVENT_LOGS.pop(job_id, None)
     return {"deleted_count": len(deleted_job_ids)}
+
+
+@app.delete("/api/v1/jobs/{job_id}")
+def delete_job(job_id: str) -> dict[str, object]:
+    """Permanently delete one completed/failed job and all of its stored artifacts."""
+    directory = job_directory(job_id)
+    job = load_job(job_id)
+    if job.status == "processing":
+        raise HTTPException(status_code=409, detail="任务仍在处理中，暂时不能删除")
+    if job_id in CAM_STREAMING_JOBS or job_id in AI_REVIEWING_JOBS:
+        raise HTTPException(status_code=409, detail="任务正在生成或审查中，暂时不能删除")
+    shutil.rmtree(directory)
+    with JOB_EVENT_CONDITION:
+        JOB_EVENT_LOGS.pop(job_id, None)
+    return {"deleted": True, "job_id": job_id}
 
 
 @app.get("/api/v1/jobs/{job_id}/manufacturing-route")

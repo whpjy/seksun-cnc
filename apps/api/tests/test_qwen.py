@@ -173,7 +173,7 @@ def test_process_review_uses_strict_schema_and_validates_response() -> None:
     assert "ai_stream_risks" in stages
     assert progress_events[1][2]["operation_count"] == 1
     assert progress_events[1][2]["feature_count"] > 0
-    assert "首个结构化审查字段" in progress_events[2][1]
+    assert progress_events[2][1] == "正在综合研判零件特征、制造约束与工艺可行性"
     assert result["usage"]["total_tokens"] == 100
 
 

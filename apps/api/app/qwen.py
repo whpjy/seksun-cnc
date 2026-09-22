@@ -512,7 +512,7 @@ def review_process_plan(
         ("missing_information", "正在核对缺失的工程信息"),
         ("requires_engineer_review", "正在形成工程师复核结论"),
     )
-    report("ai_waiting", "等待模型输出首个结构化审查字段")
+    report("ai_waiting", "正在综合研判零件特征、制造约束与工艺可行性")
     try:
         with httpx.Client(timeout=settings.timeout_seconds, transport=transport) as client:
             if not streaming:

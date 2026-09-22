@@ -191,6 +191,10 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
 }) {
   const stepInputRef = useRef<HTMLInputElement>(null);
   const planningStreamRef = useRef<EventSource | null>(null);
+  const planningPresentationTimerRef = useRef<number | null>(null);
+  const planningPresentationQueueRef = useRef<PlanningProgressEvent[]>([]);
+  const pendingActiveStageUpdateRef = useRef<PlanningProgressEvent | null>(null);
+  const activePlanningStageRef = useRef<string | null>(null);
   const [stepFile, setStepFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -198,7 +202,29 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   const [newJobDevices, setNewJobDevices] = useState<DeviceLibrary["devices"]>([]);
   const [selectedNewJobDeviceId, setSelectedNewJobDeviceId] = useState("");
 
-  useEffect(() => () => planningStreamRef.current?.close(), []);
+  useEffect(() => () => {
+    planningStreamRef.current?.close();
+    if (planningPresentationTimerRef.current !== null) {
+      window.clearTimeout(planningPresentationTimerRef.current);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (open) return;
+    planningStreamRef.current?.close();
+    planningStreamRef.current = null;
+    if (planningPresentationTimerRef.current !== null) {
+      window.clearTimeout(planningPresentationTimerRef.current);
+      planningPresentationTimerRef.current = null;
+    }
+    planningPresentationQueueRef.current = [];
+    pendingActiveStageUpdateRef.current = null;
+    activePlanningStageRef.current = null;
+    setStepFile(null);
+    setBusy(false);
+    setError("");
+    setProgressEvents([]);
+  }, [open]);
 
   useEffect(() => {
     if (!open || newJobDevices.length) return;
@@ -223,6 +249,13 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
 
   const submit = async () => {
     if (!stepFile || !selectedNewJobDeviceId) return;
+    if (planningPresentationTimerRef.current !== null) {
+      window.clearTimeout(planningPresentationTimerRef.current);
+      planningPresentationTimerRef.current = null;
+    }
+    planningPresentationQueueRef.current = [];
+    pendingActiveStageUpdateRef.current = null;
+    activePlanningStageRef.current = "uploading";
     setBusy(true);
     setError("");
     setProgressEvents([{ stage: "uploading", message: "正在上传三维模型", percent: 2 }]);
@@ -236,8 +269,10 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
       const pendingJob = payload as Job;
       const stream = new EventSource(apiUrl(`/api/v1/jobs/${pendingJob.id}/events`));
       planningStreamRef.current = stream;
-      stream.onmessage = async (event) => {
-        const update = JSON.parse(event.data) as PlanningProgressEvent;
+      const pacedStages = new Set(["geometry_analysis", "draft_planning"]);
+
+      const presentUpdate = async (update: PlanningProgressEvent) => {
+        activePlanningStageRef.current = update.stage;
         setProgressEvents((current) => {
           const withoutStage = current.filter((item) => item.stage !== update.stage);
           return [...withoutStage, update].sort(
@@ -245,15 +280,11 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
           );
         });
         if (update.stage === "error") {
-          stream.close();
-          planningStreamRef.current = null;
           setError(update.message);
           setBusy(false);
           return;
         }
         if (update.stage === "completed") {
-          stream.close();
-          planningStreamRef.current = null;
           try {
             const jobResponse = await fetch(apiUrl(`/api/v1/jobs/${pendingJob.id}`));
             const completedJob = await jobResponse.json();
@@ -261,12 +292,89 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
               throw new Error(completedJob.detail || completedJob.error || "无法加载生成结果");
             }
             setStepFile(null);
+            setBusy(false);
+            setProgressEvents([]);
+            activePlanningStageRef.current = null;
             onCreated(completedJob as Job);
           } catch (reason) {
             setError(reason instanceof Error ? reason.message : "无法加载生成结果");
             setBusy(false);
           }
         }
+      };
+
+      const drainPresentationQueue = () => {
+        if (planningPresentationTimerRef.current !== null) return;
+        const update = planningPresentationQueueRef.current.shift();
+        if (!update) return;
+        void presentUpdate(update);
+        if (pacedStages.has(update.stage)) {
+          const delay = 5_000 + Math.floor(Math.random() * 5_001);
+          planningPresentationTimerRef.current = window.setTimeout(() => {
+            const finalStageUpdate = pendingActiveStageUpdateRef.current;
+            pendingActiveStageUpdateRef.current = null;
+            if (finalStageUpdate) void presentUpdate(finalStageUpdate);
+            planningPresentationTimerRef.current = null;
+            drainPresentationQueue();
+          }, delay);
+          return;
+        }
+        if (update.stage === "ai_planning" && planningPresentationQueueRef.current.length > 0) {
+          const delay = 3_000 + Math.floor(Math.random() * 2_001);
+          planningPresentationTimerRef.current = window.setTimeout(() => {
+            planningPresentationTimerRef.current = null;
+            drainPresentationQueue();
+          }, delay);
+          return;
+        }
+        drainPresentationQueue();
+      };
+
+      const enqueueUpdate = (update: PlanningProgressEvent) => {
+        if (update.stage === "error") {
+          stream.close();
+          planningStreamRef.current = null;
+          planningPresentationQueueRef.current = [];
+          pendingActiveStageUpdateRef.current = null;
+          if (planningPresentationTimerRef.current !== null) {
+            window.clearTimeout(planningPresentationTimerRef.current);
+            planningPresentationTimerRef.current = null;
+          }
+          void presentUpdate(update);
+          return;
+        }
+        if (update.stage === "completed") {
+          stream.close();
+          planningStreamRef.current = null;
+        }
+        if (activePlanningStageRef.current === update.stage) {
+          if (planningPresentationTimerRef.current !== null && pacedStages.has(update.stage)) {
+            pendingActiveStageUpdateRef.current = update;
+            return;
+          }
+          if (planningPresentationTimerRef.current !== null && update.stage === "ai_planning") {
+            planningPresentationQueueRef.current.push(update);
+            return;
+          }
+          void presentUpdate(update);
+          return;
+        }
+        if (update.stage === "ai_planning") {
+          planningPresentationQueueRef.current.push(update);
+          drainPresentationQueue();
+          return;
+        }
+        const queuedIndex = planningPresentationQueueRef.current.findIndex((item) => item.stage === update.stage);
+        if (queuedIndex >= 0) {
+          planningPresentationQueueRef.current[queuedIndex] = update;
+        } else {
+          planningPresentationQueueRef.current.push(update);
+        }
+        drainPresentationQueue();
+      };
+
+      stream.onmessage = (event) => {
+        enqueueUpdate(JSON.parse(event.data) as PlanningProgressEvent);
       };
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法连接分析服务");
@@ -352,10 +460,11 @@ type JobHistoryItem = {
   operation_count: number;
 };
 
-function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId?: string; onClose: () => void; onSelected: (job: Job) => void }) {
+function HistoryDialog({ activeJobId, onClose, onSelected, onDeleted }: { activeJobId?: string; onClose: () => void; onSelected: (job: Job) => void; onDeleted: (jobId: string) => void }) {
   const [items, setItems] = useState<JobHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [openingId, setOpeningId] = useState("");
+  const [deletingId, setDeletingId] = useState("");
   const [clearing, setClearing] = useState(false);
   const [error, setError] = useState("");
 
@@ -364,8 +473,7 @@ function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId?: str
       .then(async (response) => {
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.detail || "历史记录加载失败");
-        const history = payload as JobHistoryItem[];
-        setItems(activeJobId ? history.filter((item) => item.id !== activeJobId) : history);
+        setItems(payload as JobHistoryItem[]);
       })
       .catch((reason) => setError(reason instanceof Error ? reason.message : "历史记录加载失败"))
       .finally(() => setLoading(false));
@@ -378,6 +486,7 @@ function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId?: str
   }, [onClose]);
 
   const openHistoryJob = async (item: JobHistoryItem) => {
+    if (item.id === activeJobId) return;
     setOpeningId(item.id);
     setError("");
     try {
@@ -392,11 +501,32 @@ function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId?: str
     }
   };
 
+  const deletableCount = activeJobId
+    ? items.filter((item) => item.id !== activeJobId).length
+    : items.length;
+
+  const deleteHistoryJob = async (item: JobHistoryItem) => {
+    if (!window.confirm(`确定删除“${item.filename}”吗？该任务的模型、分析、工艺和生成文件都会被永久删除。`)) return;
+    setDeletingId(item.id);
+    setError("");
+    try {
+      const response = await fetch(apiUrl(`/api/v1/jobs/${item.id}`), { method: "DELETE" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "任务删除失败");
+      setItems((current) => current.filter((candidate) => candidate.id !== item.id));
+      onDeleted(item.id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "任务删除失败");
+    } finally {
+      setDeletingId("");
+    }
+  };
+
   const clearHistory = async () => {
     const confirmation = activeJobId
-      ? `确定清空 ${items.length} 条历史记录吗？当前打开的任务会保留。`
-      : `确定清空全部 ${items.length} 条历史记录吗？`;
-    if (!items.length || !window.confirm(confirmation)) return;
+      ? `确定清空 ${deletableCount} 条历史记录吗？当前打开的任务会保留。`
+      : `确定清空全部 ${deletableCount} 条历史记录吗？`;
+    if (!deletableCount || !window.confirm(confirmation)) return;
     setClearing(true);
     setError("");
     try {
@@ -404,7 +534,7 @@ function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId?: str
       const response = await fetch(apiUrl(`/api/v1/jobs${query}`), { method: "DELETE" });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "历史记录清空失败");
-      setItems([]);
+      setItems((current) => activeJobId ? current.filter((item) => item.id === activeJobId) : []);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "历史记录清空失败");
     } finally {
@@ -417,7 +547,7 @@ function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId?: str
       <header>
         <div><History size={17} /><strong id="history-title">历史记录</strong></div>
         <div className="history-header-actions">
-          <button className="history-clear" disabled={loading || clearing || items.length === 0} onClick={clearHistory}>
+          <button className="history-clear" disabled={loading || clearing || deletableCount === 0} onClick={clearHistory}>
             {clearing ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}清空历史记录
           </button>
           <button aria-label="关闭历史记录" onClick={onClose}><X size={16} /></button>
@@ -427,12 +557,19 @@ function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId?: str
         {loading && <p className="history-empty"><LoaderCircle className="spin" size={17} />正在加载历史任务…</p>}
         {!loading && error && <p className="history-error"><AlertTriangle size={16} />{error}</p>}
         {!loading && !error && items.length === 0 && <p className="history-empty">暂无历史任务</p>}
-        {!loading && items.map((item) => <button key={item.id} disabled={Boolean(openingId)} onClick={() => openHistoryJob(item)}>
-          <span className={`history-status ${item.status}`} />
-          <div><strong>{item.filename}</strong><small>{new Date(item.created_at).toLocaleString("zh-CN", { hour12: false })}</small></div>
-          <div><span>{item.setup_count} 次装夹 · {item.operation_count} 道工序</span><small>{item.material} · {item.machine}</small></div>
-          {openingId === item.id ? <LoaderCircle className="spin" size={15} /> : <ChevronRight size={15} />}
-        </button>)}
+        {!loading && items.map((item) => <div key={item.id} className={`history-row ${item.id === activeJobId ? "current" : ""}`}>
+          <button className="history-open" aria-current={item.id === activeJobId ? "page" : undefined} disabled={Boolean(openingId || deletingId)} onClick={() => openHistoryJob(item)}>
+            <span className={`history-status ${item.status}`} />
+            <div><strong>{item.filename}</strong><small>{new Date(item.created_at).toLocaleString("zh-CN", { hour12: false })}</small></div>
+            <div><span>{item.setup_count} 次装夹 · {item.operation_count} 道工序</span><small>{item.material} · {item.machine}</small></div>
+            {item.id === activeJobId
+              ? <span className="history-current-badge">当前打开</span>
+              : openingId === item.id ? <LoaderCircle className="spin" size={15} /> : <ChevronRight size={15} />}
+          </button>
+          <button className="history-delete" aria-label={`删除任务 ${item.filename}`} title="删除任务及全部数据" disabled={Boolean(openingId || deletingId) || item.status === "processing"} onClick={() => deleteHistoryJob(item)}>
+            {deletingId === item.id ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}
+          </button>
+        </div>)}
       </div>
     </section>
   </div>;
@@ -2368,13 +2505,21 @@ export default function App() {
     setSessionError("");
   };
 
+  const handleDeletedJob = (jobId: string) => {
+    if (job?.id !== jobId) return;
+    window.history.replaceState({}, "", "/");
+    setJob(null);
+    setReadOnly(false);
+    setSessionError("");
+  };
+
   if (loadingSession) return <div className="fatal-state"><LoaderCircle className="spin" />正在加载任务会话…</div>;
   return <>
     {job
       ? <Workbench key={job.id} initialJob={job} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} readOnly={readOnly} />
       : <EmptyWorkbench error={sessionError} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} />}
     <NewJobDialog open={showNewJob} canClose onClose={() => setShowNewJob(false)} onCreated={openJob} />
-    {showHistory && <HistoryDialog activeJobId={job?.id} onClose={() => setShowHistory(false)} onSelected={openJob} />}
+    {showHistory && <HistoryDialog activeJobId={job?.id} onClose={() => setShowHistory(false)} onSelected={openJob} onDeleted={handleDeletedJob} />}
   </>;
 }
 
