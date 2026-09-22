@@ -1818,9 +1818,20 @@ def _process_new_job(
         report("draft_planning", "正在生成确定性工艺草案", 40)
         plan = build_process_plan(analysis, material=job.material, machine=job.machine)
         if ai_assisted:
-            report("ai_planning", "AI 正在判断制造意图、装夹路线与工序策略", 64)
+            def report_ai_progress(stage: str, message: str, **details: object) -> None:
+                report(
+                    "ai_planning",
+                    "AI 正在判断制造意图、装夹路线与工序策略",
+                    64,
+                    detail=message,
+                    phase=stage,
+                    **details,
+                )
+
             try:
-                guidance = review_process_plan(analysis, plan)
+                guidance = review_process_plan(
+                    analysis, plan, progress_callback=report_ai_progress,
+                )
                 write_json(directory / "planning-guidance.json", guidance)
                 review = guidance.get("review", {})
                 recommended_kind = str(review.get("recommended_process_kind", ""))
@@ -1848,7 +1859,7 @@ def _process_new_job(
                     "requires_engineer_review": review.get("requires_engineer_review", False),
                 }
                 report(
-                    "ai_planning", "AI 规划意图已纳入工艺编译", 72,
+                    "ai_integration", "AI 规划意图已纳入工艺编译", 72,
                     manufacturing_intent=review.get("manufacturing_intent"),
                     recommended_process_kind=recommended_kind,
                     confidence=confidence,
@@ -1856,7 +1867,7 @@ def _process_new_job(
             except QwenPlanningError as error:
                 plan.ai_planning = {"status": "fallback", "message": str(error)}
                 plan.warnings.append("AI 辅助规划不可用，本次已回退到确定性规则规划")
-                report("ai_planning", "AI 暂不可用，已自动回退到规则规划", 72, warning=str(error))
+                report("ai_integration", "AI 暂不可用，已自动回退到规则规划", 72, warning=str(error))
 
         report("process_generation", "正在生成装夹、工序、刀具与切削参数", 78)
         plan.coverage = evaluate_plan_coverage(analysis, plan)

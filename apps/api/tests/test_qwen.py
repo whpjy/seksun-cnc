@@ -101,6 +101,7 @@ def test_manufacturing_context_omits_large_visual_edge_payload() -> None:
 
 def test_process_review_uses_strict_schema_and_validates_response() -> None:
     analysis, plan = planning_input()
+    progress_events: list[tuple[str, str, dict[str, object]]] = []
     review = {
         "schema_version": "1.0.0",
         "manufacturing_intent": "fixture tooling",
@@ -134,19 +135,46 @@ def test_process_review_uses_strict_schema_and_validates_response() -> None:
         assert body["response_format"]["json_schema"]["strict"] is True
         assert "route_recommendations" in body["response_format"]["json_schema"]["schema"]["required"]
         assert "max_tokens" not in body
-        return httpx.Response(200, json={
+        assert body["stream"] is True
+        assert body["stream_options"] == {"include_usage": True}
+        content = json.dumps(review, ensure_ascii=False)
+        fragments = [content[index:index + 80] for index in range(0, len(content), 80)]
+        stream = "".join(
+            "data: " + json.dumps({
+                "id": "review-1", "model": "qwen3.8-max-0902",
+                "choices": [{"delta": {"content": fragment}}],
+            }, ensure_ascii=False) + "\n\n"
+            for fragment in fragments
+        )
+        stream += "data: " + json.dumps({
             "id": "review-1", "model": "qwen3.8-max-0902",
-            "choices": [{"message": {"content": json.dumps(review, ensure_ascii=False)}}],
-            "usage": {"total_tokens": 100},
-        })
+            "choices": [], "usage": {"total_tokens": 100},
+        }) + "\n\ndata: [DONE]\n\n"
+        return httpx.Response(200, text=stream, headers={"content-type": "text/event-stream"})
 
     result = review_process_plan(
         analysis, plan, settings=settings(), transport=httpx.MockTransport(handler),
+        progress_callback=lambda stage, message, **details: progress_events.append(
+            (stage, message, details)
+        ),
     )
     assert result["review"]["recommended_process_kind"] == "subtractive"
     assert result["review"]["route_recommendations"][0]["process_code"] == "GX-C-07"
     assert result["review"]["requires_engineer_review"] is True
     assert result["input_summary"]["operation_count"] == 1
+    stages = [stage for stage, _message, _details in progress_events]
+    assert stages[:3] == ["ai_context", "ai_request", "ai_waiting"]
+    assert stages[-4:] == [
+        "ai_response", "ai_schema_validation", "ai_capability_validation", "ai_review_completed",
+    ]
+    assert "ai_stream_manufacturing_intent" in stages
+    assert "ai_stream_setup_strategy" in stages
+    assert "ai_stream_operation_recommendations" in stages
+    assert "ai_stream_risks" in stages
+    assert progress_events[1][2]["operation_count"] == 1
+    assert progress_events[1][2]["feature_count"] > 0
+    assert "首个结构化审查字段" in progress_events[2][1]
+    assert result["usage"]["total_tokens"] == 100
 
 
 def test_process_review_rejects_unknown_operation_type() -> None:

@@ -1103,9 +1103,9 @@ body { min-width: 980px; background: #eef3f9; }
 }
 .viewport-generate-button:hover:not(:disabled) { background: #365bdb; transform: translate(-50%, -1px); }
 .viewport-generate-button:disabled { opacity: .55; cursor: not-allowed; }
-.file-menu { position: relative; margin-left: 6px; }
-.file-menu-trigger {
+.header-command-button {
   height: 30px;
+  margin-left: 6px;
   padding: 0 9px;
   display: flex;
   align-items: center;
@@ -1117,40 +1117,9 @@ body { min-width: 980px; background: #eef3f9; }
   cursor: pointer;
   font-size: 10px;
   font-weight: 600;
-}
-.file-menu-trigger:hover, .file-menu-trigger.open { background: #ffffff24; }
-.file-menu-trigger > svg:last-child { transition: transform .15s ease; }
-.file-menu-trigger.open > svg:last-child { transform: rotate(180deg); }
-.file-menu-dropdown {
-  position: absolute;
-  z-index: 100;
-  top: 35px;
-  left: 0;
-  width: 104px;
-  overflow: hidden;
-  color: #37465a;
-  background: #fff;
-  border: 1px solid #d4dbe5;
-  border-radius: 3px;
-  box-shadow: 0 6px 16px #2639572e;
-}
-.file-menu-dropdown button {
-  width: 100%;
-  height: 42px;
-  padding: 0 20px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: #354357;
-  background: #fff;
-  border: 0;
-  border-bottom: 1px solid #e3e7ed;
-  cursor: pointer;
-  font-size: 10px;
   white-space: nowrap;
 }
-.file-menu-dropdown button:last-child { border-bottom: 0; }
-.file-menu-dropdown button:hover { color: #3558cd; background: #f3f6ff; }
+.header-command-button:hover { background: #ffffff24; }
 .admin-identity {
   height: 30px;
   margin-left: 10px;
@@ -1401,13 +1370,15 @@ body { min-width: 980px; background: #eef3f9; }
 .planning-progress-track { height: 5px; margin: 11px 0 12px; overflow: hidden; background: #e9edf5; border-radius: 999px; }
 .planning-progress-track i { display: block; height: 100%; background: linear-gradient(90deg, #496be2, #7892f0); border-radius: inherit; transition: width .3s ease; }
 .planning-progress-stages { display: grid; gap: 5px; }
-.planning-progress-stages > div { min-width: 0; height: 21px; display: flex; align-items: center; gap: 7px; color: #7d8999; font-size: 10px; }
+.planning-progress-stages > div { min-width: 0; min-height: 21px; display: flex; align-items: flex-start; gap: 7px; color: #7d8999; font-size: 10px; }
 .planning-progress-stages > div.done { color: #617087; }
 .planning-progress-stages > div.active { color: #34445b; font-weight: 600; }
-.planning-progress-stages > div svg { flex: 0 0 auto; color: #45b58e; }
+.planning-progress-stages > div svg { margin-top: 3px; flex: 0 0 auto; color: #45b58e; }
 .planning-progress-stages > div.active svg { color: #496be2; }
-.planning-progress-stages > div span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.planning-progress-stages > div small { margin-left: auto; flex: 0 0 auto; color: #8995a6; font: 9px "JetBrains Mono", monospace; }
+.planning-stage-copy { min-width: 0; display: flex; flex: 1 1 auto; flex-direction: column; gap: 2px; }
+.planning-stage-copy > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.planning-stage-copy .planning-stage-detail { color: #7a8798; font: 9px/1.45 "Microsoft YaHei", sans-serif; font-weight: 400; white-space: normal; }
+.planning-progress-stages .planning-stage-meta { margin-left: auto; padding-top: 2px; flex: 0 0 auto; color: #8995a6; font: 9px "JetBrains Mono", monospace; }
 .new-job-dialog .primary-action { width: 100%; height: 40px; margin: 18px 0 0; padding: 0 18px; color: #fff; background: #496be2; border-radius: 8px; }
 .new-job-dialog .inline-error { margin: 10px 0 0; color: #b54d3f; }
 @media (max-width: 620px) {

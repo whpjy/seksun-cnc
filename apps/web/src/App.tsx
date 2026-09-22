@@ -11,7 +11,6 @@ import {
   ChevronRight,
   CircleDot,
   FileUp,
-  FolderOpen,
   History,
   Info,
   Layers3,
@@ -47,6 +46,7 @@ function apiUrl(path: string) {
 type PlanningProgressEvent = {
   stage: string;
   message: string;
+  detail?: string;
   percent: number;
   feature_count?: number;
   hole_count?: number;
@@ -169,7 +169,7 @@ function l32GroovePreviewToSegments(preview: L32GroovePreview, sourceAxis: Rotat
 }
 
 const PLANNING_STAGE_ORDER = [
-  "uploading", "geometry_analysis", "draft_planning", "ai_planning",
+  "uploading", "geometry_analysis", "draft_planning", "ai_planning", "ai_integration",
   "process_generation", "coverage_validation", "completed",
 ];
 const DEVICE_OPERATION_GROUP_ALIASES: Record<string, string[]> = {
@@ -292,8 +292,11 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
           <div className="planning-progress-stages">
             {progressEvents.filter((item) => item.stage !== "completed").slice(-5).map((item, index, items) => <div className={index === items.length - 1 ? "active" : "done"} key={item.stage}>
               {index === items.length - 1 ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
-              <span>{item.message}</span>
-              {item.operation_count !== undefined && <small>{item.setup_count} 次装夹 · {item.operation_count} 道工序</small>}
+              <span className="planning-stage-copy">
+                <span>{item.message}</span>
+                {index === items.length - 1 && item.detail && <small className="planning-stage-detail">{item.detail}</small>}
+              </span>
+              {item.operation_count !== undefined && <small className="planning-stage-meta">{item.setup_count} 次装夹 · {item.operation_count} 道工序</small>}
             </div>)}
           </div>
         </div> : <><div className="upload-pair single-file">
@@ -349,7 +352,7 @@ type JobHistoryItem = {
   operation_count: number;
 };
 
-function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId: string; onClose: () => void; onSelected: (job: Job) => void }) {
+function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId?: string; onClose: () => void; onSelected: (job: Job) => void }) {
   const [items, setItems] = useState<JobHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [openingId, setOpeningId] = useState("");
@@ -361,7 +364,8 @@ function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId: stri
       .then(async (response) => {
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.detail || "历史记录加载失败");
-        setItems((payload as JobHistoryItem[]).filter((item) => item.id !== activeJobId));
+        const history = payload as JobHistoryItem[];
+        setItems(activeJobId ? history.filter((item) => item.id !== activeJobId) : history);
       })
       .catch((reason) => setError(reason instanceof Error ? reason.message : "历史记录加载失败"))
       .finally(() => setLoading(false));
@@ -389,11 +393,15 @@ function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId: stri
   };
 
   const clearHistory = async () => {
-    if (!items.length || !window.confirm(`确定清空 ${items.length} 条历史记录吗？当前打开的任务会保留。`)) return;
+    const confirmation = activeJobId
+      ? `确定清空 ${items.length} 条历史记录吗？当前打开的任务会保留。`
+      : `确定清空全部 ${items.length} 条历史记录吗？`;
+    if (!items.length || !window.confirm(confirmation)) return;
     setClearing(true);
     setError("");
     try {
-      const response = await fetch(apiUrl(`/api/v1/jobs?preserve_job_id=${encodeURIComponent(activeJobId)}`), { method: "DELETE" });
+      const query = activeJobId ? `?preserve_job_id=${encodeURIComponent(activeJobId)}` : "";
+      const response = await fetch(apiUrl(`/api/v1/jobs${query}`), { method: "DELETE" });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "历史记录清空失败");
       setItems([]);
@@ -433,9 +441,7 @@ function HistoryDialog({ activeJobId, onClose, onSelected }: { activeJobId: stri
 function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initialJob: Job; onNew: () => void; onHistory: () => void; readOnly?: boolean }) {
   const [job, setJob] = useState(initialJob);
   const jobSnapshotRef = useRef(JSON.stringify(initialJob));
-  const fileMenuRef = useRef<HTMLDivElement>(null);
   const operationPopoverRef = useRef<HTMLElement>(null);
-  const [showFileMenu, setShowFileMenu] = useState(false);
   const [selectedOperation, setSelectedOperation] = useState<Operation | null>(job.plan?.setups[0]?.operations[0] ?? null);
   const [selectedFeatureIds, setSelectedFeatureIds] = useState<string[]>(selectedOperation?.feature_ids ?? []);
   const [activeMode, setActiveMode] = useState("工艺");
@@ -566,20 +572,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [initialJob.id]);
-
-  useEffect(() => {
-    if (!showFileMenu) return;
-    const closeMenu = (event: MouseEvent) => {
-      if (!fileMenuRef.current?.contains(event.target as Node)) setShowFileMenu(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent) => event.key === "Escape" && setShowFileMenu(false);
-    window.addEventListener("mousedown", closeMenu);
-    window.addEventListener("keydown", closeOnEscape);
-    return () => {
-      window.removeEventListener("mousedown", closeMenu);
-      window.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [showFileMenu]);
 
   const operations = useMemo(
     () => job.plan?.setups.flatMap((setup) => setup.operations) ?? [],
@@ -2000,13 +1992,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           {readOnly && <span className="readonly-badge">只读模式</span>}
         </div>
         <div className="header-actions">
-          <div className="file-menu" ref={fileMenuRef}>
-            <button className={`file-menu-trigger ${showFileMenu ? "open" : ""}`} aria-haspopup="menu" aria-expanded={showFileMenu} onClick={() => setShowFileMenu((value) => !value)}><FolderOpen size={14} />文件<ChevronDown size={13} /></button>
-            {showFileMenu && <div className="file-menu-dropdown" role="menu">
-              <button role="menuitem" onClick={() => { setShowFileMenu(false); onNew(); }}><FileUp size={15} />新建</button>
-              <button role="menuitem" onClick={() => { setShowFileMenu(false); onHistory(); }}><History size={15} />历史记录</button>
-            </div>}
-          </div>
+          <button className="header-command-button" onClick={onNew}><FileUp size={14} />新建任务</button>
+          <button className="header-command-button" onClick={onHistory}><History size={14} />历史记录</button>
           <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
         </div>
       </header>
@@ -2385,14 +2372,13 @@ export default function App() {
   return <>
     {job
       ? <Workbench key={job.id} initialJob={job} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} readOnly={readOnly} />
-      : <EmptyWorkbench error={sessionError} onNew={() => setShowNewJob(true)} />}
+      : <EmptyWorkbench error={sessionError} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} />}
     <NewJobDialog open={showNewJob} canClose onClose={() => setShowNewJob(false)} onCreated={openJob} />
-    {showHistory && job && <HistoryDialog activeJobId={job.id} onClose={() => setShowHistory(false)} onSelected={openJob} />}
+    {showHistory && <HistoryDialog activeJobId={job?.id} onClose={() => setShowHistory(false)} onSelected={openJob} />}
   </>;
 }
 
-function EmptyWorkbench({ error, onNew }: { error: string; onNew: () => void }) {
-  const [showFileMenu, setShowFileMenu] = useState(false);
+function EmptyWorkbench({ error, onNew, onHistory }: { error: string; onNew: () => void; onHistory: () => void }) {
   const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
   const [deviceLibrary, setDeviceLibrary] = useState<DeviceLibrary | null>(null);
   const [selectedDeviceId, setSelectedDeviceId] = useState("");
@@ -2429,15 +2415,11 @@ function EmptyWorkbench({ error, onNew }: { error: string; onNew: () => void }) 
   return <main className="workbench empty-workbench">
     <header className="topbar app-header">
       <div className="brand compact"><span>{APP_LOGO_TEXT}</span>{APP_NAME}</div>
-      <div className="project-title empty-project-title"><strong>未打开零件</strong></div>
+      <div className="project-title empty-project-title"><strong>尚未导入模型</strong></div>
       <div className="top-meta" />
       <div className="header-actions">
-        <div className="file-menu">
-          <button className={`file-menu-trigger ${showFileMenu ? "open" : ""}`} aria-haspopup="menu" aria-expanded={showFileMenu} onClick={() => setShowFileMenu((value) => !value)}><FolderOpen size={14} />文件<ChevronDown size={13} /></button>
-          {showFileMenu && <div className="file-menu-dropdown" role="menu">
-            <button role="menuitem" onClick={() => { setShowFileMenu(false); onNew(); }}><FileUp size={15} />新建</button>
-          </div>}
-        </div>
+        <button className="header-command-button" onClick={onNew}><FileUp size={14} />新建任务</button>
+        <button className="header-command-button" onClick={onHistory}><History size={14} />历史记录</button>
         <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
       </div>
     </header>
@@ -2447,8 +2429,8 @@ function EmptyWorkbench({ error, onNew }: { error: string; onNew: () => void }) 
         <div className="empty-viewport-grid" />
         <div className="empty-part-state">
           {error ? <AlertTriangle size={27} /> : <Box size={27} />}
-          <strong>{error || "尚未打开零件"}</strong>
-          <small>新建任务并上传 STEP 模型后，这里将显示零件与工艺规划</small>
+          <strong>{error || "尚未导入模型"}</strong>
+          <small>新建任务并上传 STEP 模型后，这里将显示模型与工艺规划</small>
           <button onClick={onNew}><FileUp size={15} />新建任务</button>
         </div>
         <nav className="inspection-rail empty-inspection-rail" aria-label="工程检查与工艺工具">
