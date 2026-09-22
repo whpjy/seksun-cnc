@@ -274,23 +274,73 @@ def _extract_profile_features(profile: RotationalProfile) -> list[TurningProfile
             candidate_index += direction
         return adjacent_reference
 
-    for index, (start, end) in enumerate(zip(points, points[1:]), start=1):
+    spans: list[tuple[int, int, str]] = []
+    segment_index = 0
+    while segment_index < len(points) - 1:
+        start = points[segment_index]
+        end = points[segment_index + 1]
         delta_z = abs(end.z - start.z)
         delta_radius = abs(end.radius - start.radius)
         if delta_z <= z_tolerance and delta_radius <= radius_tolerance:
+            segment_index += 1
             continue
+        if delta_z <= z_tolerance:
+            spans.append((segment_index, segment_index + 1, "radial_transition"))
+            segment_index += 1
+            continue
+        if delta_radius <= radius_tolerance:
+            spans.append((segment_index, segment_index + 1, "land"))
+            segment_index += 1
+            continue
+
+        # Exact OCC sections approximate a single radius/fillet with many short
+        # chords.  Treat a monotonic run as one semantic transition instead of
+        # emitting one fake taper for every sampled chord.
+        run_end = segment_index + 1
+        slopes = [(end.radius - start.radius) / (end.z - start.z)]
+        while run_end < len(points) - 1:
+            left = points[run_end]
+            right = points[run_end + 1]
+            dz = right.z - left.z
+            dr = right.radius - left.radius
+            if abs(dz) <= z_tolerance or abs(dr) <= radius_tolerance:
+                break
+            slope = dr / dz
+            if slope * slopes[-1] <= 0:
+                break
+            slopes.append(slope)
+            run_end += 1
+        slope_span = max(slopes) - min(slopes)
+        slope_scale = max(max(abs(item) for item in slopes), 1e-6)
+        span_kind = (
+            "radial_transition"
+            if len(slopes) >= 2 and slope_span > max(0.05, slope_scale * 0.12)
+            else "angled"
+        )
+        spans.append((segment_index, run_end, span_kind))
+        segment_index = run_end
+
+    for feature_index, (start_index, end_index, span_kind) in enumerate(spans, start=1):
+        start = points[start_index]
+        end = points[end_index]
+        delta_z = abs(end.z - start.z)
+        delta_radius = abs(end.radius - start.radius)
         kind: str
         depth = 0.0
         reasons: list[str]
-        if delta_z <= z_tolerance:
+        if span_kind == "radial_transition":
             kind = "radial_transition"
-            reasons = ["同一轴向位置出现半径变化，暂按台阶或槽壁候选处理。"]
-        elif delta_radius <= radius_tolerance:
+            reasons = [
+                "连续变斜率截面段已合并为一个圆弧、圆角或槽壁过渡候选。"
+                if end_index - start_index > 1
+                else "同一轴向位置出现半径变化，暂按台阶或槽壁候选处理。"
+            ]
+        elif span_kind == "land":
             if profile.side == "inner":
                 kind = "inner_bore"
                 reasons = ["恒定内半径段来自截面包络，需排除横向孔和局部槽交线。"]
-                previous_radius = nearest_land_radius(index - 1, -1)
-                following_radius = nearest_land_radius(index - 1, 1)
+                previous_radius = nearest_land_radius(start_index, -1)
+                following_radius = nearest_land_radius(start_index, 1)
                 surrounding_radius = (
                     max(previous_radius, following_radius)
                     if previous_radius is not None and following_radius is not None
@@ -308,8 +358,8 @@ def _extract_profile_features(profile: RotationalProfile) -> list[TurningProfile
             else:
                 kind = "cylindrical_land"
                 reasons = ["恒定外半径段来自截面包络，需与图纸尺寸绑定。"]
-                previous_radius = nearest_land_radius(index - 1, -1)
-                following_radius = nearest_land_radius(index - 1, 1)
+                previous_radius = nearest_land_radius(start_index, -1)
+                following_radius = nearest_land_radius(start_index, 1)
                 surrounding_radius = (
                     min(previous_radius, following_radius)
                     if previous_radius is not None and following_radius is not None
@@ -326,9 +376,9 @@ def _extract_profile_features(profile: RotationalProfile) -> list[TurningProfile
                     reasons = ["局部恒定外半径段低于两侧最近稳定外圆；槽深以稳定外圆计算，槽宽、圆角和刀宽仍须由图纸确认。"]
         else:
             kind = "inner_taper" if profile.side == "inner" else "taper"
-            reasons = ["轴向与半径同时变化，暂按锥面或圆弧离散段处理。"]
+            reasons = ["斜率连续的轴向变径段已合并为锥面候选。"]
         result.append(TurningProfileFeature(
-            id=f"TPF-{profile.side.upper()}-{index}",
+            id=f"TPF-{profile.side.upper()}-{feature_index}",
             profile_id=profile.id,
             kind=kind,
             z_start=start.z,
@@ -337,7 +387,7 @@ def _extract_profile_features(profile: RotationalProfile) -> list[TurningProfile
             radius_end=end.radius,
             width_mm=delta_z,
             depth_mm=max(0, depth),
-            source_point_indices=[index - 1, index],
+            source_point_indices=list(range(start_index, end_index + 1)),
             confidence=confidence,
             review_state="review",
             review_reasons=reasons,

@@ -556,3 +556,24 @@ def test_rejects_lower_boss_top_when_adjacent_walls_fall_away() -> None:
     normalized = normalize_manufacturing_features(analysis)
 
     assert normalized.prismatic_features == []
+
+
+def test_exposes_complex_outer_planes_as_reviewable_milling_regions() -> None:
+    analysis = sample_analysis()
+    analysis.planar_features[0].bounds = Bounds(
+        minimum=Vec3(x=0, y=0, z=20),
+        maximum=Vec3(x=100, y=60, z=20),
+        size=Vec3(x=100, y=60, z=0),
+    )
+    analysis.planar_features[0].falling_edge_count = 6
+    analysis.planar_features[0].adjacent_edge_count = 8
+
+    normalized = normalize_manufacturing_features(analysis)
+
+    assert len(normalized.planar_machining_features) == 1
+    feature = normalized.planar_machining_features[0]
+    assert feature.kind == "planar_surface"
+    assert feature.source_face_ids == ["PF-1"]
+    assert feature.length == 100
+    assert feature.width == 60
+    assert feature.review_state == "review"

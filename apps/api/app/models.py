@@ -48,6 +48,21 @@ class PrismaticFeature(BaseModel):
     review_reasons: list[str] = Field(default_factory=list)
 
 
+class PlanarMachiningFeature(BaseModel):
+    id: str
+    kind: Literal["planar_surface"] = "planar_surface"
+    source_face_ids: list[str] = Field(default_factory=list)
+    center: Vec3
+    bounds: Bounds
+    access_direction: Vec3
+    length: float = Field(ge=0)
+    width: float = Field(ge=0)
+    depth: float = Field(default=0.05, ge=0)
+    confidence: float = Field(default=0.7, ge=0, le=1)
+    review_state: Literal["accepted", "review", "excluded"] = "review"
+    review_reasons: list[str] = Field(default_factory=list)
+
+
 class InternalProfileFeature(BaseModel):
     id: str
     kind: Literal["internal_profile"] = "internal_profile"
@@ -123,6 +138,7 @@ class GeometryAnalysis(BaseModel):
     planar_features: list[PlanarFeature]
     cylindrical_features: list[CylindricalFeature]
     prismatic_features: list[PrismaticFeature] = Field(default_factory=list)
+    planar_machining_features: list[PlanarMachiningFeature] = Field(default_factory=list)
     internal_profile_features: list[InternalProfileFeature] = Field(default_factory=list)
     solid_candidates: list[SolidCandidate] = Field(default_factory=list)
     rotational_sections: list[RotationalSectionCandidate] = Field(default_factory=list)

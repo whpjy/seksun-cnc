@@ -6,7 +6,7 @@ from math import sqrt
 
 from .models import (
     Bounds, CylindricalFeature, GeometryAnalysis, InternalProfileFeature,
-    PrismaticFeature, Vec3,
+    PlanarMachiningFeature, PrismaticFeature, Vec3,
 )
 
 
@@ -303,6 +303,56 @@ def _recognize_prismatic_features(analysis: GeometryAnalysis) -> list[PrismaticF
     return result
 
 
+def recognize_planar_machining_features(
+    analysis: GeometryAnalysis,
+    prismatic_features: list[PrismaticFeature],
+) -> list[PlanarMachiningFeature]:
+    """Expose substantial outside planar regions as reviewable milling features.
+
+    Pocket bottoms are already represented by prismatic features.  The remaining
+    planes with several descending neighbours are useful setup/milling regions,
+    especially on mill-turn parts whose non-rotational lobes used to disappear
+    from the canonical feature list entirely.
+    """
+
+    consumed_face_ids = {item.source_face_id for item in prismatic_features}
+    result: list[PlanarMachiningFeature] = []
+    for plane in analysis.planar_features:
+        if plane.id in consumed_face_ids or plane.bounds is None:
+            continue
+        axis_index, signed_component = _dominant_axis(plane.normal)
+        if abs(signed_component) < PLANAR_AXIS_TOLERANCE:
+            continue
+        transverse_sizes = sorted(
+            _component(plane.bounds.size, index)
+            for index in range(3)
+            if index != axis_index
+        )
+        if transverse_sizes[0] < 0.3 or plane.area < 0.2:
+            continue
+        # One or two descending neighbours commonly describe an ordinary end
+        # face.  Three or more capture lobes, ears and side-clearance regions.
+        if plane.falling_edge_count < 3:
+            continue
+        confidence = min(0.9, 0.58 + min(plane.falling_edge_count, 8) * 0.04)
+        result.append(PlanarMachiningFeature(
+            id=f"SF-{len(result) + 1}",
+            source_face_ids=[plane.id],
+            center=plane.center,
+            bounds=plane.bounds,
+            access_direction=plane.normal,
+            length=transverse_sizes[1],
+            width=transverse_sizes[0],
+            confidence=confidence,
+            review_state="review",
+            review_reasons=[
+                f"外露平面连接 {plane.falling_edge_count} 条向实体内部延伸的边，识别为平面铣削区域候选",
+                "需结合相邻曲面合并边界，并确认动力刀具进刀方向",
+            ],
+        ))
+    return result
+
+
 def _recognize_internal_profiles(analysis: GeometryAnalysis) -> list[InternalProfileFeature]:
     raw_profiles = [item for item in analysis.internal_profile_features if not item.circular]
     result: list[InternalProfileFeature] = []
@@ -450,5 +500,9 @@ def normalize_manufacturing_features(analysis: GeometryAnalysis) -> GeometryAnal
     analysis.schema_version = "0.5.0"
     analysis.cylindrical_features = merged
     analysis.prismatic_features = _recognize_prismatic_features(analysis)
+    analysis.planar_machining_features = recognize_planar_machining_features(
+        analysis,
+        analysis.prismatic_features,
+    )
     analysis.internal_profile_features = _recognize_internal_profiles(analysis)
     return analysis

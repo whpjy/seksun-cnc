@@ -30,7 +30,7 @@ import { L32ProgramViewer } from "./L32ProgramViewer";
 import { L32Workbench } from "./L32Workbench";
 import { ToolLibraryPanel } from "./ToolLibraryPanel";
 import { ProcessDesigner } from "./ProcessDesigner";
-import type { BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, ManufacturingFeature, Operation, RotationalFeatureAnalysis, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
+import type { BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, ManufacturingFeature, Operation, RotationalFeatureAnalysis, RotationalManufacturingFeature, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 const APP_NAME = (import.meta.env.VITE_APP_NAME ?? "NEXUS CNC").trim() || "NEXUS CNC";
@@ -613,7 +613,6 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
                 <span><strong>{item.stage === "ai_planning" && item.detail ? item.detail : item.message}</strong>
                   {item.stage !== "ai_planning" && item.detail && <small>{item.detail}</small>}
                 </span>
-                <em>{Math.round(item.percent)}%</em>
               </div>;
             })}
           </div>
@@ -851,16 +850,54 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     () => job.analysis?.prismatic_features?.filter((item) => item.review_state !== "excluded") ?? [],
     [job.analysis?.prismatic_features],
   );
+  const planarMachiningFeatures = useMemo(
+    () => job.analysis?.planar_machining_features?.filter((item) => item.review_state !== "excluded") ?? [],
+    [job.analysis?.planar_machining_features],
+  );
   const internalProfiles = useMemo(
     () => job.analysis?.internal_profile_features?.filter((item) => item.review_state !== "excluded") ?? [],
     [job.analysis?.internal_profile_features],
   );
+  const rotationalManufacturingFeatures = useMemo<ManufacturingFeature[]>(() => {
+    if (!l32Rotational) return [];
+    const axes = new Map(l32Rotational.axes.map((axis) => [axis.id, axis]));
+    const profileAxes = new Map(l32Rotational.profiles.map((profile) => [profile.id, axes.get(profile.axis_id)]));
+    return l32Rotational.features
+      .filter((feature) => feature.review_state !== "excluded")
+      .flatMap<RotationalManufacturingFeature>((feature) => {
+        const axis = profileAxes.get(feature.profile_id);
+        if (!axis) return [];
+        const axialCenter = (feature.z_start + feature.z_end) / 2;
+        const radius = Math.max(feature.radius_start, feature.radius_end);
+        return [{
+          id: feature.id,
+          kind: feature.kind,
+          source: "rotational" as const,
+          profile_id: feature.profile_id,
+          center: {
+            x: axis.origin.x + axis.direction.x * axialCenter,
+            y: axis.origin.y + axis.direction.y * axialCenter,
+            z: axis.origin.z + axis.direction.z * axialCenter,
+          },
+          axis: axis.direction,
+          radius,
+          diameter: radius * 2,
+          length: Math.max(feature.width_mm, 0.05),
+          width_mm: feature.width_mm,
+          depth_mm: feature.depth_mm,
+          confidence: feature.confidence,
+          review_state: feature.review_state,
+          review_reasons: feature.review_reasons,
+        }];
+      });
+  }, [l32Rotational]);
   const manufacturingFeatures = useMemo<ManufacturingFeature[]>(
-    () => [...holes, ...prismaticFeatures, ...internalProfiles],
-    [holes, internalProfiles, prismaticFeatures],
+    () => [...holes, ...prismaticFeatures, ...planarMachiningFeatures, ...internalProfiles, ...rotationalManufacturingFeatures],
+    [holes, internalProfiles, planarMachiningFeatures, prismaticFeatures, rotationalManufacturingFeatures],
   );
   const excludedCount = job.analysis?.cylindrical_features.filter((item) => item.kind === "hole" && item.review_state === "excluded").length ?? 0;
   const prismaticExcludedCount = job.analysis?.prismatic_features?.filter((item) => item.review_state === "excluded").length ?? 0;
+  const planarExcludedCount = job.analysis?.planar_machining_features?.filter((item) => item.review_state === "excluded").length ?? 0;
   const internalProfileExcludedCount = job.analysis?.internal_profile_features?.filter((item) => item.review_state === "excluded").length ?? 0;
   const reviewCount = manufacturingFeatures.filter((item) => item.review_state === "review").length;
   const firstReviewFeature = manufacturingFeatures.find((item) => item.review_state === "review");
@@ -1701,19 +1738,40 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   };
 
   const reviewFeature = async (featureId: string, reviewState: "accepted" | "excluded") => {
-    const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/features/${featureId}`), {
+    const rotationalFeature = l32Rotational?.features.some((feature) => feature.id === featureId) ?? false;
+    const endpoint = rotationalFeature
+      ? `/api/v1/jobs/${job.id}/turning/features/${featureId}`
+      : `/api/v1/jobs/${job.id}/features/${featureId}`;
+    const response = await fetch(apiUrl(endpoint), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ review_state: reviewState }),
     });
-    if (!response.ok) return;
-    const updatedJob = await response.json() as Job;
-    setJob(updatedJob);
+    const payload = await response.json() as Job | RotationalFeatureAnalysis | { detail?: string };
+    if (!response.ok) {
+      const detail = "detail" in payload ? payload.detail : undefined;
+      throw new Error(detail || "特征复核保存失败");
+    }
+    let updatedOperations = operations;
+    if (rotationalFeature) {
+      setL32Rotational(payload as RotationalFeatureAnalysis);
+      setL32OperationPreview(null);
+      setL32TurningPreviews({});
+      setL32GroovePreviews({});
+      setL32GrooveSegments({});
+      setL32MillingPreviews({});
+      setL32MaterialSnapshots(null);
+      l32PreviewResponseCacheRef.current.clear();
+      l32PrewarmedOperationIdsRef.current.clear();
+    } else {
+      const updatedJob = payload as Job;
+      setJob(updatedJob);
+      updatedOperations = updatedJob.plan?.setups.flatMap((setup) => setup.operations) ?? [];
+    }
     setCamResult(null);
     setLoadingCam(activeMode === "刀路" || activeMode === "仿真");
-    const updatedOperations = updatedJob.plan?.setups.flatMap((setup) => setup.operations) ?? [];
     const relatedOperation = updatedOperations.find((operation) => operation.feature_ids.includes(featureId));
-    setSelectedOperation(relatedOperation ?? updatedOperations[0] ?? null);
+    if (relatedOperation) setSelectedOperation(relatedOperation);
     setSelectedFeatureIds(reviewState === "excluded" ? [] : [featureId]);
   };
 
@@ -2323,8 +2381,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       <section className="workspace">
         <aside className="workbench-sidebar">
           <nav className="sidebar-view-tabs" aria-label="左侧工作区">
+            <button className={sidebarView === "planning" ? "active" : ""} onClick={() => setSidebarView("planning")}><History size={14} />规划过程</button>
             <button className={sidebarView === "route" ? "active" : ""} onClick={() => setSidebarView("route")}><Layers3 size={14} />工艺路线</button>
-            <button className={sidebarView === "planning" ? "active" : ""} onClick={() => setSidebarView("planning")}><History size={14} />规划过程<span>100%</span></button>
           </nav>
           {sidebarView === "route" ? <section className={`feature-tree panel accordion-panel ${structureExpanded ? "expanded" : "collapsed"}`}>
             <button className="panel-heading accordion-trigger" aria-expanded={structureExpanded} onClick={() => setStructureExpanded((value) => !value)}><Layers3 size={16} /><span>工艺路线</span><small>{job.plan.setups.length} 装夹 · {operations.length} 工序</small><ChevronRight className="accordion-chevron" size={16} /></button>
@@ -2345,11 +2403,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
                   ))}
                 </div>
               ))}
-              <div className="tree-summary"><CircleDot size={14} /> {holes.length} 孔 · {prismaticFeatures.length} 型腔/槽 · {internalProfiles.length} 内轮廓/雕刻 · {reviewCount} 待复核 · 排除 {excludedCount + prismaticExcludedCount + internalProfileExcludedCount}</div>
+              <div className="tree-summary"><CircleDot size={14} /> {holes.length} 孔 · {prismaticFeatures.length} 型腔/槽 · {planarMachiningFeatures.length} 平面区 · {rotationalManufacturingFeatures.length} 回转特征 · {internalProfiles.length} 内轮廓/雕刻 · {reviewCount} 待复核 · 排除 {excludedCount + prismaticExcludedCount + planarExcludedCount + internalProfileExcludedCount}</div>
             </div>}
           </section> : <section className="panel planning-history-panel">
             <header><div><Check size={16} /><strong>工艺规划已完成</strong></div><span>{planningEvents.length} 条记录</span></header>
-            <div className="planning-history-summary"><strong>100%</strong><span>几何分析、AI 工艺审查与能力校验均已完成</span></div>
             <div className="planning-history-events">
               {planningEventsLoading && <p><LoaderCircle className="spin" size={15} />正在加载规划过程…</p>}
               {!planningEventsLoading && planningEventsError && <p className="error"><AlertTriangle size={15} />{planningEventsError}</p>}
@@ -2357,7 +2414,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               {planningEvents.map((item, index) => <div key={`${item.stage}-${item.phase ?? "stage"}-${index}`}>
                 <Check size={14} />
                 <span><strong>{item.detail ?? item.message}</strong>{item.detail && <small>{item.message}</small>}{item.created_at && <time>{new Date(item.created_at).toLocaleTimeString("zh-CN", { hour12: false })}</time>}</span>
-                <em>{Math.round(item.percent)}%</em>
               </div>)}
             </div>
           </section>}
@@ -2402,15 +2458,18 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
                   </div>
                   {selectedFeatures.map((feature: ManufacturingFeature) => (
                     <div className={`feature-card ${feature.review_state}`} key={feature.id}>
-                      {"depth" in feature ? <>
+                      {"source" in feature && feature.source === "rotational" ? <>
+                        <div><span>{feature.id}</span><small>{feature.kind === "external_groove_candidate" ? "外圆槽" : feature.kind === "internal_groove_candidate" ? "内圆槽" : feature.kind === "cylindrical_land" ? "外圆段" : feature.kind === "inner_bore" ? "内孔段" : feature.kind === "cutoff_boundary" ? "切断边界" : feature.kind === "radial_transition" ? "圆弧/台阶过渡" : feature.kind === "thread_form_candidate" ? "螺纹形态候选" : feature.kind === "inner_taper" ? "内锥段" : "外锥段"}</small></div>
+                        <div><strong>Ø{feature.diameter.toFixed(2)} × {feature.width_mm.toFixed(2)}</strong><small>{feature.depth_mm > 0 ? `深 ${feature.depth_mm.toFixed(2)} · ` : ""}{Math.round(feature.confidence * 100)}%</small></div>
+                      </> : "depth" in feature ? <>
                         <div><span>{feature.id}</span><small>{feature.kind === "pocket" ? "封闭型腔" : feature.kind === "slot" ? "贯通槽" : "machining_kind" in feature && feature.machining_kind === "engraving" ? "浅雕刻" : "machining_kind" in feature && feature.machining_kind === "blind_pocket" ? "异形盲型腔" : "异形贯通孔"}</small></div>
                         <div><strong>{feature.length.toFixed(2)} × {feature.width.toFixed(2)}</strong><small>深 {feature.depth.toFixed(2)} · {Math.round(feature.confidence * 100)}%</small></div>
-                      </> : <>
+                      </> : "segment_count" in feature ? <>
                         <div><span>{feature.id}</span><small>{feature.end_type === "through" ? "通孔" : feature.end_type === "blind" ? "盲孔" : "孔端待确认"}</small></div>
                         <div><strong>Ø{feature.diameter.toFixed(2)} × {feature.length.toFixed(2)}</strong><small>{feature.segment_count} 个圆柱面 · {Math.round(feature.confidence * 100)}%</small></div>
-                      </>}
+                      </> : null}
                       {feature.review_reasons.map((reason) => <p key={reason}>{reason}</p>)}
-                      {!readOnly && editingOperationDetails && <div className="feature-actions"><button onClick={() => reviewFeature(feature.id, "accepted")}><Check size={12} />确认特征</button><button onClick={() => reviewFeature(feature.id, "excluded")}><AlertTriangle size={12} />排除</button></div>}
+                      {!readOnly && editingOperationDetails && !("source" in feature && feature.source === "rotational") && <div className="feature-actions"><button onClick={() => reviewFeature(feature.id, "accepted")}><Check size={12} />确认特征</button><button onClick={() => reviewFeature(feature.id, "excluded")}><AlertTriangle size={12} />排除</button></div>}
                     </div>
                   ))}
                 </>
@@ -2451,6 +2510,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             features={viewerFeatures}
             selectedFeatureIds={selectedFeatureIds}
             onSelectFeature={chooseFeature}
+            onReviewFeature={readOnly ? undefined : (feature, reviewState) => reviewFeature(feature.id, reviewState)}
             toolpathSegments={visibleToolpathSegments}
             materialSnapshotUrls={visibleMaterialSnapshots.urls}
             materialSnapshotStages={visibleMaterialSnapshots.stages}

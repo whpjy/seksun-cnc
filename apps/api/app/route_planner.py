@@ -36,7 +36,7 @@ def _part_family(analysis: GeometryAnalysis, plan: ProcessPlan) -> str:
     }:
         return "rotational"
     if non_hole_cylinders and sizes[-1] >= max(sizes[1] * 2.5, 20):
-        return "mixed" if analysis.prismatic_features or analysis.internal_profile_features else "rotational"
+        return "mixed" if analysis.prismatic_features or analysis.planar_machining_features or analysis.internal_profile_features else "rotational"
     if operation_types & {"surface_roughing", "surface_3d", "waterline"}:
         return "freeform"
     axes = {

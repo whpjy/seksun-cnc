@@ -50,6 +50,21 @@ export type PrismaticFeature = {
   review_reasons: string[];
 };
 
+export type PlanarMachiningFeature = {
+  id: string;
+  kind: "planar_surface";
+  source_face_ids: string[];
+  center: Vec3;
+  bounds: Bounds;
+  access_direction: Vec3;
+  length: number;
+  width: number;
+  depth: number;
+  confidence: number;
+  review_state: "accepted" | "review" | "excluded";
+  review_reasons: string[];
+};
+
 export type InternalProfileFeature = {
   id: string;
   kind: "internal_profile";
@@ -74,7 +89,24 @@ export type InternalProfileFeature = {
   review_reasons: string[];
 };
 
-export type ManufacturingFeature = CylindricalFeature | PrismaticFeature | InternalProfileFeature;
+export type RotationalManufacturingFeature = {
+  id: string;
+  kind: RotationalFeatureAnalysis["features"][number]["kind"];
+  source: "rotational";
+  profile_id: string;
+  center: Vec3;
+  axis: Vec3;
+  radius: number;
+  diameter: number;
+  length: number;
+  width_mm: number;
+  depth_mm: number;
+  confidence: number;
+  review_state: "accepted" | "review" | "excluded";
+  review_reasons: string[];
+};
+
+export type ManufacturingFeature = CylindricalFeature | PrismaticFeature | PlanarMachiningFeature | InternalProfileFeature | RotationalManufacturingFeature;
 
 export type ToolpathSegment = {
   operation_id: string;
@@ -953,6 +985,7 @@ export type Job = {
     planar_features: PlanarFeature[];
     cylindrical_features: CylindricalFeature[];
     prismatic_features: PrismaticFeature[];
+    planar_machining_features?: PlanarMachiningFeature[];
     internal_profile_features: InternalProfileFeature[];
     visual_edges: Vec3[][];
   } | null;

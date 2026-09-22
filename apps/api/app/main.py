@@ -46,7 +46,7 @@ from .collision import build_safety_configuration, detect_collisions
 from .conformance import compare_stock_to_target_mesh
 from .preflight import verify_cam
 from .simulation import simulate_material_removal
-from .recognizer import normalize_manufacturing_features
+from .recognizer import normalize_manufacturing_features, recognize_planar_machining_features
 from .engines import probe_engine, resolve_executable, run_camotics, run_freecad_adapter
 from .forming import build_forming_preview
 from .qwen import QwenPlanningError, probe_qwen, qwen_config_payload, review_process_plan
@@ -302,7 +302,13 @@ def load_job(job_id: str) -> JobResponse:
     metadata_path = job_directory(job_id) / "job.json"
     if not metadata_path.is_file():
         raise HTTPException(status_code=404, detail="Job not found")
-    return JobResponse.model_validate_json(metadata_path.read_text(encoding="utf-8"))
+    job = JobResponse.model_validate_json(metadata_path.read_text(encoding="utf-8"))
+    if job.analysis and "planar_machining_features" not in job.analysis.model_fields_set:
+        job.analysis.planar_machining_features = recognize_planar_machining_features(
+            job.analysis,
+            job.analysis.prismatic_features,
+        )
+    return job
 
 
 def save_job(directory: Path, job: JobResponse) -> None:
@@ -1823,7 +1829,8 @@ def _process_new_job(
         rotational_analysis = persist_rotational_analysis(directory, job, analysis)
         feature_count = (
             len(analysis.planar_features) + len(analysis.cylindrical_features)
-            + len(analysis.prismatic_features) + len(analysis.internal_profile_features)
+            + len(analysis.prismatic_features) + len(analysis.planar_machining_features)
+            + len(analysis.internal_profile_features)
         )
         job.analysis = analysis
         job.model_url = f"/api/v1/jobs/{job_id}/files/model.stl"
@@ -2282,6 +2289,42 @@ def review_job_rotational_profile(
     save_job(directory, job)
     invalidate_cam_artifacts(directory)
     return result
+
+
+@app.patch(
+    "/api/v1/jobs/{job_id}/turning/features/{feature_id}",
+    response_model=RotationalFeatureAnalysis,
+)
+def review_job_rotational_feature(
+    job_id: str, feature_id: str, request: FeatureReviewRequest,
+) -> RotationalFeatureAnalysis:
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="Rotational feature review requires an L32 job")
+    directory = job_directory(job_id)
+    path = directory / "rotational-features.json"
+    if not path.is_file():
+        raise HTTPException(status_code=409, detail="Rotational analysis is not available")
+    try:
+        analysis = RotationalFeatureAnalysis.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=500, detail="Stored rotational analysis is invalid") from error
+    feature = next((item for item in analysis.features if item.id == feature_id), None)
+    if feature is None:
+        raise HTTPException(status_code=404, detail="Rotational feature not found")
+    feature.review_state = request.review_state
+    if request.review_state == "accepted":
+        feature.confidence = max(feature.confidence, 0.9)
+        reason = "制造工程师已人工确认该回转子特征"
+        if reason not in feature.review_reasons:
+            feature.review_reasons.append(reason)
+    elif request.review_state == "excluded":
+        reason = "制造工程师已从自动工艺规划中排除该回转子特征"
+        if reason not in feature.review_reasons:
+            feature.review_reasons.append(reason)
+    write_json(path, analysis.model_dump(mode="json"))
+    invalidate_cam_artifacts(directory)
+    return analysis
 
 
 @app.post("/api/v1/jobs/{job_id}/manufacturing-requirements", response_model=JobResponse)
@@ -3312,6 +3355,7 @@ def review_feature(job_id: str, feature_id: str, request: FeatureReviewRequest) 
             item for item in [
                 *job.analysis.cylindrical_features,
                 *job.analysis.prismatic_features,
+                *job.analysis.planar_machining_features,
                 *job.analysis.internal_profile_features,
             ] if item.id == feature_id
         ),
@@ -3387,6 +3431,9 @@ def _feature_type(job: JobResponse, feature_id: str) -> str | None:
     prismatic = next((item for item in job.analysis.prismatic_features if item.id == feature_id), None)
     if prismatic:
         return f"prismatic_{prismatic.kind}"
+    planar_machining = next((item for item in job.analysis.planar_machining_features if item.id == feature_id), None)
+    if planar_machining:
+        return "planar_surface"
     # L32 accepted rotational entities are stored outside GeometryAnalysis.
     # Only IDs already referenced by the formal plan are eligible here; a
     # client cannot invent an RP/TPF identifier to bypass geometry checks.

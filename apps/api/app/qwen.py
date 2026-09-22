@@ -450,7 +450,8 @@ def review_process_plan(
     schema = AIProcessReview.model_json_schema()
     feature_count = (
         len(analysis.planar_features) + len(analysis.cylindrical_features)
-        + len(analysis.prismatic_features) + len(analysis.internal_profile_features)
+        + len(analysis.prismatic_features) + len(analysis.planar_machining_features)
+        + len(analysis.internal_profile_features)
     )
     setup_count = len(plan.setups)
     operation_count = sum(len(setup.operations) for setup in plan.setups)

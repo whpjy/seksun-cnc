@@ -7,8 +7,7 @@ from app.main import app
 from app.machine_models import MachineInstance
 from app.models import GeometryAnalysis, JobResponse, PlanarFeature, PrismaticFeature, RotationalSectionCandidate
 from app.planner import build_process_plan
-from app.rotational_features import infer_rotational_features
-from app.rotational_features import clip_rotational_profile
+from app.rotational_features import RotationalFeatureAnalysis, clip_rotational_profile, infer_rotational_features
 from app.requirements_adapter import import_measurement_specification
 from app.turning_draft import TurningDraftRequest, compile_turning_draft
 from app.turning_simulation import simulate_turning_stock
@@ -1044,6 +1043,46 @@ def test_profile_review_updates_the_formal_plan_and_invalidates_cam(tmp_path, mo
     assert persisted.plan.stock["profile_review_state"] == "accepted"
     assert persisted.plan.coverage is not None
     assert persisted.plan.coverage.targets[-1].state == "covered"
+    assert not (directory / "toolpath.json").exists()
+
+
+def test_rotational_child_feature_review_persists_and_invalidates_cam(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "d" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    analysis = shaft_analysis()
+    job = JobResponse(
+        id=job_id,
+        status="completed",
+        filename="shaft.step",
+        created_at="2026-09-22T00:00:00+00:00",
+        material="S45C",
+        machine="Citizen Cincom L32",
+        device_id="citizen-cincom-l32",
+        analysis=analysis,
+        plan=build_process_plan(analysis, "S45C", "Citizen Cincom L32"),
+    )
+    main.save_job(directory, job)
+    rotational = infer_rotational_features(analysis)
+    assert rotational.features
+    feature_id = rotational.features[0].id
+    main.write_json(directory / "rotational-features.json", rotational.model_dump(mode="json"))
+    (directory / "toolpath.json").write_text("{}", encoding="utf-8")
+
+    response = client.patch(
+        f"/api/v1/jobs/{job_id}/turning/features/{feature_id}",
+        json={"review_state": "accepted"},
+    )
+
+    assert response.status_code == 200
+    reviewed = next(item for item in response.json()["features"] if item["id"] == feature_id)
+    assert reviewed["review_state"] == "accepted"
+    assert reviewed["confidence"] >= 0.9
+    persisted = RotationalFeatureAnalysis.model_validate_json(
+        (directory / "rotational-features.json").read_text(encoding="utf-8"),
+    )
+    assert next(item for item in persisted.features if item.id == feature_id).review_state == "accepted"
     assert not (directory / "toolpath.json").exists()
 
 

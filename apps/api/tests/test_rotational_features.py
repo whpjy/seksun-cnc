@@ -265,6 +265,29 @@ def test_rounded_groove_depth_uses_stable_lands_not_first_arc_chords() -> None:
     assert groove.depth_mm == 1
 
 
+def test_collapses_sampled_radius_chords_into_semantic_transitions() -> None:
+    profile = RotationalProfile(
+        id="RP-SAMPLED-RADIUS", axis_id="RA-1", side="outer",
+        extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=z_value, radius=radius)
+            for z_value, radius in [
+                (-1.0, 2.0), (-0.8, 1.98), (-0.6, 1.88),
+                (-0.4, 1.68), (-0.2, 1.38), (0.0, 1.0),
+                (1.0, 1.0),
+            ]
+        ],
+        confidence=0.8,
+    )
+
+    features = _extract_profile_features(profile)
+    transitions = [item for item in features if item.kind == "radial_transition"]
+
+    assert len(transitions) == 1
+    assert transitions[0].source_point_indices == [0, 1, 2, 3, 4, 5]
+    assert not any(item.kind == "taper" for item in features)
+
+
 def test_external_groove_is_bridged_for_longitudinal_od_turning() -> None:
     profile = RotationalProfile(
         id="RP-GROOVE", axis_id="RA-1", side="outer",
