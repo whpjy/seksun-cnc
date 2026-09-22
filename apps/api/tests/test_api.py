@@ -306,6 +306,14 @@ def test_job_progress_stream_replays_structured_events(tmp_path, monkeypatch) ->
     assert '"feature_count": 12' in response.text
     assert '"operation_count": 4' in response.text
     assert '"stage": "completed"' in response.text
+    persisted = json.loads((directory / "planning-events.json").read_text(encoding="utf-8"))
+    assert [item["stage"] for item in persisted] == ["geometry_analysis", "completed"]
+
+    with main.JOB_EVENT_CONDITION:
+        main.JOB_EVENT_LOGS.pop(job_id, None)
+    history_response = client.get(f"/api/v1/jobs/{job_id}/planning-events")
+    assert history_response.status_code == 200
+    assert [item["stage"] for item in history_response.json()] == ["geometry_analysis", "completed"]
 
 
 def test_safe_cam_remediation_updates_plan_and_records_iteration(tmp_path, monkeypatch) -> None:

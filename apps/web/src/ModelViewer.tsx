@@ -41,6 +41,14 @@ type Props = {
   activeOperationLabel?: string;
 };
 
+const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
+const EMPTY_MATERIAL_SNAPSHOT_URLS: string[] = [];
+const EMPTY_MATERIAL_SNAPSHOT_STAGES: { operationId: string; start: number; count: number }[] = [];
+const EMPTY_PROFILE_BOUNDARIES: NonNullable<Props["profileBoundaries"]> = [];
+const EMPTY_FIXTURE_COMPONENTS: FixtureComponent[] = [];
+const EMPTY_OPERATION_TOOLS: NonNullable<Props["operationTools"]> = {};
+const EMPTY_TOPOLOGY_EDGES: Vec3[][] = [];
+
 // Siemens NX/UG-style neutral blue-gray: dark enough to preserve the part's
 // silhouette while still allowing the lighting to describe fillets and ribs.
 const UG_PART_COLOR = 0x6f7b7d;
@@ -54,7 +62,7 @@ function featureMarkerColor(feature: ManufacturingFeature) {
   return 0x18b89a;
 }
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = [], materialSnapshotUrls = [], materialSnapshotStages = [], initialToolpathSegments = [], profileBoundaries = [], simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = [], animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = {}, topologyEdges = [], activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", workAxis = null, activeOperationLabel = "" }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", workAxis = null, activeOperationLabel = "" }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());

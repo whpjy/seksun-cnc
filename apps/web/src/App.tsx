@@ -39,6 +39,9 @@ const APP_LOGO_TEXT = (import.meta.env.VITE_APP_LOGO_TEXT ?? "N").trim().slice(0
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
 const EMPTY_PROFILE_BOUNDARIES: { operation_id: string; setup_id: string; work_axis: Vec3; points: Vec3[] }[] = [];
 const EMPTY_MATERIAL_SNAPSHOTS: { urls: string[]; stages: { operationId: string; start: number; count: number }[] } = { urls: [], stages: [] };
+const EMPTY_MANUFACTURING_FEATURES: ManufacturingFeature[] = [];
+const EMPTY_SELECTED_FEATURE_IDS: string[] = [];
+const IGNORE_FEATURE_SELECTION = () => undefined;
 function apiUrl(path: string) {
   return `${API_BASE}${path}`;
 }
@@ -47,7 +50,10 @@ type PlanningProgressEvent = {
   stage: string;
   message: string;
   detail?: string;
+  phase?: string;
+  created_at?: string;
   percent: number;
+  model_url?: string;
   feature_count?: number;
   hole_count?: number;
   requirement_count?: number;
@@ -190,11 +196,6 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   canClose?: boolean;
 }) {
   const stepInputRef = useRef<HTMLInputElement>(null);
-  const planningStreamRef = useRef<EventSource | null>(null);
-  const planningPresentationTimerRef = useRef<number | null>(null);
-  const planningPresentationQueueRef = useRef<PlanningProgressEvent[]>([]);
-  const pendingActiveStageUpdateRef = useRef<PlanningProgressEvent | null>(null);
-  const activePlanningStageRef = useRef<string | null>(null);
   const [stepFile, setStepFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -202,29 +203,13 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   const [newJobDevices, setNewJobDevices] = useState<DeviceLibrary["devices"]>([]);
   const [selectedNewJobDeviceId, setSelectedNewJobDeviceId] = useState("");
 
-  useEffect(() => () => {
-    planningStreamRef.current?.close();
-    if (planningPresentationTimerRef.current !== null) {
-      window.clearTimeout(planningPresentationTimerRef.current);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (open) return;
-    planningStreamRef.current?.close();
-    planningStreamRef.current = null;
-    if (planningPresentationTimerRef.current !== null) {
-      window.clearTimeout(planningPresentationTimerRef.current);
-      planningPresentationTimerRef.current = null;
-    }
-    planningPresentationQueueRef.current = [];
-    pendingActiveStageUpdateRef.current = null;
-    activePlanningStageRef.current = null;
+  const closeDialog = useCallback(() => {
     setStepFile(null);
     setBusy(false);
     setError("");
     setProgressEvents([]);
-  }, [open]);
+    onClose();
+  }, [onClose]);
 
   useEffect(() => {
     if (!open || newJobDevices.length) return;
@@ -241,21 +226,14 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   useEffect(() => {
     if (!open || !canClose) return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) onClose();
+      if (event.key === "Escape" && !busy) closeDialog();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [busy, canClose, onClose, open]);
+  }, [busy, canClose, closeDialog, open]);
 
   const submit = async () => {
     if (!stepFile || !selectedNewJobDeviceId) return;
-    if (planningPresentationTimerRef.current !== null) {
-      window.clearTimeout(planningPresentationTimerRef.current);
-      planningPresentationTimerRef.current = null;
-    }
-    planningPresentationQueueRef.current = [];
-    pendingActiveStageUpdateRef.current = null;
-    activePlanningStageRef.current = "uploading";
     setBusy(true);
     setError("");
     setProgressEvents([{ stage: "uploading", message: "正在上传三维模型", percent: 2 }]);
@@ -267,115 +245,10 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "分析失败");
       const pendingJob = payload as Job;
-      const stream = new EventSource(apiUrl(`/api/v1/jobs/${pendingJob.id}/events`));
-      planningStreamRef.current = stream;
-      const pacedStages = new Set(["geometry_analysis", "draft_planning"]);
-
-      const presentUpdate = async (update: PlanningProgressEvent) => {
-        activePlanningStageRef.current = update.stage;
-        setProgressEvents((current) => {
-          const withoutStage = current.filter((item) => item.stage !== update.stage);
-          return [...withoutStage, update].sort(
-            (left, right) => PLANNING_STAGE_ORDER.indexOf(left.stage) - PLANNING_STAGE_ORDER.indexOf(right.stage),
-          );
-        });
-        if (update.stage === "error") {
-          setError(update.message);
-          setBusy(false);
-          return;
-        }
-        if (update.stage === "completed") {
-          try {
-            const jobResponse = await fetch(apiUrl(`/api/v1/jobs/${pendingJob.id}`));
-            const completedJob = await jobResponse.json();
-            if (!jobResponse.ok || completedJob.status !== "completed") {
-              throw new Error(completedJob.detail || completedJob.error || "无法加载生成结果");
-            }
-            setStepFile(null);
-            setBusy(false);
-            setProgressEvents([]);
-            activePlanningStageRef.current = null;
-            onCreated(completedJob as Job);
-          } catch (reason) {
-            setError(reason instanceof Error ? reason.message : "无法加载生成结果");
-            setBusy(false);
-          }
-        }
-      };
-
-      const drainPresentationQueue = () => {
-        if (planningPresentationTimerRef.current !== null) return;
-        const update = planningPresentationQueueRef.current.shift();
-        if (!update) return;
-        void presentUpdate(update);
-        if (pacedStages.has(update.stage)) {
-          const delay = 5_000 + Math.floor(Math.random() * 5_001);
-          planningPresentationTimerRef.current = window.setTimeout(() => {
-            const finalStageUpdate = pendingActiveStageUpdateRef.current;
-            pendingActiveStageUpdateRef.current = null;
-            if (finalStageUpdate) void presentUpdate(finalStageUpdate);
-            planningPresentationTimerRef.current = null;
-            drainPresentationQueue();
-          }, delay);
-          return;
-        }
-        if (update.stage === "ai_planning" && planningPresentationQueueRef.current.length > 0) {
-          const delay = 3_000 + Math.floor(Math.random() * 2_001);
-          planningPresentationTimerRef.current = window.setTimeout(() => {
-            planningPresentationTimerRef.current = null;
-            drainPresentationQueue();
-          }, delay);
-          return;
-        }
-        drainPresentationQueue();
-      };
-
-      const enqueueUpdate = (update: PlanningProgressEvent) => {
-        if (update.stage === "error") {
-          stream.close();
-          planningStreamRef.current = null;
-          planningPresentationQueueRef.current = [];
-          pendingActiveStageUpdateRef.current = null;
-          if (planningPresentationTimerRef.current !== null) {
-            window.clearTimeout(planningPresentationTimerRef.current);
-            planningPresentationTimerRef.current = null;
-          }
-          void presentUpdate(update);
-          return;
-        }
-        if (update.stage === "completed") {
-          stream.close();
-          planningStreamRef.current = null;
-        }
-        if (activePlanningStageRef.current === update.stage) {
-          if (planningPresentationTimerRef.current !== null && pacedStages.has(update.stage)) {
-            pendingActiveStageUpdateRef.current = update;
-            return;
-          }
-          if (planningPresentationTimerRef.current !== null && update.stage === "ai_planning") {
-            planningPresentationQueueRef.current.push(update);
-            return;
-          }
-          void presentUpdate(update);
-          return;
-        }
-        if (update.stage === "ai_planning") {
-          planningPresentationQueueRef.current.push(update);
-          drainPresentationQueue();
-          return;
-        }
-        const queuedIndex = planningPresentationQueueRef.current.findIndex((item) => item.stage === update.stage);
-        if (queuedIndex >= 0) {
-          planningPresentationQueueRef.current[queuedIndex] = update;
-        } else {
-          planningPresentationQueueRef.current.push(update);
-        }
-        drainPresentationQueue();
-      };
-
-      stream.onmessage = (event) => {
-        enqueueUpdate(JSON.parse(event.data) as PlanningProgressEvent);
-      };
+      setStepFile(null);
+      setBusy(false);
+      setProgressEvents([]);
+      onCreated(pendingJob);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法连接分析服务");
       setBusy(false);
@@ -385,11 +258,11 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   if (!open) return null;
 
   return (
-    <div className="new-job-backdrop" onMouseDown={() => canClose && !busy && onClose()}>
+    <div className="new-job-backdrop" onMouseDown={() => canClose && !busy && closeDialog()}>
       <section className="new-job-dialog" role="dialog" aria-modal="true" aria-labelledby="new-job-title" onMouseDown={(event) => event.stopPropagation()}>
         <header>
           <div><span className="dialog-icon"><FileUp size={18} /></span><div><strong id="new-job-title">新建工艺任务</strong><small>上传三维模型，自动识别特征并规划工序</small></div></div>
-          {canClose && <button aria-label="关闭新建任务" disabled={busy} onClick={onClose}><X size={17} /></button>}
+          {canClose && <button aria-label="关闭新建任务" disabled={busy} onClick={closeDialog}><X size={17} /></button>}
         </header>
         {busy ? <div className="planning-progress" aria-live="polite">
           <div className="planning-progress-head">
@@ -575,6 +448,188 @@ function HistoryDialog({ activeJobId, onClose, onSelected, onDeleted }: { active
   </div>;
 }
 
+function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
+  initialJob: Job;
+  onCompleted: (job: Job) => void;
+  onNew: () => void;
+  onHistory: () => void;
+}) {
+  const streamRef = useRef<EventSource | null>(null);
+  const timerRef = useRef<number | null>(null);
+  const queueRef = useRef<PlanningProgressEvent[]>([]);
+  const pendingStageUpdateRef = useRef<PlanningProgressEvent | null>(null);
+  const activeStageRef = useRef<string | null>("uploading");
+  const [previewJob, setPreviewJob] = useState(initialJob);
+  const [progressEvents, setProgressEvents] = useState<PlanningProgressEvent[]>([
+    { stage: "uploading", message: "三维模型上传完成", percent: 6 },
+  ]);
+  const [error, setError] = useState(initialJob.error ?? "");
+  const latestProgress = progressEvents.at(-1);
+
+  useEffect(() => {
+    const pacedStages = new Set(["geometry_analysis", "draft_planning"]);
+    let disposed = false;
+
+    const refreshJob = async (expectCompleted = false) => {
+      try {
+        const response = await fetch(apiUrl(`/api/v1/jobs/${initialJob.id}`), { cache: "no-store" });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || "无法加载任务状态");
+        if (disposed) return;
+        const refreshed = payload as Job;
+        setPreviewJob(refreshed);
+        if (expectCompleted || refreshed.status === "completed") onCompleted(refreshed);
+        else if (refreshed.status === "failed") setError(refreshed.error || "工艺规划失败");
+      } catch (reason) {
+        if (!disposed) setError(reason instanceof Error ? reason.message : "无法加载任务状态");
+      }
+    };
+
+    const presentUpdate = (update: PlanningProgressEvent) => {
+      activeStageRef.current = update.stage;
+      setProgressEvents((current) => {
+        if (update.stage === "ai_planning") return [...current, update];
+        const withoutStage = current.filter((item) => item.stage !== update.stage);
+        return [...withoutStage, update].sort(
+          (left, right) => PLANNING_STAGE_ORDER.indexOf(left.stage) - PLANNING_STAGE_ORDER.indexOf(right.stage),
+        );
+      });
+      if (update.stage === "error") {
+        setError(update.message);
+        return;
+      }
+      if (update.stage === "completed") void refreshJob(true);
+    };
+
+    const drainQueue = () => {
+      if (timerRef.current !== null) return;
+      const update = queueRef.current.shift();
+      if (!update) return;
+      presentUpdate(update);
+      if (pacedStages.has(update.stage)) {
+        const delay = 5_000 + Math.floor(Math.random() * 5_001);
+        timerRef.current = window.setTimeout(() => {
+          const finalStageUpdate = pendingStageUpdateRef.current;
+          pendingStageUpdateRef.current = null;
+          if (finalStageUpdate) presentUpdate(finalStageUpdate);
+          timerRef.current = null;
+          drainQueue();
+        }, delay);
+        return;
+      }
+      if (update.stage === "ai_planning" && queueRef.current.length > 0) {
+        const delay = 3_000 + Math.floor(Math.random() * 2_001);
+        timerRef.current = window.setTimeout(() => {
+          timerRef.current = null;
+          drainQueue();
+        }, delay);
+        return;
+      }
+      drainQueue();
+    };
+
+    const enqueueUpdate = (update: PlanningProgressEvent) => {
+      if (update.model_url) setPreviewJob((current) => ({ ...current, model_url: update.model_url ?? current.model_url }));
+      if (update.stage === "error") {
+        streamRef.current?.close();
+        streamRef.current = null;
+        queueRef.current = [];
+        pendingStageUpdateRef.current = null;
+        if (timerRef.current !== null) {
+          window.clearTimeout(timerRef.current);
+          timerRef.current = null;
+        }
+        presentUpdate(update);
+        return;
+      }
+      if (update.stage === "completed") {
+        streamRef.current?.close();
+        streamRef.current = null;
+      }
+      if (activeStageRef.current === update.stage) {
+        if (timerRef.current !== null && pacedStages.has(update.stage)) {
+          pendingStageUpdateRef.current = update;
+          return;
+        }
+        if (timerRef.current !== null && update.stage === "ai_planning") {
+          queueRef.current.push(update);
+          return;
+        }
+        presentUpdate(update);
+        return;
+      }
+      if (update.stage === "ai_planning") queueRef.current.push(update);
+      else {
+        const queuedIndex = queueRef.current.findIndex((item) => item.stage === update.stage);
+        if (queuedIndex >= 0) queueRef.current[queuedIndex] = update;
+        else queueRef.current.push(update);
+      }
+      drainQueue();
+    };
+
+    const stream = new EventSource(apiUrl(`/api/v1/jobs/${initialJob.id}/events`));
+    streamRef.current = stream;
+    stream.onmessage = (event) => enqueueUpdate(JSON.parse(event.data) as PlanningProgressEvent);
+    stream.onerror = () => {
+      if (!disposed) void refreshJob();
+    };
+
+    return () => {
+      disposed = true;
+      stream.close();
+      streamRef.current = null;
+      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+      queueRef.current = [];
+      pendingStageUpdateRef.current = null;
+    };
+  }, [initialJob.id, onCompleted]);
+
+  return <main className="workbench processing-workbench">
+    <header className="topbar app-header">
+      <div className="brand compact"><span>{APP_LOGO_TEXT}</span>{APP_NAME}</div>
+      <div className="project-title"><strong>{initialJob.filename}</strong></div>
+      <div className="top-meta"><span className="planning-header-state"><LoaderCircle className="spin" size={13} />工艺规划中</span></div>
+      <div className="header-actions">
+        <button className="header-command-button" onClick={onNew}><FileUp size={14} />新建任务</button>
+        <button className="header-command-button" onClick={onHistory}><History size={14} />历史记录</button>
+        <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
+      </div>
+    </header>
+    <nav className="compact-mode-toolbar processing-mode-toolbar" aria-label="工作模式">
+      {["特征", "工艺", "刀路", "仿真"].map((mode) => <button key={mode} className={mode === "工艺" ? "active" : ""} disabled>{mode}</button>)}
+    </nav>
+    <section className="workspace processing-workspace">
+      <aside className="workbench-sidebar processing-sidebar">
+        <section className="panel planning-workbench-panel">
+          <header><div><LoaderCircle className="spin" size={16} /><strong>正在生成工艺方案</strong></div><span>{Math.round(latestProgress?.percent ?? 6)}%</span></header>
+          <div className="planning-progress-track"><i style={{ width: `${latestProgress?.percent ?? 6}%` }} /></div>
+          <p>{latestProgress?.detail ?? latestProgress?.message ?? "正在准备工艺规划"}</p>
+          <div className="planning-workbench-stages">
+            {progressEvents.filter((item) => item.stage !== "completed").map((item, index, items) => {
+              const active = index === items.length - 1 && !error;
+              return <div className={active ? "active" : "done"} key={`${item.stage}-${item.phase ?? "stage"}-${index}`}>
+                {active ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
+                <span><strong>{item.stage === "ai_planning" && item.detail ? item.detail : item.message}</strong>
+                  {item.stage !== "ai_planning" && item.detail && <small>{item.detail}</small>}
+                </span>
+                <em>{Math.round(item.percent)}%</em>
+              </div>;
+            })}
+          </div>
+          {error && <div className="planning-workbench-error"><AlertTriangle size={15} /><span>{error}</span><button onClick={onNew}>新建任务</button></div>}
+        </section>
+      </aside>
+      <section className="viewport panel processing-viewport">
+        {previewJob.model_url
+          ? <ModelViewer modelUrl={apiUrl(previewJob.model_url)} features={EMPTY_MANUFACTURING_FEATURES} selectedFeatureIds={EMPTY_SELECTED_FEATURE_IDS} onSelectFeature={IGNORE_FEATURE_SELECTION} viewMode="特征" />
+          : <div className="processing-model-placeholder"><LoaderCircle className="spin" size={28} /><strong>正在构建三维预览</strong><small>完成 STEP 拓扑解析后将在这里显示原始模型</small></div>}
+        {!previewJob.model_url && <div className="processing-model-badge"><Box size={14} /><span>模型解析中</span></div>}
+      </section>
+    </section>
+  </main>;
+}
+
 function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initialJob: Job; onNew: () => void; onHistory: () => void; readOnly?: boolean }) {
   const [job, setJob] = useState(initialJob);
   const jobSnapshotRef = useRef(JSON.stringify(initialJob));
@@ -613,6 +668,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [solidBusy, setSolidBusy] = useState(false);
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
   const [structureExpanded, setStructureExpanded] = useState(true);
+  const [sidebarView, setSidebarView] = useState<"route" | "planning">("route");
+  const [planningEvents, setPlanningEvents] = useState<PlanningProgressEvent[]>([]);
+  const [planningEventsLoading, setPlanningEventsLoading] = useState(true);
+  const [planningEventsError, setPlanningEventsError] = useState("");
   const [showOperationDetails, setShowOperationDetails] = useState(false);
   const [editingOperationDetails, setEditingOperationDetails] = useState(false);
   const [toolDraftId, setToolDraftId] = useState(selectedOperation?.tool.id ?? "");
@@ -664,6 +723,23 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   useEffect(() => {
     jobSnapshotRef.current = JSON.stringify(job);
   }, [job]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(apiUrl(`/api/v1/jobs/${initialJob.id}/planning-events`), { cache: "no-store" })
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || "规划过程加载失败");
+        if (!cancelled) setPlanningEvents(payload as PlanningProgressEvent[]);
+      })
+      .catch((reason) => {
+        if (!cancelled) setPlanningEventsError(reason instanceof Error ? reason.message : "规划过程加载失败");
+      })
+      .finally(() => {
+        if (!cancelled) setPlanningEventsLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [initialJob.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2246,7 +2322,11 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
 
       <section className="workspace">
         <aside className="workbench-sidebar">
-          <section className={`feature-tree panel accordion-panel ${structureExpanded ? "expanded" : "collapsed"}`}>
+          <nav className="sidebar-view-tabs" aria-label="左侧工作区">
+            <button className={sidebarView === "route" ? "active" : ""} onClick={() => setSidebarView("route")}><Layers3 size={14} />工艺路线</button>
+            <button className={sidebarView === "planning" ? "active" : ""} onClick={() => setSidebarView("planning")}><History size={14} />规划过程<span>100%</span></button>
+          </nav>
+          {sidebarView === "route" ? <section className={`feature-tree panel accordion-panel ${structureExpanded ? "expanded" : "collapsed"}`}>
             <button className="panel-heading accordion-trigger" aria-expanded={structureExpanded} onClick={() => setStructureExpanded((value) => !value)}><Layers3 size={16} /><span>工艺路线</span><small>{job.plan.setups.length} 装夹 · {operations.length} 工序</small><ChevronRight className="accordion-chevron" size={16} /></button>
             {structureExpanded && <div className="panel-content">
               <div className="tree-section"><strong><Box size={15} /> 毛坯</strong><small>{String((job.plan.stock.size_mm as number[])?.join(" × "))} mm</small></div>
@@ -2267,7 +2347,20 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               ))}
               <div className="tree-summary"><CircleDot size={14} /> {holes.length} 孔 · {prismaticFeatures.length} 型腔/槽 · {internalProfiles.length} 内轮廓/雕刻 · {reviewCount} 待复核 · 排除 {excludedCount + prismaticExcludedCount + internalProfileExcludedCount}</div>
             </div>}
-          </section>
+          </section> : <section className="panel planning-history-panel">
+            <header><div><Check size={16} /><strong>工艺规划已完成</strong></div><span>{planningEvents.length} 条记录</span></header>
+            <div className="planning-history-summary"><strong>100%</strong><span>几何分析、AI 工艺审查与能力校验均已完成</span></div>
+            <div className="planning-history-events">
+              {planningEventsLoading && <p><LoaderCircle className="spin" size={15} />正在加载规划过程…</p>}
+              {!planningEventsLoading && planningEventsError && <p className="error"><AlertTriangle size={15} />{planningEventsError}</p>}
+              {!planningEventsLoading && !planningEventsError && planningEvents.length === 0 && <p>该任务生成时尚未保存规划过程。</p>}
+              {planningEvents.map((item, index) => <div key={`${item.stage}-${item.phase ?? "stage"}-${index}`}>
+                <Check size={14} />
+                <span><strong>{item.detail ?? item.message}</strong>{item.detail && <small>{item.message}</small>}{item.created_at && <time>{new Date(item.created_at).toLocaleTimeString("zh-CN", { hour12: false })}</time>}</span>
+                <em>{Math.round(item.percent)}%</em>
+              </div>)}
+            </div>
+          </section>}
 
           {showOperationDetails && selectedOperation && <section ref={operationPopoverRef} className="operation-popover inspector panel" style={{ top: operationPopoverPosition.top, left: operationPopoverPosition.left, "--operation-anchor-y": `${operationPopoverPosition.anchorY}px` } as CSSProperties}>
             <header className="operation-popover-heading"><div><Bot size={16} /><span>工序详情</span><small>{selectedOperation.id}</small></div><div className="operation-popover-actions">{!readOnly && !editingOperationDetails && <button className="edit-operation-button" aria-label="编辑工序" title="编辑" onClick={() => { setEditingOperationDetails(true); setToolDraftId(selectedOperation.tool.id); setOperationMessage(""); }}><Pencil size={13} /></button>}<button aria-label="关闭工序详情" title="关闭" onClick={() => { setEditingOperationDetails(false); setShowOperationDetails(false); }}><X size={15} /></button></div></header>
@@ -2505,6 +2598,12 @@ export default function App() {
     setSessionError("");
   };
 
+  const completePlanningJob = useCallback((completedJob: Job) => {
+    setJob(completedJob);
+    setReadOnly(false);
+    setSessionError("");
+  }, []);
+
   const handleDeletedJob = (jobId: string) => {
     if (job?.id !== jobId) return;
     window.history.replaceState({}, "", "/");
@@ -2516,7 +2615,9 @@ export default function App() {
   if (loadingSession) return <div className="fatal-state"><LoaderCircle className="spin" />正在加载任务会话…</div>;
   return <>
     {job
-      ? <Workbench key={job.id} initialJob={job} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} readOnly={readOnly} />
+      ? job.status === "completed"
+        ? <Workbench key={job.id} initialJob={job} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} readOnly={readOnly} />
+        : <ProcessingWorkbench key={job.id} initialJob={job} onCompleted={completePlanningJob} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} />
       : <EmptyWorkbench error={sessionError} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} />}
     <NewJobDialog open={showNewJob} canClose onClose={() => setShowNewJob(false)} onCreated={openJob} />
     {showHistory && <HistoryDialog activeJobId={job?.id} onClose={() => setShowHistory(false)} onSelected={openJob} onDeleted={handleDeletedJob} />}

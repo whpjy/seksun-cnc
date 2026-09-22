@@ -107,7 +107,13 @@ def publish_job_event(job_id: str, stage: str, message: str, percent: float, **d
         **{key: value for key, value in details.items() if value is not None},
     }
     with JOB_EVENT_CONDITION:
-        JOB_EVENT_LOGS.setdefault(job_id, []).append(event)
+        events = JOB_EVENT_LOGS.setdefault(job_id, [])
+        events.append(event)
+        try:
+            write_json(job_directory(job_id) / "planning-events.json", events)
+        except OSError:
+            # Progress delivery must continue even if persistence temporarily fails.
+            pass
         JOB_EVENT_CONDITION.notify_all()
 
 @asynccontextmanager
@@ -183,6 +189,17 @@ def write_json(path: Path, value: object) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def load_job_events(job_id: str) -> list[dict[str, object]]:
+    path = job_directory(job_id) / "planning-events.json"
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
 
 
 def cached_preview_signature(kind: str, source: Path, payload: object) -> str:
@@ -1808,11 +1825,15 @@ def _process_new_job(
             len(analysis.planar_features) + len(analysis.cylindrical_features)
             + len(analysis.prismatic_features) + len(analysis.internal_profile_features)
         )
+        job.analysis = analysis
+        job.model_url = f"/api/v1/jobs/{job_id}/files/model.stl"
+        save_job(directory, job)
         report(
             "geometry_analysis", "三维几何分析完成", 34,
             feature_count=feature_count,
             hole_count=sum(item.kind == "hole" and item.review_state != "excluded" for item in analysis.cylindrical_features),
             rotational_status=rotational_analysis.status if rotational_analysis else None,
+            model_url=job.model_url,
         )
 
         report("draft_planning", "正在生成确定性工艺草案", 40)
@@ -2011,6 +2032,7 @@ async def start_job(
     save_job(directory, job)
     with JOB_EVENT_CONDITION:
         JOB_EVENT_LOGS[job_id] = []
+        write_json(directory / "planning-events.json", [])
     publish_job_progress = lambda stage, message, percent, **details: publish_job_event(
         job_id, stage, message, percent, **details,
     )
@@ -2035,6 +2057,9 @@ async def start_job(
 @app.get("/api/v1/jobs/{job_id}/events")
 def stream_job_progress(job_id: str) -> StreamingResponse:
     load_job(job_id)
+    with JOB_EVENT_CONDITION:
+        if job_id not in JOB_EVENT_LOGS:
+            JOB_EVENT_LOGS[job_id] = load_job_events(job_id)
 
     def event_stream():
         index = 0
@@ -2066,6 +2091,15 @@ def stream_job_progress(job_id: str) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/v1/jobs/{job_id}/planning-events")
+def get_job_planning_events(job_id: str) -> list[dict[str, object]]:
+    load_job(job_id)
+    with JOB_EVENT_CONDITION:
+        if job_id in JOB_EVENT_LOGS:
+            return list(JOB_EVENT_LOGS[job_id])
+    return load_job_events(job_id)
 
 
 @app.get("/api/v1/jobs/{job_id}", response_model=JobResponse)
