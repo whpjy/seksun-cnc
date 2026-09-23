@@ -726,7 +726,7 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
         <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
       </div>
     </header>
-    <section className="workspace processing-workspace">
+    <section className="workspace processing-workspace workbench-workspace left-panel-open">
       <aside className="workbench-sidebar processing-sidebar">
         <section className="panel planning-workbench-panel">
           <header><div><LoaderCircle className="spin" size={16} /><strong>正在生成工艺方案</strong></div><span>{Math.round(latestProgress?.percent ?? 6)}%</span></header>
@@ -794,7 +794,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [operationBusy, setOperationBusy] = useState(false);
   const [solidBusy, setSolidBusy] = useState(false);
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
-  const [leftWorkbenchPanel, setLeftWorkbenchPanel] = useState<"features" | "process" | null>(null);
+  const [leftWorkbenchPanel, setLeftWorkbenchPanel] = useState<"features" | "process" | null>("process");
   const [showOperationViewSwitch, setShowOperationViewSwitch] = useState(false);
   const [stockSelected, setStockSelected] = useState(false);
   const [showOperationDetails, setShowOperationDetails] = useState(false);
@@ -1746,6 +1746,19 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     && selectedOperation.enabled !== false
     && ["turn_facing", "turn_od_roughing", "turn_od_finishing", "turn_grooving", "turn_cutoff", "live_tool_contour_roughing", "live_tool_contour_finishing", "pocket_roughing", "pocket_finishing"].includes(selectedOperation.type)
     && (l32MaterialSnapshots?.key !== l32MaterialRequestKey || !(l32MaterialSnapshots.files[selectedOperation.id]?.length));
+  const l32MaterialGenerationPending = awaitingL32MaterialSnapshots
+    && l32MaterialSnapshotError?.key !== l32MaterialRequestKey
+    && l32MaterialSnapshots?.key !== l32MaterialRequestKey;
+  const simulationGenerating = activeMode === "仿真" && selectedOperation != null && (
+    isL32
+      ? previewingL32OperationId === selectedOperation.id || loadingL32Program || l32MaterialGenerationPending
+      : loadingCam || generatingCam || applyingRemediation
+  );
+  const simulationGenerationMessage = isL32
+    ? previewingL32OperationId === selectedOperation?.id || loadingL32Program
+      ? "正在计算真实刀路与刀具扫掠"
+      : "正在生成实体材料的逐帧变化"
+    : camProgress?.message ?? "正在生成刀路与材料去除结果";
   const initialToolpathSegments = useMemo(() => {
     if (activeMode !== "仿真" || playbackMode !== "single" || !selectedOperation) return EMPTY_TOOLPATH_SEGMENTS;
     const selectedIndex = operations.findIndex((operation) => operation.id === selectedOperation.id);
@@ -2764,26 +2777,25 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             <div><AlertTriangle size={17} /><strong>已阻止生成不完整工艺</strong></div>
             {job.plan.blocking_reasons.map((reason) => <p key={reason}>{reason}</p>)}
           </div>}
-          {isL32 && playbackMode === "cumulative" && (activeMode === "仿真" || activeMode === "刀路") && l32WholePartBlocked && l32PreviewOperationId !== selectedOperation?.id && previewingL32OperationId !== selectedOperation?.id && <div className="simulation-failure-banner l32-whole-part-blocker">
+          {!simulationGenerating && isL32 && playbackMode === "cumulative" && (activeMode === "仿真" || activeMode === "刀路") && l32WholePartBlocked && l32PreviewOperationId !== selectedOperation?.id && previewingL32OperationId !== selectedOperation?.id && <div className="simulation-failure-banner l32-whole-part-blocker">
             <AlertTriangle size={18} />
             <div>
               <strong>逐工序真实刀路已生成，正在进行整件连续余料校核</strong>
               <span>{l32WholePartBlockers.join("；")}</span>
             </div>
           </div>}
-          {isL32 && activeMode === "仿真" && selectedOperation && operationMessage && <div className={`l32-operation-preview-status ${l32PreviewOperationId === selectedOperation.id ? "complete" : ""}`}>
-            {previewingL32OperationId === selectedOperation.id ? <LoaderCircle className="spin" size={15} /> : l32PreviewOperationId === selectedOperation.id ? <Check size={15} /> : <Info size={15} />}
-            <span>{operationMessage}</span>
+          {simulationGenerating && selectedOperation && <div className={`simulation-generation-state ${showOperationViewSwitch ? "with-operation-card" : ""}`} aria-live="polite">
+            <div className="simulation-generation-visual" aria-hidden="true"><i /><i /><LoaderCircle className="spin" size={30} /></div>
+            <small>{selectedOperation.id} · {selectedOperation.name}</small>
+            <strong>正在生成加工仿真</strong>
+            <p>{simulationGenerationMessage}</p>
+            <div className="simulation-generation-progress"><i /></div>
+            <div className="simulation-generation-steps">
+              <span className="active">刀路求解</span><span className={l32MaterialGenerationPending ? "active" : ""}>材料演算</span><span>安全校核</span>
+            </div>
+            <em>结果完成后将自动显示真实模型与播放控件</em>
           </div>}
-          {awaitingL32MaterialSnapshots && <div className={`l32-material-snapshot-status ${l32MaterialSnapshotError?.key === l32MaterialRequestKey || l32MaterialSnapshots?.key === l32MaterialRequestKey ? "failed" : ""}`}>
-            {l32MaterialSnapshotError?.key === l32MaterialRequestKey || l32MaterialSnapshots?.key === l32MaterialRequestKey ? <AlertTriangle size={15} /> : <LoaderCircle className="spin" size={15} />}
-            <span>{l32MaterialSnapshotError?.key === l32MaterialRequestKey ? l32MaterialSnapshotError.message : l32MaterialSnapshots?.key === l32MaterialRequestKey ? "当前工序没有可用的实体材料帧；画面仅供刀路参考。" : "正在预生成实体材料的逐帧变化；当前显示暂不代表加工结果。"}</span>
-          </div>}
-          {isL32 && activeMode === "仿真" && playbackMode === "cumulative" && missingMaterialStages.length > 0 && <div className="l32-material-snapshot-status failed">
-            <AlertTriangle size={15} />
-            <span>{missingMaterialStages.join("、")} 没有实体材料帧；累计播放在这些工序只展示刀路，不代表已验证的材料去除。</span>
-          </div>}
-          <ModelViewer
+          {!simulationGenerating && <ModelViewer
             modelUrl={`${apiUrl(job.model_url)}?solid=${selectedSolidIndex}`}
             features={viewerFeatures}
             selectedFeatureIds={selectedFeatureIds}
@@ -2817,10 +2829,14 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             activeOperationLabel={selectedOperation?.name}
             operationContextVisible={showOperationViewSwitch || stockSelected}
             operationIntent={stockSelected ? null : operationIntent}
-            compositionInsetLeftRatio={leftWorkbenchPanel ? (showOperationViewSwitch || stockSelected ? 0.25 : 0.16) : 0}
+            compositionInsetLeftRatio={leftWorkbenchPanel
+              ? (showOperationViewSwitch || stockSelected
+                ? (activeMode === "仿真" ? 0.34 : 0.25)
+                : (activeMode === "仿真" ? 0.2 : 0.16))
+              : 0}
             compositionInsetRightRatio={leftWorkbenchPanel ? 0.04 : 0}
             showFeatureAnnotations={leftWorkbenchPanel === "features" && isolatedFeatureId !== null}
-          />
+          />}
           {stockSelected && <section className="operation-context-card stock-context-card" aria-label="毛坯视图">
             <header><span>加工起点</span><div><button type="button" aria-label="关闭毛坯窗口" title="关闭" onClick={() => setStockSelected(false)}><X size={15} /></button></div></header>
             <strong>毛坯</strong>
@@ -2846,6 +2862,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               </>}
               {activeMode === "刀路" && <ToolpathOverview segments={visibleToolpathSegments} loaded={isL32 ? !loadingL32Program && (l32Program !== null || !warmingL32Previews) : !loadingCam} />}
               {activeMode === "仿真" && <SimulationOverview summary={activeSimulationSummary} loading={isL32 ? previewingL32OperationId === selectedOperation.id || warmingL32Previews : loadingCam || generatingCam} hasPreview={Boolean(visibleSimulation || visibleTurningStage || visibleMaterialSnapshots.urls.length || visibleToolpathSegments.length)} />}
+              {activeMode === "仿真" && !simulationGenerating && l32MaterialSnapshotError?.key === l32MaterialRequestKey && <div className="simulation-inline-warning"><AlertTriangle size={13} /><span>{l32MaterialSnapshotError.message}</span></div>}
+              {activeMode === "仿真" && !simulationGenerating && playbackMode === "cumulative" && missingMaterialStages.length > 0 && <div className="simulation-inline-warning"><AlertTriangle size={13} /><span>{missingMaterialStages.join("、")} 没有实体材料帧，仅展示刀路参考。</span></div>}
             </div>
             <footer><i />{activeMode === "工艺" ? selectedFeatures.length ? `真实特征区域 · ${selectedFeatures.length} 项` : "根据工序参数推算加工区域" : activeMode === "刀路" ? loadingCam ? "正在加载刀路数据" : `${visibleToolpathSegments.length} 段运动轨迹` : "材料去除过程与安全校验"}</footer>
           </section>}
