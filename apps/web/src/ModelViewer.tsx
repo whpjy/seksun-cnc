@@ -5,7 +5,7 @@ import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import type { FixtureComponent, FormingPreview, ManufacturingFeature, SimulationResult, SpatialDefectRegion, SpatialDefectSample, ToolpathSegment, TurningStageView, Vec3 } from "./types";
-import { featureMarkerColor } from "./featurePresentation";
+import { featureDimensionLabel, featureDisplayName, featureMarkerColor } from "./featurePresentation";
 
 type ViewMode = "特征" | "工艺" | "刀路" | "仿真";
 type FeatureFilterKey = "hole" | "pocket" | "slot" | "surface" | "turning" | "profile";
@@ -14,6 +14,15 @@ type ProcessOperationIntent = {
   parameters: Record<string, string | number | boolean>;
   toolDiameterMm: number;
   toolKind: string;
+  turningProfile?: {
+    axisOrigin: Vec3;
+    axisDirection: Vec3;
+    minimumZ: number;
+    maximumZ: number;
+    maximumRadius: number;
+    minimumEndRadius: number;
+    maximumEndRadius: number;
+  };
 };
 
 type Props = {
@@ -53,6 +62,7 @@ type Props = {
   showFeatureSummary?: boolean;
   compositionInsetLeftRatio?: number;
   compositionInsetRightRatio?: number;
+  showFeatureAnnotations?: boolean;
 };
 
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
@@ -91,10 +101,11 @@ function featureFilterKey(feature: ManufacturingFeature): FeatureFilterKey {
   return "profile";
 }
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", isolatedFeatureId = null, workAxis = null, activeOperationLabel = "", operationContextVisible = false, operationIntent = null, showFeatureSummary = true, compositionInsetLeftRatio = 0, compositionInsetRightRatio = 0 }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", isolatedFeatureId = null, workAxis = null, activeOperationLabel = "", operationContextVisible = false, operationIntent = null, showFeatureSummary = true, compositionInsetLeftRatio = 0, compositionInsetRightRatio = 0, showFeatureAnnotations = false }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
+  const annotationElementsRef = useRef<Map<string, HTMLButtonElement>>(new Map());
   const onSelectRef = useRef(onSelectFeature);
   const onSelectDefectRef = useRef(onSelectDefect);
   const selectedIdsRef = useRef(selectedFeatureIds);
@@ -206,6 +217,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       material.color.set(viewMode === "工艺" ? 0x21c997 : Number(marker.userData.baseColor ?? 0x4f7cff));
       material.opacity = selected ? 0.68 : viewMode === "特征" ? 0.26 : 0.05;
       marker.renderOrder = selected ? 5 : 3;
+      annotationElementsRef.current.get(featureId)?.classList.toggle("selected", selected);
     }
   }, [selectedFeatureIds, viewMode]);
 
@@ -239,6 +251,13 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     renderer.shadowMap.enabled = viewMode === "仿真";
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     host.appendChild(renderer.domElement);
+    const annotationLayer = document.createElement("div");
+    annotationLayer.className = "feature-annotation-layer";
+    const annotationLines = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    annotationLines.classList.add("feature-annotation-lines");
+    annotationLayer.appendChild(annotationLines);
+    host.appendChild(annotationLayer);
+    annotationElementsRef.current = new Map();
 
     const axisRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     axisRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -407,6 +426,12 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     const markerGroup = new THREE.Group();
     scene.add(markerGroup);
     markersRef.current = new Map();
+    const featureAnnotations: Array<{
+      featureId: string;
+      marker: THREE.Mesh;
+      element: HTMLButtonElement;
+      line: SVGLineElement;
+    }> = [];
     const surfaceFrame = simulation?.surface.frame ?? {
       x: { x: 1, y: 0, z: 0 },
       y: { x: 0, y: 1, z: 0 },
@@ -519,7 +544,8 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           }
           return 0;
         };
-        const alignToAxis = (mesh: THREE.Mesh) => mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis);
+        const alignToAxis = (mesh: THREE.Mesh, direction = axis) => mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction);
+        const alignFaceToAxis = (mesh: THREE.Mesh, direction = axis) => mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), direction);
         const addIntentMesh = (mesh: THREE.Mesh, renderOrder = 6) => {
           mesh.renderOrder = renderOrder;
           processIntentMeshes.push(mesh);
@@ -534,10 +560,46 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         const isAxial = type.includes("drill") || type.includes("bor") || type.includes("thread") || type.includes("inner") || type.includes("turn_id");
 
         if (isFacing) {
-          const thickness = Math.max(parameterNumber("depth_of_cut_mm", "axial_allowance_mm"), axialLength * 0.015, 0.15);
-          const face = addIntentMesh(new THREE.Mesh(new THREE.CylinderGeometry(outerRadius * 1.06, outerRadius * 1.06, thickness, 48), intentMaterial(0x21c997, 0.3)));
-          alignToAxis(face);
-          face.position.copy(axis).multiplyScalar(centeredMax.getComponent(axisIndex) - thickness / 2);
+          const profile = operationIntent.turningProfile;
+          const faceAxis = profile
+            ? new THREE.Vector3(profile.axisDirection.x, profile.axisDirection.y, profile.axisDirection.z).normalize()
+            : axis;
+          const profileEndRadius = profile?.maximumEndRadius ?? 0;
+          const faceRadius = profile
+            ? Math.min(
+              Math.max(profileEndRadius, profile.maximumRadius * 0.12),
+              profile.maximumRadius * 1.015,
+            )
+            : outerRadius * 1.01;
+          const profileLength = profile ? Math.max(profile.maximumZ - profile.minimumZ, 0.5) : axialLength;
+          const requestedThickness = parameterNumber("depth_of_cut_mm", "axial_allowance_mm");
+          const thickness = Math.min(
+            Math.max(requestedThickness, profileLength * 0.003, 0.04),
+            Math.max(profileLength * 0.02, 0.12),
+          );
+          const faceCenter = profile
+            ? new THREE.Vector3(profile.axisOrigin.x, profile.axisOrigin.y, profile.axisOrigin.z)
+              .addScaledVector(faceAxis, profile.maximumZ)
+              .sub(modelCenter)
+            : axis.clone().multiplyScalar(centeredMax.getComponent(axisIndex));
+
+          // Use a restrained face wash plus a crisp perimeter. The previous
+          // full-bounds disk could float away from the actual turned face and
+          // obscure a large part of the model.
+          const faceWash = addIntentMesh(new THREE.Mesh(
+            new THREE.CylinderGeometry(faceRadius, faceRadius, thickness, 64),
+            intentMaterial(0x21c997, 0.1),
+          ));
+          alignToAxis(faceWash, faceAxis);
+          faceWash.position.copy(faceCenter).addScaledVector(faceAxis, thickness / 2);
+
+          const ringTubeRadius = Math.max(Math.min(faceRadius * 0.012, viewSize * 0.002), 0.015);
+          const faceRing = addIntentMesh(new THREE.Mesh(
+            new THREE.TorusGeometry(faceRadius, ringTubeRadius, 8, 64),
+            intentMaterial(0x18ad82, 0.92),
+          ), 7);
+          alignFaceToAxis(faceRing, faceAxis);
+          faceRing.position.copy(faceCenter).addScaledVector(faceAxis, thickness * 1.05);
         } else if (isGrooving || isCutoff) {
           const bandWidth = Math.max(parameterNumber("groove_width_mm", "confirmed_groove_width_mm"), operationIntent.toolDiameterMm, axialLength * (isCutoff ? 0.025 : 0.06), 0.2);
           const grooveDepth = Math.max(parameterNumber("groove_depth_mm", "confirmed_groove_depth_mm", "depth_of_cut_mm"), outerRadius * 0.12);
@@ -1030,6 +1092,31 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         marker.renderOrder = selected ? 5 : 3;
         markerGroup.add(marker);
         markersRef.current.set(feature.id, marker);
+        if (viewMode === "特征" && showFeatureAnnotations) {
+          const featureIndex = Math.max(features.findIndex((item) => item.id === feature.id), 0);
+          const color = `#${featureMarkerColor(feature).toString(16).padStart(6, "0")}`;
+          const annotation = document.createElement("button");
+          annotation.type = "button";
+          annotation.className = `feature-model-annotation${selected ? " selected" : ""}`;
+          annotation.setAttribute("aria-label", `F${String(featureIndex + 1).padStart(2, "0")} ${featureDisplayName(feature)}`);
+          annotation.style.setProperty("--feature-color", color);
+          const number = document.createElement("b");
+          number.textContent = `F${String(featureIndex + 1).padStart(2, "0")}`;
+          const detail = document.createElement("span");
+          const name = document.createElement("strong");
+          name.textContent = featureDisplayName(feature);
+          const dimension = document.createElement("small");
+          dimension.textContent = `${feature.id} · ${featureDimensionLabel(feature)}`;
+          detail.append(name, dimension);
+          annotation.append(number, detail);
+          annotation.addEventListener("click", () => onSelectRef.current(feature.id));
+          const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+          line.setAttribute("stroke", color);
+          annotationLines.appendChild(line);
+          annotationLayer.appendChild(annotation);
+          annotationElementsRef.current.set(feature.id, annotation);
+          featureAnnotations.push({ featureId: feature.id, marker, element: annotation, line });
+        }
       }
 
       controls.target.set(0, 0, 0);
@@ -1829,6 +1916,43 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       }
     };
 
+    const updateFeatureAnnotationLayout = () => {
+      if (!featureAnnotations.length) return;
+      const positioned = featureAnnotations.flatMap((annotation) => {
+        const projected = annotation.marker.getWorldPosition(new THREE.Vector3()).project(camera);
+        const visible = projected.z >= -1 && projected.z <= 1;
+        annotation.element.hidden = !visible;
+        annotation.line.style.display = visible ? "" : "none";
+        if (!visible) return [];
+        const anchorX = (projected.x * 0.5 + 0.5) * viewportWidth;
+        const anchorY = (-projected.y * 0.5 + 0.5) * viewportHeight;
+        const side = anchorX < viewportWidth - 230 ? "right" : "left";
+        return [{ ...annotation, anchorX, anchorY, side, labelY: anchorY }];
+      });
+      for (const side of ["right", "left"] as const) {
+        const group = positioned.filter((item) => item.side === side).sort((a, b) => a.anchorY - b.anchorY);
+        let cursor = 24;
+        for (const item of group) {
+          item.labelY = Math.max(24, Math.min(viewportHeight - 24, Math.max(item.anchorY, cursor)));
+          cursor = item.labelY + 34;
+        }
+        const overflow = cursor - 34 - (viewportHeight - 24);
+        if (overflow > 0) for (const item of group) item.labelY -= overflow;
+      }
+      for (const item of positioned) {
+        const labelX = item.side === "right"
+          ? Math.min(item.anchorX + 18, viewportWidth - 205)
+          : Math.max(item.anchorX - 18, 205);
+        item.element.dataset.side = item.side;
+        item.element.style.left = `${labelX}px`;
+        item.element.style.top = `${item.labelY}px`;
+        item.line.setAttribute("x1", item.anchorX.toFixed(1));
+        item.line.setAttribute("y1", item.anchorY.toFixed(1));
+        item.line.setAttribute("x2", labelX.toFixed(1));
+        item.line.setAttribute("y2", item.labelY.toFixed(1));
+      }
+    };
+
     const animate = (time: number) => {
       const elapsed = Math.min((time - lastFrameTime) / 1000, 0.1);
       lastFrameTime = time;
@@ -1886,6 +2010,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       }
       if (camoticsMesh) camoticsMesh.visible = materialSnapshotUrls.length === 0 && playbackRef.current.progress >= 0.999;
       controls.update();
+      updateFeatureAnnotationLayout();
       renderer.render(scene, camera);
       axisGroup.quaternion.copy(camera.quaternion).invert();
       axisRenderer.render(axisScene, axisCamera);
@@ -1984,11 +2109,13 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         }
       }
       markersRef.current.clear();
+      annotationElementsRef.current.clear();
       viewApiRef.current = null;
       host.removeChild(renderer.domElement);
+      host.removeChild(annotationLayer);
       axisHost.removeChild(axisRenderer.domElement);
     };
-  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, compositionInsetLeftRatio, compositionInsetRightRatio, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, isolatedFeatureId, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationIntent, operationTools, playbackKey, profileBoundaries, renderedFeatures, simulation, spatialDefects, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
+  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, compositionInsetLeftRatio, compositionInsetRightRatio, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, isolatedFeatureId, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationIntent, operationTools, playbackKey, profileBoundaries, renderedFeatures, showFeatureAnnotations, simulation, spatialDefects, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
   const activeFormingStage = formingPreview?.stages.length

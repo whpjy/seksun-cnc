@@ -56,6 +56,56 @@ button { color: inherit; }
 .setup-tree > button > span { color: #52d8af; font: 9px "JetBrains Mono"; padding-top: 2px; }.setup-tree button div { display: flex; flex-direction: column; gap: 4px; }.setup-tree button strong { font-size: 10px; }.setup-tree button small { color: #617486; font-size: 9px; }
 .tree-summary { margin: 12px; padding: 9px; background: #101a22; color: #6f8295; font-size: 10px; display: flex; gap: 7px; }
 .model-viewer { position: absolute; inset: 0; overflow: hidden; }.model-viewer canvas { display: block; }.model-viewer > canvas { width: 100% !important; height: 100% !important; }
+.feature-annotation-layer { position: absolute; z-index: 8; inset: 0; overflow: hidden; pointer-events: none; }
+.feature-annotation-lines { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.feature-annotation-lines line { stroke-width: 1.2; stroke-dasharray: 3 3; opacity: .72; }
+.feature-model-annotation {
+  position: absolute;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #344760;
+  background: transparent;
+  border: 0;
+  transform: translateY(-50%);
+  pointer-events: auto;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.feature-model-annotation[data-side="left"] { flex-direction: row-reverse; transform: translate(-100%, -50%); }
+.feature-model-annotation > b {
+  width: 30px;
+  height: 24px;
+  flex: 0 0 30px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: var(--feature-color, #4569e7);
+  border: 2px solid #fff;
+  border-radius: 12px;
+  box-shadow: 0 3px 9px #29447538;
+  font: 700 8px "JetBrains Mono", monospace;
+}
+.feature-model-annotation > span {
+  max-width: 0;
+  padding: 0;
+  overflow: hidden;
+  display: grid;
+  gap: 2px;
+  opacity: 0;
+  background: #fffffff2;
+  border: 0 solid #cfd9e8;
+  border-radius: 6px;
+  box-shadow: 0 5px 14px #29447524;
+  transition: max-width .16s ease, padding .16s ease, opacity .12s ease, border-width .12s ease;
+}
+.feature-model-annotation:hover > span,
+.feature-model-annotation:focus-visible > span,
+.feature-model-annotation.selected > span { max-width: 190px; padding: 6px 8px; opacity: 1; border-width: 1px; }
+.feature-model-annotation > span strong { overflow: hidden; color: #30435f; font-size: 10px; text-overflow: ellipsis; }
+.feature-model-annotation > span small { overflow: hidden; color: #6d7e96; font: 8px "JetBrains Mono", monospace; text-overflow: ellipsis; }
+.feature-model-annotation.selected > b { outline: 3px solid color-mix(in srgb, var(--feature-color, #4569e7) 30%, transparent); }
 .viewer-badge { position: absolute; z-index: 2; left: 14px; top: 14px; min-width: 170px; padding: 7px 9px; display: grid; gap: 3px; background: #080c11bb; color: #52d8af; border: 1px solid #27483f; }
 .viewer-badge strong { font-size: 10px; }
 .viewer-badge small { color: #728297; font: 8px "JetBrains Mono", monospace; }
@@ -960,10 +1010,12 @@ body { min-width: 980px; background: #eef3f9; }
 .manufacturing-feature-heading span { font-weight: 700; letter-spacing: .02em; }
 .manufacturing-feature-heading small { margin-left: auto; color: #dbe3ff; font: 8px "JetBrains Mono", monospace; }
 .manufacturing-feature-list { display: flex; flex-direction: column; scrollbar-color: #9ba8ba transparent; scrollbar-width: thin; }
-.manufacturing-feature-list > button { width: 100%; min-height: 52px; padding: 7px 10px; display: grid; grid-template-columns: 10px minmax(0, 1fr); align-items: center; gap: 8px; color: #2e3c53; background: #fff; border: 0; border-bottom: 1px solid #e8edf4; cursor: pointer; text-align: left; }
+.manufacturing-feature-list > button { width: 100%; min-height: 52px; padding: 7px 10px; display: grid; grid-template-columns: 10px 30px minmax(0, 1fr); align-items: center; gap: 7px; color: #2e3c53; background: #fff; border: 0; border-bottom: 1px solid #e8edf4; cursor: pointer; text-align: left; }
 .manufacturing-feature-list > button:hover { background: #f3f6fd; }
 .manufacturing-feature-list > button.selected { background: #edf2ff; box-shadow: inset 3px 0 #4569e7; }
 .manufacturing-feature-list > button > i { width: 8px; height: 8px; border-radius: 50%; }
+.manufacturing-feature-index { padding: 3px 4px; color: #4569e7; background: #eef2ff; border-radius: 5px; font: 700 8px "JetBrains Mono", monospace; text-align: center; }
+.manufacturing-feature-list > button.selected .manufacturing-feature-index { color: #fff; background: #4569e7; }
 .manufacturing-feature-list > button > span { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .manufacturing-feature-list strong, .manufacturing-feature-list small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .manufacturing-feature-list strong { font-size: 10px; }.manufacturing-feature-list small { color: #78869a; font: 8px "JetBrains Mono", monospace; }

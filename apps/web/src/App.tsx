@@ -1103,12 +1103,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     () => catalogs?.operations.find((item) => item.id === (selectedOperation?.definition_id || selectedOperation?.type)) ?? null,
     [catalogs?.operations, selectedOperation?.definition_id, selectedOperation?.type],
   );
-  const operationIntent = useMemo(() => selectedOperation ? {
-    type: selectedOperation.type,
-    parameters: selectedOperation.parameters,
-    toolDiameterMm: selectedOperation.tool.diameter_mm,
-    toolKind: selectedOperation.tool.kind,
-  } : null, [selectedOperation]);
   const turningProcessProfile = useMemo(() => {
     if (!l32Rotational || !selectedOperation) return null;
     const wantsInnerProfile = selectedOperation.type.includes("turn_id") || selectedOperation.type.includes("drill") || selectedOperation.type.includes("bor") || selectedOperation.type.includes("inner");
@@ -1117,6 +1111,41 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       ?? l32Rotational.profiles.find((profile) => profile.side === side)
       ?? null;
   }, [l32Rotational, selectedOperation]);
+  const turningProcessAxis = useMemo(
+    () => l32Rotational?.axes.find((axis) => axis.id === turningProcessProfile?.axis_id) ?? null,
+    [l32Rotational?.axes, turningProcessProfile?.axis_id],
+  );
+  const operationIntent = useMemo(() => {
+    if (!selectedOperation) return null;
+    const profilePoints = turningProcessProfile?.points ?? [];
+    const minimumPoint = profilePoints.reduce<(typeof profilePoints)[number] | null>(
+      (current, point) => !current || point.z < current.z ? point : current,
+      null,
+    );
+    const maximumPoint = profilePoints.reduce<(typeof profilePoints)[number] | null>(
+      (current, point) => !current || point.z > current.z ? point : current,
+      null,
+    );
+    const maximumRadius = profilePoints.reduce((current, point) => Math.max(current, point.radius), 0);
+    const turningProfile = turningProcessProfile && turningProcessAxis && minimumPoint && maximumPoint && maximumRadius > 0
+      ? {
+        axisOrigin: turningProcessAxis.origin,
+        axisDirection: turningProcessAxis.direction,
+        minimumZ: minimumPoint.z,
+        maximumZ: maximumPoint.z,
+        maximumRadius,
+        minimumEndRadius: minimumPoint.radius,
+        maximumEndRadius: maximumPoint.radius,
+      }
+      : undefined;
+    return {
+      type: selectedOperation.type,
+      parameters: selectedOperation.parameters,
+      toolDiameterMm: selectedOperation.tool.diameter_mm,
+      toolKind: selectedOperation.tool.kind,
+      turningProfile,
+    };
+  }, [selectedOperation, turningProcessAxis, turningProcessProfile]);
   const visualizedProcessParameters = useMemo(() => {
     if (!selectedOperation) return [];
     const preferredKeys = ["radial_allowance_mm", "axial_allowance_mm", "stock_allowance_mm", "depth_of_cut_mm", "radial_depth_mm", "groove_width_mm", "groove_depth_mm", "depth_mm", "profile_depth_mm", "cutting_speed_m_min", "maximum_spindle_rpm", "spindle_rpm", "feed_per_revolution_mm", "feed_rate_mm_min"];
@@ -2637,8 +2666,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             <div className="panel-heading floating-panel-heading manufacturing-feature-heading"><CircleDot size={16} /><span>制造特征</span><small>{manufacturingFeatures.length} 项</small><button type="button" aria-label="关闭制造特征" title="关闭" onClick={() => setLeftWorkbenchPanel(null)}><X size={15} /></button></div>
             <>
             <div className="panel-content manufacturing-feature-list">
-              {manufacturingFeatures.map((feature) => <button type="button" key={feature.id} className={isolatedFeatureId === feature.id ? "selected" : ""} onClick={() => chooseFeature(feature.id)}>
+              {manufacturingFeatures.map((feature, index) => <button type="button" key={feature.id} className={isolatedFeatureId === feature.id ? "selected" : ""} onClick={() => chooseFeature(feature.id)}>
                 <i style={{ backgroundColor: `#${featureMarkerColor(feature).toString(16).padStart(6, "0")}` }} />
+                <b className="manufacturing-feature-index">F{String(index + 1).padStart(2, "0")}</b>
                 <span><strong>{featureDisplayName(feature)}</strong><small>{feature.id} · {featureDimensionLabel(feature)}</small></span>
               </button>)}
               {manufacturingFeatures.length === 0 && <p>当前模型没有识别到制造特征。</p>}
@@ -2789,6 +2819,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             operationIntent={stockSelected ? null : operationIntent}
             compositionInsetLeftRatio={leftWorkbenchPanel ? (showOperationViewSwitch || stockSelected ? 0.25 : 0.16) : 0}
             compositionInsetRightRatio={leftWorkbenchPanel ? 0.04 : 0}
+            showFeatureAnnotations={leftWorkbenchPanel === "features" && isolatedFeatureId !== null}
           />
           {stockSelected && <section className="operation-context-card stock-context-card" aria-label="毛坯视图">
             <header><span>加工起点</span><div><button type="button" aria-label="关闭毛坯窗口" title="关闭" onClick={() => setStockSelected(false)}><X size={15} /></button></div></header>
