@@ -760,8 +760,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [job, setJob] = useState(initialJob);
   const jobSnapshotRef = useRef(JSON.stringify(initialJob));
   const operationPopoverRef = useRef<HTMLElement>(null);
-  const [selectedOperation, setSelectedOperation] = useState<Operation | null>(job.plan?.setups[0]?.operations[0] ?? null);
-  const [selectedFeatureIds, setSelectedFeatureIds] = useState<string[]>(selectedOperation?.feature_ids ?? []);
+  const [selectedOperation, setSelectedOperation] = useState<Operation | null>(null);
+  const [selectedFeatureIds, setSelectedFeatureIds] = useState<string[]>([]);
   const [activeMode, setActiveMode] = useState("工艺");
   const [generatingCam, setGeneratingCam] = useState(false);
   const [loadingCam, setLoadingCam] = useState(readOnly);
@@ -868,9 +868,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         setJob(refreshed);
         const refreshedOperations = refreshed.plan?.setups.flatMap((setup) => setup.operations) ?? [];
         setSelectedOperation((current) => (
-          refreshedOperations.find((operation) => operation.id === current?.id)
-          ?? refreshedOperations[0]
-          ?? null
+          current ? refreshedOperations.find((operation) => operation.id === current.id) ?? null : null
         ));
       } catch {
         // Keep the already loaded task visible; the next focus/visibility
@@ -1845,6 +1843,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
 
   const chooseStock = () => {
     setStockSelected(true);
+    setSelectedOperation(null);
     setActiveMode("工艺");
     setSelectedFeatureIds([]);
     setIsolatedFeatureId(null);
@@ -1853,6 +1852,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   };
 
   const openOperationDetails = (operation: Operation, anchor: HTMLElement) => {
+    setStockSelected(false);
     setSelectedOperation(operation);
     setSelectedFeatureIds(operation.feature_ids);
     setActiveMode("工艺");

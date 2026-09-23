@@ -885,7 +885,7 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
     }
     stages_json = json.dumps({"stages": stages, "context": context}, separators=(",", ":"))
     signature = hashlib.sha256(
-        f"material-binary-v11:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
+        f"material-binary-v12:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
     ).hexdigest()
     manifest_path = directory / "l32-material-snapshots.json"
     stages_path = directory / "l32-material-stages.json"

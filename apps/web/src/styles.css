@@ -814,7 +814,7 @@ body { min-width: 980px; background: #eef3f9; }
 .feature-tree, .inspector { overflow: hidden; color: #263650; background: #fff; border-width: 1px; }
 .feature-tree .tree-section { border-bottom-color: #e5ebf3; }
 .feature-tree .tree-section small, .feature-tree .setup-tree button small { color: #62728a; font-size: 10px; line-height: 1.4; }
-.feature-tree .stock-tree-row { width: 100%; color: inherit; background: transparent; border: 0; border-bottom: 1px solid #e5ebf3; cursor: pointer; text-align: left; font: inherit; }
+.feature-tree .stock-tree-row { width: 100%; height: 48px; min-height: 48px; padding: 5px 14px; box-sizing: border-box; justify-content: center; color: inherit; background: transparent; border: 0; border-bottom: 1px solid #e5ebf3; cursor: pointer; text-align: left; font: inherit; }
 .feature-tree .stock-tree-row:hover { background: #f3f6fd; }
 .feature-tree .stock-tree-row.selected { color: #294fae; background: #eaf0ff; box-shadow: inset 3px 0 #4569e7; }
 .feature-tree .setup-tree > button { min-height: 48px; color: #2e3c53; border-bottom-color: #e8edf4; }

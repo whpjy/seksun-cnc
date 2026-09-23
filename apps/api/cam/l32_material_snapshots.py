@@ -21,6 +21,29 @@ def export_snapshot(shape, path):
     mesh.write(str(path))
 
 
+def visualization_shape(components, compound):
+    """Fuse touching IPW solids for export without trusting the fuse for validation."""
+    if len(components) < 2:
+        return compound
+    try:
+        merged = components[0]
+        for component in components[1:]:
+            merged = merged.fuse(component)
+        merged = merged.removeSplitter()
+        tolerance = max(0.002, compound.Volume * 1e-7)
+        if (
+            merged.isNull()
+            or not merged.isValid()
+            or abs(merged.Volume - compound.Volume) > tolerance
+        ):
+            return compound
+        return merged
+    except Exception:
+        # Some thin, merely tangent pocket fills are intentionally kept as a
+        # compound because OCC cannot always fuse them robustly.
+        return compound
+
+
 def bounds_box(shape, axis_index, ratio):
     bounds = shape.BoundBox
     lower = [bounds.XMin - 0.1, bounds.YMin - 0.1, bounds.ZMin - 0.1]
@@ -225,7 +248,8 @@ def main():
             # disjointly partitioned. OCC fuse at their shared tangencies can
             # corrupt volume or erase a thin pocket; a compound preserves each
             # valid solid while the renderer displays one tessellated mesh.
-            frame_shape = Part.makeCompound([target, *uncut]) if uncut else target
+            components = [target, *uncut]
+            frame_shape = Part.makeCompound(components) if uncut else target
             volume = frame_shape.Volume
             if frame_shape.isNull() or volume < target.Volume - 0.001:
                 raise ValueError(f"{stage['operation_id']} frame {frame}: invalid material volume {volume}")
@@ -234,7 +258,7 @@ def main():
             if frame == 0 and previous_end_volume is not None and abs(volume - previous_end_volume) > 0.002:
                 raise ValueError(f"{stage['operation_id']}: previous operation's final material differs")
             name = f"l32-material-{stage['operation_id']}-{frame:02d}.stl"
-            export_snapshot(frame_shape, output / name)
+            export_snapshot(visualization_shape(components, frame_shape), output / name)
             files.append(name)
             volumes.append(round(volume, 6))
         previous_end_volume = volumes[-1]

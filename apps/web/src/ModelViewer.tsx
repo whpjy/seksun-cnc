@@ -66,6 +66,11 @@ const EMPTY_TOPOLOGY_EDGES: Vec3[][] = [];
 const UG_PART_COLOR = 0x6f7b7d;
 const UG_TARGET_COLOR = 0x788689;
 const UG_EDGE_COLOR = 0x303a3d;
+const STOCK_MATERIAL_COLOR = 0x7f8c92;
+const STOCK_MATERIAL_ROUGHNESS = 0.38;
+const STOCK_MATERIAL_METALNESS = 0.42;
+const STOCK_MATERIAL_CLEARCOAT = 0.12;
+const STOCK_MATERIAL_CLEARCOAT_ROUGHNESS = 0.5;
 const FEATURE_FILTERS: Array<{ key: FeatureFilterKey; label: string; colorClass: string }> = [
   { key: "hole", label: "孔", colorClass: "hole" },
   { key: "pocket", label: "型腔", colorClass: "pocket" },
@@ -369,11 +374,11 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         const snapshotMesh = new THREE.Mesh(
           renderSnapshot,
           new THREE.MeshPhysicalMaterial({
-            color: 0x718083,
-            roughness: 0.5,
-            metalness: 0.08,
-            clearcoat: 0.04,
-            clearcoatRoughness: 0.68,
+            color: STOCK_MATERIAL_COLOR,
+            roughness: STOCK_MATERIAL_ROUGHNESS,
+            metalness: STOCK_MATERIAL_METALNESS,
+            clearcoat: STOCK_MATERIAL_CLEARCOAT,
+            clearcoatRoughness: STOCK_MATERIAL_CLEARCOAT_ROUGHNESS,
           }),
         );
         snapshotMesh.castShadow = true;
@@ -559,14 +564,27 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
             ...ordered.map((sample) => new THREE.Vector2(Math.max(sample.outer_radius, 0), sample.z)),
             ...ordered.slice().reverse().map((sample) => new THREE.Vector2(Math.max(sample.inner_radius, 0), sample.z)),
           ];
-          const stockGeometry = new THREE.LatheGeometry(profile, 64);
+          const isSolidRoundStock = turningStage.operation_id === "stock"
+            && ordered.length === 2
+            && ordered.every((sample) => sample.inner_radius <= 1e-6)
+            && Math.abs(ordered[0].outer_radius - ordered[1].outer_radius) <= 1e-6;
+          const stockGeometry: THREE.BufferGeometry = isSolidRoundStock
+            ? new THREE.CylinderGeometry(
+                ordered[0].outer_radius,
+                ordered[0].outer_radius,
+                Math.max(ordered[1].z - ordered[0].z, 1e-6),
+                64,
+                1,
+                false,
+              ).translate(0, (ordered[0].z + ordered[1].z) / 2, 0)
+            : new THREE.LatheGeometry(profile, 64);
           stockGeometry.computeVertexNormals();
           const material = new THREE.MeshPhysicalMaterial({
             color,
-            roughness: 0.38,
-            metalness: 0.42,
-            clearcoat: 0.12,
-            clearcoatRoughness: 0.5,
+            roughness: STOCK_MATERIAL_ROUGHNESS,
+            metalness: STOCK_MATERIAL_METALNESS,
+            clearcoat: STOCK_MATERIAL_CLEARCOAT,
+            clearcoatRoughness: STOCK_MATERIAL_CLEARCOAT_ROUGHNESS,
             transparent: true,
             opacity,
             side: THREE.DoubleSide,
@@ -579,7 +597,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           mesh.receiveShadow = true;
           return mesh;
         };
-        turningBeforeMesh = makeStockMesh(turningStage.before_samples, 0x7f8c92, 0.78);
+        turningBeforeMesh = makeStockMesh(turningStage.before_samples, STOCK_MATERIAL_COLOR, 0.78);
         turningAfterMesh = makeStockMesh(turningStage.after_samples, 0x268b7a, 0.28);
         turningBeforeSamples = [...turningStage.before_samples].sort((left, right) => left.z - right.z);
         turningAfterSamples = [...turningStage.after_samples].sort((left, right) => left.z - right.z);
@@ -722,12 +740,11 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           camoticsMesh = new THREE.Mesh(
             toCreasedNormals(stockGeometry, THREE.MathUtils.degToRad(42)),
             new THREE.MeshPhysicalMaterial({
-              color: 0xaebbc1,
-              roughness: 0.32,
-              metalness: 0.62,
-              clearcoat: 0.18,
-              clearcoatRoughness: 0.45,
-              envMapIntensity: 0.9,
+              color: STOCK_MATERIAL_COLOR,
+              roughness: STOCK_MATERIAL_ROUGHNESS,
+              metalness: STOCK_MATERIAL_METALNESS,
+              clearcoat: STOCK_MATERIAL_CLEARCOAT,
+              clearcoatRoughness: STOCK_MATERIAL_CLEARCOAT_ROUGHNESS,
             }),
           );
           camoticsMesh.visible = !animateToolpath || playbackRef.current.progress >= 0.999;
@@ -859,19 +876,19 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         processedRatios = new Array(toolpathSegments.length).fill(0);
         simulationMesh = new THREE.Mesh(
           surfaceGeometry,
-          new THREE.MeshStandardMaterial({ color: 0xbfc8cd, roughness: 0.68, metalness: 0.18, side: THREE.DoubleSide }),
+          new THREE.MeshPhysicalMaterial({ color: STOCK_MATERIAL_COLOR, roughness: STOCK_MATERIAL_ROUGHNESS, metalness: STOCK_MATERIAL_METALNESS, clearcoat: STOCK_MATERIAL_CLEARCOAT, clearcoatRoughness: STOCK_MATERIAL_CLEARCOAT_ROUGHNESS, side: THREE.DoubleSide }),
         );
         simulationMesh.renderOrder = 4;
         scene.add(simulationMesh);
         simulationLowerMesh = new THREE.Mesh(
           lowerGeometry,
-          new THREE.MeshStandardMaterial({ color: 0xa9b5bb, roughness: 0.72, metalness: 0.14, side: THREE.DoubleSide }),
+          new THREE.MeshPhysicalMaterial({ color: STOCK_MATERIAL_COLOR, roughness: STOCK_MATERIAL_ROUGHNESS, metalness: STOCK_MATERIAL_METALNESS, clearcoat: STOCK_MATERIAL_CLEARCOAT, clearcoatRoughness: STOCK_MATERIAL_CLEARCOAT_ROUGHNESS, side: THREE.DoubleSide }),
         );
         simulationLowerMesh.renderOrder = 4;
         scene.add(simulationLowerMesh);
         simulationWalls = new THREE.Mesh(
           new THREE.BufferGeometry(),
-          new THREE.MeshStandardMaterial({ color: 0x8f9ca4, roughness: 0.74, metalness: 0.12, side: THREE.DoubleSide }),
+          new THREE.MeshPhysicalMaterial({ color: STOCK_MATERIAL_COLOR, roughness: STOCK_MATERIAL_ROUGHNESS, metalness: STOCK_MATERIAL_METALNESS, clearcoat: STOCK_MATERIAL_CLEARCOAT, clearcoatRoughness: STOCK_MATERIAL_CLEARCOAT_ROUGHNESS, side: THREE.DoubleSide }),
         );
         simulationWalls.renderOrder = 5;
         scene.add(simulationWalls);
@@ -1273,6 +1290,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     let lastTurningGeometryProgress = -1;
     const updateTurningMaterial = (currentProgress: number) => {
       if (!turningBeforeMesh || !turningSampleTargets.length) return;
+      if (turningStage?.operation_id === "stock") return;
       if (Math.abs(currentProgress - lastTurningGeometryProgress) < 0.008 && currentProgress < 0.999) return;
       const dynamicSamples = turningSampleTargets.map(({ before, after }, index) => {
         const encounter = turningEncounterRatios[index];
@@ -1847,7 +1865,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         const turningProgress = animateToolpath ? playbackRef.current.progress : 1;
         updateTurningMaterial(turningProgress);
         const beforeMaterial = turningBeforeMesh.material as THREE.MeshPhysicalMaterial;
-        beforeMaterial.opacity = 0.96;
+        beforeMaterial.opacity = turningStage?.operation_id === "stock" ? 1 : 0.96;
         beforeMaterial.visible = true;
         beforeMaterial.depthWrite = true;
         // The authoritative final mesh remains available for bounds checking,
