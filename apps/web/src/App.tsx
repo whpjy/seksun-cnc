@@ -784,7 +784,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [applyingRemediation, setApplyingRemediation] = useState(false);
   const [inspectionPanel, setInspectionPanel] = useState<"tools" | null>(null);
   const [isolatedFeatureId, setIsolatedFeatureId] = useState<string | null>(null);
-  const [featureSearch, setFeatureSearch] = useState("");
   const inspectionPanelRef = useRef<HTMLElement>(null);
   const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
   const [deviceLibrary, setDeviceLibrary] = useState<DeviceLibrary | null>(null);
@@ -795,8 +794,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [operationBusy, setOperationBusy] = useState(false);
   const [solidBusy, setSolidBusy] = useState(false);
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
-  const [structureExpanded, setStructureExpanded] = useState(true);
-  const [featureStructureExpanded, setFeatureStructureExpanded] = useState(false);
+  const [leftWorkbenchPanel, setLeftWorkbenchPanel] = useState<"features" | "process" | null>(null);
   const [showOperationViewSwitch, setShowOperationViewSwitch] = useState(false);
   const [stockSelected, setStockSelected] = useState(false);
   const [showOperationDetails, setShowOperationDetails] = useState(false);
@@ -1004,10 +1002,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     () => [...holes, ...prismaticFeatures, ...planarMachiningFeatures, ...internalProfiles, ...rotationalManufacturingFeatures],
     [holes, internalProfiles, planarMachiningFeatures, prismaticFeatures, rotationalManufacturingFeatures],
   );
-  const visibleManufacturingFeatures = useMemo(() => {
-    const query = featureSearch.trim().toLocaleLowerCase("zh-CN");
-    return manufacturingFeatures.filter((feature) => !query || `${feature.id} ${featureDisplayName(feature)}`.toLocaleLowerCase("zh-CN").includes(query));
-  }, [featureSearch, manufacturingFeatures]);
   const coverage = job.plan?.coverage;
   const profileAxialComplete = job.plan?.stock.profile_axial_complete;
   const l32WholePartBlockers = useMemo(() => {
@@ -2632,22 +2626,27 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         </section>
       </div>}
 
-      <section className="workspace">
-        <aside className="workbench-sidebar">
-          <section className={`feature-tree panel accordion-panel manufacturing-feature-panel ${featureStructureExpanded ? "expanded" : "collapsed"}`}>
-            <button className="panel-heading accordion-trigger manufacturing-feature-heading" aria-expanded={featureStructureExpanded} onClick={() => { const next = !featureStructureExpanded; setFeatureStructureExpanded(next); if (next) setStructureExpanded(false); }}><CircleDot size={16} /><span>制造特征</span><small>{visibleManufacturingFeatures.length} / {manufacturingFeatures.length} 项</small><ChevronRight className="accordion-chevron" size={16} /></button>
-            {featureStructureExpanded && <><div className="manufacturing-feature-search"><input type="search" value={featureSearch} onChange={(event) => setFeatureSearch(event.target.value)} placeholder="搜索编号或特征类型" aria-label="搜索制造特征" /></div>
+      <section className={`workspace workbench-workspace ${leftWorkbenchPanel ? "left-panel-open" : ""}`}>
+        <nav className="workbench-panel-switcher" aria-label="工作区面板">
+          <button type="button" className={leftWorkbenchPanel === "features" ? "active" : ""} aria-pressed={leftWorkbenchPanel === "features"} onClick={() => { const opening = leftWorkbenchPanel !== "features"; setLeftWorkbenchPanel(opening ? "features" : null); setShowOperationViewSwitch(false); setShowOperationDetails(false); setEditingOperationDetails(false); setStockSelected(false); if (opening) { setActiveMode("特征"); setIsolatedFeatureId(null); setSelectedFeatureIds([]); } }}><CircleDot size={15} /><span>制造特征</span></button>
+          <button type="button" className={leftWorkbenchPanel === "process" ? "active" : ""} aria-pressed={leftWorkbenchPanel === "process"} onClick={() => { const closing = leftWorkbenchPanel === "process"; setLeftWorkbenchPanel(closing ? null : "process"); setShowOperationDetails(false); setEditingOperationDetails(false); if (closing) { setShowOperationViewSwitch(false); setStockSelected(false); } }}><Layers3 size={15} /><span>工艺路线</span></button>
+        </nav>
+
+        {leftWorkbenchPanel && <aside className="workbench-sidebar floating-workbench-panel">
+          {leftWorkbenchPanel === "features" && <section className="feature-tree panel accordion-panel manufacturing-feature-panel expanded">
+            <div className="panel-heading floating-panel-heading manufacturing-feature-heading"><CircleDot size={16} /><span>制造特征</span><small>{manufacturingFeatures.length} 项</small><button type="button" aria-label="关闭制造特征" title="关闭" onClick={() => setLeftWorkbenchPanel(null)}><X size={15} /></button></div>
+            <>
             <div className="panel-content manufacturing-feature-list">
-              {visibleManufacturingFeatures.map((feature) => <button type="button" key={feature.id} className={isolatedFeatureId === feature.id ? "selected" : ""} onClick={() => chooseFeature(feature.id)}>
+              {manufacturingFeatures.map((feature) => <button type="button" key={feature.id} className={isolatedFeatureId === feature.id ? "selected" : ""} onClick={() => chooseFeature(feature.id)}>
                 <i style={{ backgroundColor: `#${featureMarkerColor(feature).toString(16).padStart(6, "0")}` }} />
                 <span><strong>{featureDisplayName(feature)}</strong><small>{feature.id} · {featureDimensionLabel(feature)}</small></span>
               </button>)}
-              {visibleManufacturingFeatures.length === 0 && <p>没有匹配的制造特征。</p>}
-            </div></>}
-          </section>
-          <section className={`feature-tree panel accordion-panel ${structureExpanded ? "expanded" : "collapsed"}`}>
-            <button className="panel-heading accordion-trigger" aria-expanded={structureExpanded} onClick={() => { const next = !structureExpanded; setStructureExpanded(next); if (next) setFeatureStructureExpanded(false); }}><Layers3 size={16} /><span>工艺路线</span><small>{job.plan.setups.length} 装夹 · {operations.length} 工序</small><ChevronRight className="accordion-chevron" size={16} /></button>
-            {structureExpanded && <div className="panel-content">
+              {manufacturingFeatures.length === 0 && <p>当前模型没有识别到制造特征。</p>}
+            </div></>
+          </section>}
+          {leftWorkbenchPanel === "process" && <section className="feature-tree panel accordion-panel expanded">
+            <div className="panel-heading floating-panel-heading"><Layers3 size={16} /><span>工艺路线</span><small>{job.plan.setups.length} 装夹 · {operations.length} 工序</small><button type="button" aria-label="关闭工艺路线" title="关闭" onClick={() => { setLeftWorkbenchPanel(null); setShowOperationViewSwitch(false); setShowOperationDetails(false); setEditingOperationDetails(false); setStockSelected(false); }}><X size={15} /></button></div>
+            <div className="panel-content">
               <button type="button" className={`tree-section stock-tree-row ${stockSelected ? "selected" : ""}`} aria-pressed={stockSelected} onClick={chooseStock}><strong><Box size={15} /> 毛坯</strong><small>{stockDimensionLabel}</small></button>
               {job.plan.setups.map((setup) => (
                 <div key={setup.id} className="setup-tree">
@@ -2665,8 +2664,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
                 </div>
               ))}
               <div className="tree-summary"><CircleDot size={14} /> {holes.length} 孔 · {prismaticFeatures.length} 型腔/槽 · {planarMachiningFeatures.length} 平面区 · {rotationalManufacturingFeatures.length} 回转特征 · {internalProfiles.length} 内轮廓/雕刻 · 共 {manufacturingFeatures.length} 项</div>
-            </div>}
-          </section>
+            </div>
+          </section>}
 
           {showOperationDetails && selectedOperation && <section ref={operationPopoverRef} className="operation-popover inspector panel" style={{ top: operationPopoverPosition.top, left: operationPopoverPosition.left, "--operation-anchor-y": `${operationPopoverPosition.anchorY}px` } as CSSProperties}>
             <header className="operation-popover-heading"><div><Bot size={16} /><span>工序详情</span><small>{selectedOperation.id}</small></div><div className="operation-popover-actions">{!readOnly && !editingOperationDetails && <button className="edit-operation-button" aria-label="编辑工序" title="编辑" onClick={() => { setEditingOperationDetails(true); setToolDraftId(selectedOperation.tool.id); setOperationMessage(""); }}><Pencil size={13} /></button>}<button aria-label="关闭工序详情" title="关闭" onClick={() => { setEditingOperationDetails(false); setShowOperationDetails(false); }}><X size={15} /></button></div></header>
@@ -2728,7 +2727,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               <button onClick={cancelOperationEdit} disabled={operationBusy}>取消</button><button className="primary" onClick={saveOperationEdits} disabled={operationBusy}>{operationBusy ? <LoaderCircle className="spin" size={14} /> : <ShieldCheck size={14} />}{operationBusy ? "保存并校核中…" : "保存并重新检验"}</button>
             </footer>}
           </section>}
-        </aside>
+        </aside>}
 
         <section className={`viewport panel inspection-rail-host ${activeMode === "刀路" || activeMode === "仿真" ? "show-toolpath-legend" : ""}`}>
           {automationBlocked && <div className="capability-blocker">
@@ -2788,6 +2787,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             activeOperationLabel={selectedOperation?.name}
             operationContextVisible={showOperationViewSwitch || stockSelected}
             operationIntent={stockSelected ? null : operationIntent}
+            compositionInsetLeftRatio={leftWorkbenchPanel ? (showOperationViewSwitch || stockSelected ? 0.25 : 0.16) : 0}
+            compositionInsetRightRatio={leftWorkbenchPanel ? 0.04 : 0}
           />
           {stockSelected && <section className="operation-context-card stock-context-card" aria-label="毛坯视图">
             <header><span>加工起点</span><div><button type="button" aria-label="关闭毛坯窗口" title="关闭" onClick={() => setStockSelected(false)}><X size={15} /></button></div></header>
@@ -2797,7 +2798,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             <footer><i />工艺路线起始状态</footer>
           </section>}
           {showOperationViewSwitch && selectedOperation && <section className="operation-context-card" aria-label={`${selectedOperation.name} 工序视图`}>
-            <header><span>当前工序</span><div><em>{selectedOperation.id}</em><button type="button" aria-label="关闭工序窗口" title="关闭" onClick={() => setShowOperationViewSwitch(false)}><X size={15} /></button></div></header>
+            <header><span>当前工序</span><div><em>{selectedOperation.id}</em><button type="button" aria-label="关闭工序窗口" title="关闭" onClick={() => { setShowOperationViewSwitch(false); setShowOperationDetails(false); setEditingOperationDetails(false); }}><X size={15} /></button></div></header>
             <strong>{selectedOperation.name}</strong>
             <div className="operation-context-meta"><span>{selectedOperation.tool.name}</span>{selectedSetup?.work_axis && <span>方向 X{selectedSetup.work_axis.x.toFixed(0)} Y{selectedSetup.work_axis.y.toFixed(0)} Z{selectedSetup.work_axis.z.toFixed(0)}</span>}</div>
             <nav className="operation-view-tabs" aria-label="工序视图切换">

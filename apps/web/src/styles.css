@@ -781,6 +781,124 @@ body { min-width: 980px; background: #eef3f9; }
   flex-direction: column;
   gap: 10px;
 }
+.workbench-workspace {
+  --floating-sidebar-width: 340px;
+  position: relative;
+  display: block;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  background: #eef3f9;
+}
+.workbench-workspace > .workbench-sidebar {
+  position: absolute;
+  z-index: 16;
+  top: 8px;
+  bottom: 8px;
+  left: 8px;
+  width: var(--floating-sidebar-width);
+}
+.workbench-workspace > .workbench-sidebar .accordion-panel {
+  box-shadow: 0 8px 25px #2e466d26;
+  backdrop-filter: blur(8px);
+}
+.workbench-workspace > .viewport {
+  position: absolute;
+  inset: 0;
+  width: auto;
+  height: auto;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+.workbench-workspace > .viewport .operation-context-card {
+  left: calc(var(--floating-sidebar-width) + 24px);
+}
+.workbench-workspace > .viewport .orientation-axis {
+  left: calc(var(--floating-sidebar-width) + 22px);
+}
+.workbench-workspace > .viewport .viewer-badge {
+  left: calc(var(--floating-sidebar-width) + 24px);
+}
+.workbench-panel-switcher {
+  position: absolute;
+  z-index: 18;
+  top: 12px;
+  left: 12px;
+  height: 44px;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  box-sizing: border-box;
+  background: #fff;
+  border: 1px solid #9db7f2;
+  border-radius: 7px;
+  box-shadow: 0 5px 14px #3156b326;
+  backdrop-filter: blur(8px);
+}
+.workbench-panel-switcher button {
+  min-width: 106px;
+  height: 34px;
+  padding: 0 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: #365ed8;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  transition: color .16s ease, background .16s ease, box-shadow .16s ease;
+}
+.workbench-panel-switcher button:hover { color: #244ed0; background: #eef3ff; }
+.workbench-panel-switcher button.active { color: #fff; background: #4569e7; box-shadow: 0 3px 8px #3656ce45; }
+.workbench-panel-switcher button:focus-visible { outline: 2px solid #8ba8f3; outline-offset: 1px; }
+.workbench-workspace > .floating-workbench-panel {
+  top: 64px;
+  bottom: 10px;
+  left: 12px;
+}
+.floating-workbench-panel .accordion-panel { height: 100%; flex: 1 1 auto; }
+.floating-panel-heading {
+  min-height: 42px;
+  padding: 0 8px 0 12px;
+  display: flex;
+  flex: 0 0 42px;
+  align-items: center;
+  gap: 7px;
+  color: #fff;
+  background: linear-gradient(100deg, #4569e7, #5879ec);
+  border: 0;
+}
+.floating-panel-heading > span { font-weight: 700; letter-spacing: .02em; }
+.floating-panel-heading > small { margin-left: auto; color: #eef2ff; font: 9px "JetBrains Mono", monospace; }
+.floating-panel-heading > button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.floating-panel-heading > button:hover { background: #ffffff24; }
+.floating-workbench-panel .feature-tree .floating-panel-heading {
+  color: #fff;
+  background: linear-gradient(100deg, #4569e7, #5879ec) !important;
+  border-bottom-color: #385bd6;
+}
+.workbench-workspace > .viewport .viewer-badge,
+.workbench-workspace > .viewport .process-view-legend { display: none; }
+.workbench-workspace:not(.left-panel-open) > .viewport .operation-context-card,
+.workbench-workspace:not(.left-panel-open) > .viewport .viewer-badge { left: 16px; }
+.workbench-workspace:not(.left-panel-open) > .viewport .orientation-axis { left: 18px; }
 .accordion-panel {
   min-height: 0;
   display: flex;
@@ -841,9 +959,6 @@ body { min-width: 980px; background: #eef3f9; }
 .feature-tree .manufacturing-feature-heading { height: 40px; min-height: 40px; padding: 0 11px; display: flex; flex: 0 0 40px; align-items: center; gap: 7px; color: #fff; background: linear-gradient(100deg, #4569e7, #5879ec); border-bottom-color: #385bd6; }
 .manufacturing-feature-heading span { font-weight: 700; letter-spacing: .02em; }
 .manufacturing-feature-heading small { margin-left: auto; color: #dbe3ff; font: 8px "JetBrains Mono", monospace; }
-.manufacturing-feature-search { padding: 8px; flex: 0 0 auto; background: #f7f9fc; border-bottom: 1px solid #e1e7f0; }
-.manufacturing-feature-search input { width: 100%; height: 30px; padding: 0 9px; box-sizing: border-box; color: #34465e; background: #fff; border: 1px solid #d9e1ed; border-radius: 6px; outline: none; font-size: 9px; }
-.manufacturing-feature-search input:focus { border-color: #6f92d9; box-shadow: 0 0 0 2px #6489da1f; }
 .manufacturing-feature-list { display: flex; flex-direction: column; scrollbar-color: #9ba8ba transparent; scrollbar-width: thin; }
 .manufacturing-feature-list > button { width: 100%; min-height: 52px; padding: 7px 10px; display: grid; grid-template-columns: 10px minmax(0, 1fr); align-items: center; gap: 8px; color: #2e3c53; background: #fff; border: 0; border-bottom: 1px solid #e8edf4; cursor: pointer; text-align: left; }
 .manufacturing-feature-list > button:hover { background: #f3f6fd; }
@@ -1600,6 +1715,7 @@ body { min-width: 980px; background: #eef3f9; }
 
 @media (max-width: 1250px) {
   .workspace { grid-template-columns: 280px minmax(450px, 1fr); }
+  .workbench-workspace { --floating-sidebar-width: 280px; }
   .workspace-toolbar .plan-state { display: none; }
   .context-actions button { padding: 0 8px; }
 }

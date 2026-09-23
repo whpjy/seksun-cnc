@@ -51,6 +51,8 @@ type Props = {
   operationContextVisible?: boolean;
   operationIntent?: ProcessOperationIntent | null;
   showFeatureSummary?: boolean;
+  compositionInsetLeftRatio?: number;
+  compositionInsetRightRatio?: number;
 };
 
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
@@ -89,7 +91,7 @@ function featureFilterKey(feature: ManufacturingFeature): FeatureFilterKey {
   return "profile";
 }
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", isolatedFeatureId = null, workAxis = null, activeOperationLabel = "", operationContextVisible = false, operationIntent = null, showFeatureSummary = true }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", isolatedFeatureId = null, workAxis = null, activeOperationLabel = "", operationContextVisible = false, operationIntent = null, showFeatureSummary = true, compositionInsetLeftRatio = 0, compositionInsetRightRatio = 0 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
@@ -343,6 +345,8 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     let viewSize = 100;
     let viewHeight = 200;
     let viewAspect = 1;
+    let viewportWidth = Math.max(host.clientWidth, 1);
+    let viewportHeight = Math.max(host.clientHeight, 1);
     let dynamicHeights: Float32Array | null = null;
     let dynamicLowerHeights: Float32Array | null = null;
     let surfacePositions: THREE.BufferAttribute | null = null;
@@ -418,20 +422,29 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       y: x * surfaceFrame.y.x + y * surfaceFrame.y.y + z * surfaceFrame.y.z,
       z: x * surfaceFrame.z.x + y * surfaceFrame.z.y + z * surfaceFrame.z.z,
     });
+    const applyCameraFrustum = () => {
+      const safeLeftInset = Math.min(Math.max(compositionInsetLeftRatio, 0), 0.65) * viewportWidth;
+      const safeRightInset = Math.min(Math.max(compositionInsetRightRatio, 0), 0.25) * viewportWidth;
+      const visibleCenterX = safeLeftInset + Math.max(viewportWidth - safeLeftInset - safeRightInset, 1) / 2;
+      const centerOffsetPixels = visibleCenterX - viewportWidth / 2;
+      const centerOffsetWorld = centerOffsetPixels * viewHeight / viewportHeight;
+      const halfWidth = viewHeight * viewAspect / 2;
+      camera.left = -halfWidth - centerOffsetWorld;
+      camera.right = halfWidth - centerOffsetWorld;
+      camera.top = viewHeight / 2;
+      camera.bottom = -viewHeight / 2;
+      camera.updateProjectionMatrix();
+    };
     const resize = () => {
-      const width = host.clientWidth;
-      const height = host.clientHeight;
+      viewportWidth = Math.max(host.clientWidth, 1);
+      viewportHeight = Math.max(host.clientHeight, 1);
       // Keep the CSS display size equal to the viewport. With updateStyle=false
       // a high-DPI drawing buffer (often 2×) keeps its intrinsic CSS size and
       // the host clips its top-left quadrant, making the true canvas center
       // appear at the viewport's bottom-right.
-      renderer.setSize(width, height, true);
-      viewAspect = width / Math.max(height, 1);
-      camera.left = -viewHeight * viewAspect / 2;
-      camera.right = viewHeight * viewAspect / 2;
-      camera.top = viewHeight / 2;
-      camera.bottom = -viewHeight / 2;
-      camera.updateProjectionMatrix();
+      renderer.setSize(viewportWidth, viewportHeight, true);
+      viewAspect = viewportWidth / viewportHeight;
+      applyCameraFrustum();
     };
     const observer = new ResizeObserver(resize);
     observer.observe(host);
@@ -1088,7 +1101,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         // Normal CAD views use twice the previous 19.2% size. Simulation gets
         // a larger dedicated fit so material-removal details remain readable.
         const fillRatio = viewMode === "仿真" ? 0.33 : 0.384;
-        viewHeight = Math.max(halfHeight * 2, halfWidth * 2 / Math.max(viewAspect, 0.1)) / fillRatio;
+        const visibleWidthRatio = Math.max(1 - compositionInsetLeftRatio - compositionInsetRightRatio, 0.35);
+        const visibleWidth = viewportWidth * visibleWidthRatio;
+        const visibleAspect = visibleWidth / viewportHeight;
+        viewHeight = Math.max(halfHeight * 2, halfWidth * 2 / Math.max(visibleAspect, 0.1)) / fillRatio;
         const radius = viewSize / 2;
         const distance = viewSize * 2.2;
         // Center the *visible projected bounds*, not the world origin. Turning
@@ -1104,13 +1120,9 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         controls.target.copy(target);
         camera.position.copy(target).add(direction.multiplyScalar(distance));
         camera.zoom = 1;
-        camera.left = -viewHeight * viewAspect / 2;
-        camera.right = viewHeight * viewAspect / 2;
-        camera.top = viewHeight / 2;
-        camera.bottom = -viewHeight / 2;
         camera.near = Math.max(distance - radius * 2, 0.01);
         camera.far = distance + radius * 4;
-        camera.updateProjectionMatrix();
+        applyCameraFrustum();
         controls.update();
       };
       const setView = (view: "iso" | "top" | "front" | "fit") => {
@@ -1976,7 +1988,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       host.removeChild(renderer.domElement);
       axisHost.removeChild(axisRenderer.domElement);
     };
-  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, isolatedFeatureId, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationIntent, operationTools, playbackKey, profileBoundaries, renderedFeatures, simulation, spatialDefects, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
+  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, compositionInsetLeftRatio, compositionInsetRightRatio, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, isolatedFeatureId, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationIntent, operationTools, playbackKey, profileBoundaries, renderedFeatures, simulation, spatialDefects, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
   const activeFormingStage = formingPreview?.stages.length
