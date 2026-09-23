@@ -656,6 +656,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [showSimulationChecks, setShowSimulationChecks] = useState(false);
   const [applyingRemediation, setApplyingRemediation] = useState(false);
   const [inspectionPanel, setInspectionPanel] = useState<"tools" | null>(null);
+  const [showFeatureExplorer, setShowFeatureExplorer] = useState(false);
   const inspectionPanelRef = useRef<HTMLElement>(null);
   const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
   const [deviceLibrary, setDeviceLibrary] = useState<DeviceLibrary | null>(null);
@@ -895,12 +896,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     () => [...holes, ...prismaticFeatures, ...planarMachiningFeatures, ...internalProfiles, ...rotationalManufacturingFeatures],
     [holes, internalProfiles, planarMachiningFeatures, prismaticFeatures, rotationalManufacturingFeatures],
   );
-  const excludedCount = job.analysis?.cylindrical_features.filter((item) => item.kind === "hole" && item.review_state === "excluded").length ?? 0;
-  const prismaticExcludedCount = job.analysis?.prismatic_features?.filter((item) => item.review_state === "excluded").length ?? 0;
-  const planarExcludedCount = job.analysis?.planar_machining_features?.filter((item) => item.review_state === "excluded").length ?? 0;
-  const internalProfileExcludedCount = job.analysis?.internal_profile_features?.filter((item) => item.review_state === "excluded").length ?? 0;
-  const reviewCount = manufacturingFeatures.filter((item) => item.review_state === "review").length;
-  const firstReviewFeature = manufacturingFeatures.find((item) => item.review_state === "review");
   const coverage = job.plan?.coverage;
   const profileAxialComplete = job.plan?.stock.profile_axial_complete;
   const l32WholePartBlockers = useMemo(() => {
@@ -1644,6 +1639,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     }
     setLoadingCam((mode === "刀路" || mode === "仿真") && !camResult && !isL32);
     setActiveMode(mode);
+    setShowFeatureExplorer(mode === "特征");
     if (mode === "仿真" && isL32 && selectedOperation) void previewL32Operation(selectedOperation);
   };
 
@@ -1663,12 +1659,14 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     setShowSimulationChecks(true);
   };
 
-  const openReviewQueue = () => {
+  const openFeatureExplorer = () => {
     setInspectionPanel(null);
+    setShowResourceLibrary(false);
+    setShowProcessDesigner(false);
+    setShowOperationDetails(false);
     setActiveMode("特征");
-    setOperationPopoverPosition({ top: 110, left: Math.min(326, Math.max(12, window.innerWidth - 372)), anchorY: 28 });
-    setShowOperationDetails(true);
-    if (firstReviewFeature) chooseFeature(firstReviewFeature.id);
+    setShowFeatureExplorer(true);
+    if (manufacturingFeatures[0]) chooseFeature(manufacturingFeatures[0].id);
   };
 
   const generateCam = async () => {
@@ -1735,44 +1733,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     } finally {
       setGeneratingCam(false);
     }
-  };
-
-  const reviewFeature = async (featureId: string, reviewState: "accepted" | "excluded") => {
-    const rotationalFeature = l32Rotational?.features.some((feature) => feature.id === featureId) ?? false;
-    const endpoint = rotationalFeature
-      ? `/api/v1/jobs/${job.id}/turning/features/${featureId}`
-      : `/api/v1/jobs/${job.id}/features/${featureId}`;
-    const response = await fetch(apiUrl(endpoint), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ review_state: reviewState }),
-    });
-    const payload = await response.json() as Job | RotationalFeatureAnalysis | { detail?: string };
-    if (!response.ok) {
-      const detail = "detail" in payload ? payload.detail : undefined;
-      throw new Error(detail || "特征复核保存失败");
-    }
-    let updatedOperations = operations;
-    if (rotationalFeature) {
-      setL32Rotational(payload as RotationalFeatureAnalysis);
-      setL32OperationPreview(null);
-      setL32TurningPreviews({});
-      setL32GroovePreviews({});
-      setL32GrooveSegments({});
-      setL32MillingPreviews({});
-      setL32MaterialSnapshots(null);
-      l32PreviewResponseCacheRef.current.clear();
-      l32PrewarmedOperationIdsRef.current.clear();
-    } else {
-      const updatedJob = payload as Job;
-      setJob(updatedJob);
-      updatedOperations = updatedJob.plan?.setups.flatMap((setup) => setup.operations) ?? [];
-    }
-    setCamResult(null);
-    setLoadingCam(activeMode === "刀路" || activeMode === "仿真");
-    const relatedOperation = updatedOperations.find((operation) => operation.feature_ids.includes(featureId));
-    if (relatedOperation) setSelectedOperation(relatedOperation);
-    setSelectedFeatureIds(reviewState === "excluded" ? [] : [featureId]);
   };
 
   const applyUpdatedJob = (updatedJob: Job, preferredOperationId?: string) => {
@@ -2403,7 +2363,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
                   ))}
                 </div>
               ))}
-              <div className="tree-summary"><CircleDot size={14} /> {holes.length} 孔 · {prismaticFeatures.length} 型腔/槽 · {planarMachiningFeatures.length} 平面区 · {rotationalManufacturingFeatures.length} 回转特征 · {internalProfiles.length} 内轮廓/雕刻 · {reviewCount} 待复核 · 排除 {excludedCount + prismaticExcludedCount + planarExcludedCount + internalProfileExcludedCount}</div>
+              <div className="tree-summary"><CircleDot size={14} /> {holes.length} 孔 · {prismaticFeatures.length} 型腔/槽 · {planarMachiningFeatures.length} 平面区 · {rotationalManufacturingFeatures.length} 回转特征 · {internalProfiles.length} 内轮廓/雕刻 · 共 {manufacturingFeatures.length} 项</div>
             </div>}
           </section> : <section className="panel planning-history-panel">
             <header><div><Check size={16} /><strong>工艺规划已完成</strong></div><span>{planningEvents.length} 条记录</span></header>
@@ -2469,7 +2429,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
                         <div><strong>Ø{feature.diameter.toFixed(2)} × {feature.length.toFixed(2)}</strong><small>{feature.segment_count} 个圆柱面 · {Math.round(feature.confidence * 100)}%</small></div>
                       </> : null}
                       {feature.review_reasons.map((reason) => <p key={reason}>{reason}</p>)}
-                      {!readOnly && editingOperationDetails && !("source" in feature && feature.source === "rotational") && <div className="feature-actions"><button onClick={() => reviewFeature(feature.id, "accepted")}><Check size={12} />确认特征</button><button onClick={() => reviewFeature(feature.id, "excluded")}><AlertTriangle size={12} />排除</button></div>}
                     </div>
                   ))}
                 </>
@@ -2510,7 +2469,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             features={viewerFeatures}
             selectedFeatureIds={selectedFeatureIds}
             onSelectFeature={chooseFeature}
-            onReviewFeature={readOnly ? undefined : (feature, reviewState) => reviewFeature(feature.id, reviewState)}
             toolpathSegments={visibleToolpathSegments}
             materialSnapshotUrls={visibleMaterialSnapshots.urls}
             materialSnapshotStages={visibleMaterialSnapshots.stages}
@@ -2535,27 +2493,29 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             spatialDefects={activeMode === "仿真" ? spatialDefects : null}
             onSelectDefect={chooseSpatialDefect}
             viewMode={activeMode as "特征" | "工艺" | "刀路" | "仿真"}
+            showFeatureExplorer={showFeatureExplorer}
+            onCloseFeatureExplorer={() => setShowFeatureExplorer(false)}
             workAxis={selectedSetup?.work_axis}
             activeOperationLabel={selectedOperation?.name}
           />
           <nav className="inspection-rail" aria-label="工程检查与工艺工具">
-            {reviewCount > 0 && <button className="inspection-card review" onClick={openReviewQueue} title="查看待人工复核的制造特征">
-              <em>{reviewCount}</em>
-              <AlertTriangle size={19} />
-              <strong>待复核</strong>
-              <small>{reviewCount} 项</small>
+            {manufacturingFeatures.length > 0 && <button className={`inspection-card feature ${showFeatureExplorer ? "active" : ""}`} onClick={openFeatureExplorer} title="查看已识别的制造特征">
+              <em>{manufacturingFeatures.length}</em>
+              <CircleDot size={19} />
+              <strong>特征</strong>
+              <small>{manufacturingFeatures.length} 项</small>
             </button>}
-            <button className={`inspection-card tool ${showResourceLibrary ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setDeviceInfoId(null); setShowResourceLibrary(true); }} title="打开工序库">
+            <button className={`inspection-card tool ${showResourceLibrary ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setShowFeatureExplorer(false); setDeviceInfoId(null); setShowResourceLibrary(true); }} title="打开工序库">
               <Library size={19} />
               <strong>工序库</strong>
               <small>{catalogs?.operations.length ?? 0} 项工序</small>
             </button>
-            {operations.length > 0 && <button className={`inspection-card process-design ${showProcessDesigner ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setShowProcessDesigner(true); }} title="逐步设计和调整工序">
+            {operations.length > 0 && <button className={`inspection-card process-design ${showProcessDesigner ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setShowFeatureExplorer(false); setShowProcessDesigner(true); }} title="逐步设计和调整工序">
               <Layers3 size={19} />
               <strong>工序设计</strong>
               <small>编辑与插入</small>
             </button>}
-            {isL32 && <button className={`inspection-card tool ${inspectionPanel === "tools" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => setInspectionPanel((current) => current === "tools" ? null : "tools")} title="打开刀具库">
+            {isL32 && <button className={`inspection-card tool ${inspectionPanel === "tools" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => { setShowFeatureExplorer(false); setInspectionPanel((current) => current === "tools" ? null : "tools"); }} title="打开刀具库">
               <Wrench size={19} />
               <strong>刀具库</strong>
               <small>现场刀具</small>

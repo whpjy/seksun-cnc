@@ -14,7 +14,6 @@ type Props = {
   features: ManufacturingFeature[];
   selectedFeatureIds: string[];
   onSelectFeature: (id: string) => void;
-  onReviewFeature?: (feature: ManufacturingFeature, reviewState: "accepted" | "excluded") => void | Promise<void>;
   toolpathSegments?: ToolpathSegment[];
   materialSnapshotUrls?: string[];
   materialSnapshotStages?: { operationId: string; start: number; count: number }[];
@@ -39,6 +38,8 @@ type Props = {
   spatialDefects?: { regions: SpatialDefectRegion[]; samples: SpatialDefectSample[] } | null;
   onSelectDefect?: (region: SpatialDefectRegion) => void;
   viewMode?: ViewMode;
+  showFeatureExplorer?: boolean;
+  onCloseFeatureExplorer?: () => void;
   workAxis?: Vec3 | null;
   activeOperationLabel?: string;
 };
@@ -112,7 +113,7 @@ function featureDimensionLabel(feature: ManufacturingFeature) {
   return `${feature.length.toFixed(2)} × ${feature.width.toFixed(2)} mm`;
 }
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, onReviewFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", workAxis = null, activeOperationLabel = "" }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", showFeatureExplorer = true, onCloseFeatureExplorer, workAxis = null, activeOperationLabel = "" }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
@@ -128,27 +129,19 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const [progress, setProgress] = useState(initialProgress);
   const [speed, setSpeed] = useState(1);
   const [snapshotLoadError, setSnapshotLoadError] = useState<string | null>(null);
-  const [activeFeatureFilters, setActiveFeatureFilters] = useState<FeatureFilterKey[]>(FEATURE_FILTERS.map((item) => item.key));
-  const [reviewOnly, setReviewOnly] = useState(false);
   const [featureSearch, setFeatureSearch] = useState("");
   const [isolatedFeatureId, setIsolatedFeatureId] = useState<string | null>(null);
-  const [featureReviewBusyId, setFeatureReviewBusyId] = useState<string | null>(null);
-  const [featureReviewError, setFeatureReviewError] = useState("");
   const featureCounts = useMemo(() => FEATURE_FILTERS.reduce<Record<FeatureFilterKey, number>>((counts, filter) => {
     counts[filter.key] = features.filter((feature) => featureFilterKey(feature) === filter.key).length;
     return counts;
   }, { hole: 0, pocket: 0, slot: 0, surface: 0, turning: 0, profile: 0 }), [features]);
   const filteredFeatures = useMemo(() => {
     const query = featureSearch.trim().toLocaleLowerCase("zh-CN");
-    return features.filter((feature) =>
-      activeFeatureFilters.includes(featureFilterKey(feature))
-      && (!reviewOnly || feature.review_state === "review")
-      && (!query || `${feature.id} ${featureDisplayName(feature)} ${feature.review_reasons.join(" ")}`.toLocaleLowerCase("zh-CN").includes(query)),
-    );
-  }, [activeFeatureFilters, featureSearch, features, reviewOnly]);
+    return features.filter((feature) => !query || `${feature.id} ${featureDisplayName(feature)}`.toLocaleLowerCase("zh-CN").includes(query));
+  }, [featureSearch, features]);
   const renderedFeatures = useMemo(() => viewMode === "特征"
-    ? isolatedFeatureId ? filteredFeatures.filter((feature) => feature.id === isolatedFeatureId) : filteredFeatures
-    : features, [features, filteredFeatures, isolatedFeatureId, viewMode]);
+    ? showFeatureExplorer && isolatedFeatureId ? filteredFeatures.filter((feature) => feature.id === isolatedFeatureId) : filteredFeatures
+    : features, [features, filteredFeatures, isolatedFeatureId, showFeatureExplorer, viewMode]);
   const [activeMotion, setActiveMotion] = useState<{ operation: string; setup?: string; motion: string; removesMaterial: boolean } | null>(null);
   const [targetVisible, setTargetVisible] = useState(false);
   const targetVisibleRef = useRef(false);
@@ -1983,27 +1976,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const visibleActiveDefect = activeDefect
     ? spatialDefects?.regions.find((region) => region.id === activeDefect.id) ?? null
     : null;
-  const selectedManufacturingFeature = renderedFeatures.find((feature) => selectedFeatureIds.includes(feature.id)) ?? null;
-  const toggleFeatureFilter = (key: FeatureFilterKey) => setActiveFeatureFilters((current) =>
-    current.includes(key) ? current.filter((item) => item !== key) : [...current, key],
-  );
   const selectFeature = (featureId: string) => {
-    setFeatureReviewError("");
+    setIsolatedFeatureId(featureId);
     onSelectFeature(featureId);
     viewApiRef.current?.focusFeature(featureId);
-  };
-  const reviewFeatureSelection = async (feature: ManufacturingFeature, reviewState: "accepted" | "excluded") => {
-    if (!onReviewFeature || featureReviewBusyId) return;
-    setFeatureReviewBusyId(feature.id);
-    setFeatureReviewError("");
-    try {
-      await onReviewFeature(feature, reviewState);
-      if (reviewState === "excluded") setIsolatedFeatureId(null);
-    } catch (reason) {
-      setFeatureReviewError(reason instanceof Error ? reason.message : "特征复核失败，请稍后重试");
-    } finally {
-      setFeatureReviewBusyId(null);
-    }
   };
   const modeClass = { "特征": "features", "工艺": "process", "刀路": "toolpath", "仿真": "simulation" }[viewMode];
   const modeTitle = simulationBlocked ? "原始零件" : { "特征": "特征识别", "工艺": "工艺规划", "刀路": "刀路结果", "仿真": "加工仿真" }[viewMode];
@@ -2019,41 +1995,23 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   return (
     <div className={`model-viewer mode-${modeClass}`} ref={hostRef}>
       <div className="orientation-axis" ref={axisHostRef} aria-label="视图坐标轴"><small>视图坐标</small></div>
-      <div className="viewer-badge"><strong>{modeTitle}</strong><small>{modeDetail}</small></div>
-      {viewMode === "特征" && <div className="feature-view-legend feature-filter-bar" aria-label="特征显示筛选">
-        <div className="feature-filter-kinds">
-          {FEATURE_FILTERS.map((filter) => <button key={filter.key} type="button" className={activeFeatureFilters.includes(filter.key) ? "active" : ""} aria-pressed={activeFeatureFilters.includes(filter.key)} disabled={featureCounts[filter.key] === 0} onClick={() => toggleFeatureFilter(filter.key)}><i className={filter.colorClass} />{filter.label}<em>{featureCounts[filter.key]}</em></button>)}
+      {viewMode === "特征" ? <div className="viewer-badge feature-view-summary" aria-label="特征识别概览">
+        <strong>{modeTitle}</strong>
+        <small>{modeDetail}</small>
+        <div className="feature-filter-kinds" aria-label="特征类型图例">
+          {FEATURE_FILTERS.map((filter) => <span key={filter.key} className={featureCounts[filter.key] === 0 ? "empty" : ""}><i className={filter.colorClass} />{filter.label}<em>{featureCounts[filter.key]}</em></span>)}
         </div>
-        <div className="feature-filter-actions">
-          <button type="button" className={reviewOnly ? "active review-only" : ""} aria-pressed={reviewOnly} onClick={() => setReviewOnly((value) => !value)}>仅待复核</button>
-          <button type="button" onClick={() => { setActiveFeatureFilters(FEATURE_FILTERS.map((item) => item.key)); setReviewOnly(false); }}>全部</button>
-          <button type="button" onClick={() => setActiveFeatureFilters([])}>清空</button>
-          <button type="button" onClick={() => viewApiRef.current?.setView("fit")}>适应整件</button>
-        </div>
-      </div>}
-      {viewMode === "特征" && <aside className="feature-explorer" aria-label="制造特征列表">
-        <header><div><strong>制造特征</strong><small>{filteredFeatures.length} / {features.length}</small></div>{isolatedFeatureId && <button type="button" onClick={() => setIsolatedFeatureId(null)}>退出单独显示</button>}</header>
-        <input type="search" value={featureSearch} onChange={(event) => setFeatureSearch(event.target.value)} placeholder="搜索编号、类型或识别依据" aria-label="搜索制造特征" />
+      </div> : <div className="viewer-badge"><strong>{modeTitle}</strong><small>{modeDetail}</small></div>}
+      {viewMode === "特征" && showFeatureExplorer && <aside className="feature-explorer" aria-label="制造特征列表">
+        <header><div><small>FEATURE LIST</small><strong>制造特征</strong></div><span>{filteredFeatures.length} / {features.length} 项</span>{onCloseFeatureExplorer && <button type="button" aria-label="关闭制造特征面板" onClick={() => { setIsolatedFeatureId(null); onCloseFeatureExplorer(); }}>×</button>}</header>
+        <input type="search" value={featureSearch} onChange={(event) => setFeatureSearch(event.target.value)} placeholder="搜索编号或特征类型" aria-label="搜索制造特征" />
         <div className="feature-explorer-list">
           {filteredFeatures.map((feature) => <button type="button" key={feature.id} className={`${selectedFeatureIds.includes(feature.id) ? "selected" : ""} ${isolatedFeatureId === feature.id ? "isolated" : ""}`} onClick={() => selectFeature(feature.id)}>
             <i style={{ backgroundColor: `#${featureMarkerColor(feature).toString(16).padStart(6, "0")}` }} />
             <span><strong>{featureDisplayName(feature)}</strong><small>{feature.id} · {featureDimensionLabel(feature)}</small></span>
-            <em className={feature.review_state}>{feature.review_state === "accepted" ? "已确认" : feature.review_state === "excluded" ? "已排除" : `${Math.round(feature.confidence * 100)}%`}</em>
           </button>)}
           {filteredFeatures.length === 0 && <p>当前筛选条件下没有特征。</p>}
         </div>
-        {selectedManufacturingFeature && <section className={`feature-explorer-detail ${selectedManufacturingFeature.review_state}`}>
-          <small>{selectedManufacturingFeature.id} · {selectedManufacturingFeature.review_state === "accepted" ? "已确认" : selectedManufacturingFeature.review_state === "excluded" ? "已排除" : "待复核"}</small>
-          <strong>{featureDisplayName(selectedManufacturingFeature)}</strong>
-          <span>{featureDimensionLabel(selectedManufacturingFeature)} · 置信度 {Math.round(selectedManufacturingFeature.confidence * 100)}%</span>
-          {selectedManufacturingFeature.review_reasons[0] && <p>{selectedManufacturingFeature.review_reasons[0]}</p>}
-          <div><button type="button" onClick={() => viewApiRef.current?.focusFeature(selectedManufacturingFeature.id)}>定位</button><button type="button" className={isolatedFeatureId === selectedManufacturingFeature.id ? "active" : ""} onClick={() => setIsolatedFeatureId((current) => current === selectedManufacturingFeature.id ? null : selectedManufacturingFeature.id)}>{isolatedFeatureId === selectedManufacturingFeature.id ? "显示全部" : "单独显示"}</button></div>
-          {onReviewFeature && selectedManufacturingFeature.review_state === "review" && <div className="feature-review-actions">
-            <button type="button" className="accept" disabled={featureReviewBusyId !== null} onClick={() => void reviewFeatureSelection(selectedManufacturingFeature, "accepted")}>{featureReviewBusyId === selectedManufacturingFeature.id ? "保存中…" : "确认特征"}</button>
-            <button type="button" className="exclude" disabled={featureReviewBusyId !== null} onClick={() => void reviewFeatureSelection(selectedManufacturingFeature, "excluded")}>排除误识别</button>
-          </div>}
-          {featureReviewError && <p className="feature-review-error">{featureReviewError}</p>}
-        </section>}
       </aside>}
       {viewMode === "工艺" && <div className="process-view-legend"><i />当前工序加工区域{workAxis && <small>方向 X{workAxis.x.toFixed(0)} Y{workAxis.y.toFixed(0)} Z{workAxis.z.toFixed(0)}</small>}</div>}
       {(viewMode === "刀路" || viewMode === "仿真") && <div className="viewer-legend">{formingPreview ? <>原始板料 <i className="selected" />落料件 → 预成形 → 终成形样品</> : <><i />快速移动 <i className="selected" />切削轨迹 · 已完成轨迹自动淡化</>}</div>}
