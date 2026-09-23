@@ -5,6 +5,7 @@ import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { toCreasedNormals } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import type { FixtureComponent, FormingPreview, ManufacturingFeature, SimulationResult, SpatialDefectRegion, SpatialDefectSample, ToolpathSegment, TurningStageView, Vec3 } from "./types";
+import { featureMarkerColor } from "./featurePresentation";
 
 type ViewMode = "特征" | "工艺" | "刀路" | "仿真";
 type FeatureFilterKey = "hole" | "pocket" | "slot" | "surface" | "turning" | "profile";
@@ -38,8 +39,7 @@ type Props = {
   spatialDefects?: { regions: SpatialDefectRegion[]; samples: SpatialDefectSample[] } | null;
   onSelectDefect?: (region: SpatialDefectRegion) => void;
   viewMode?: ViewMode;
-  showFeatureExplorer?: boolean;
-  onCloseFeatureExplorer?: () => void;
+  isolatedFeatureId?: string | null;
   workAxis?: Vec3 | null;
   activeOperationLabel?: string;
 };
@@ -75,45 +75,7 @@ function featureFilterKey(feature: ManufacturingFeature): FeatureFilterKey {
   return "profile";
 }
 
-function featureMarkerColor(feature: ManufacturingFeature) {
-  if (feature.kind === "hole") return 0x4f7cff;
-  if (feature.kind === "pocket") return 0xf0a23b;
-  if (feature.kind === "slot") return 0xa66be0;
-  if (feature.kind === "planar_surface") return 0x24a8b8;
-  if ("source" in feature && feature.source === "rotational") {
-    if (feature.kind.includes("groove")) return 0xe0588b;
-    if (feature.kind === "inner_bore" || feature.kind === "inner_taper") return 0x35b779;
-    return 0xe5b43b;
-  }
-  return 0x18b89a;
-}
-
-function featureDisplayName(feature: ManufacturingFeature) {
-  if (feature.kind === "hole") return feature.end_type === "through" ? "通孔" : feature.end_type === "blind" ? "盲孔" : "孔候选";
-  if (feature.kind === "pocket") return "封闭型腔";
-  if (feature.kind === "slot") return "贯通槽";
-  if (feature.kind === "planar_surface") return "平面铣削区域";
-  if (feature.kind === "internal_profile") return feature.machining_kind === "engraving" ? "浅雕刻" : "内部轮廓";
-  if (feature.kind === "external_groove_candidate") return "外圆槽候选";
-  if (feature.kind === "internal_groove_candidate") return "内圆槽候选";
-  if (feature.kind === "cylindrical_land") return "外圆段";
-  if (feature.kind === "inner_bore") return "内孔段";
-  if (feature.kind === "inner_taper") return "内锥段";
-  if (feature.kind === "taper") return "外锥段";
-  if (feature.kind === "radial_transition") return "圆弧/台阶过渡";
-  if (feature.kind === "thread_form_candidate") return "螺纹形态候选";
-  return "切断边界";
-}
-
-function featureDimensionLabel(feature: ManufacturingFeature) {
-  if ("source" in feature && feature.source === "rotational") {
-    return `Ø${feature.diameter.toFixed(2)} × ${feature.width_mm.toFixed(2)} mm`;
-  }
-  if ("diameter" in feature) return `Ø${feature.diameter.toFixed(2)} × ${feature.length.toFixed(2)} mm`;
-  return `${feature.length.toFixed(2)} × ${feature.width.toFixed(2)} mm`;
-}
-
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", showFeatureExplorer = true, onCloseFeatureExplorer, workAxis = null, activeOperationLabel = "" }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", isolatedFeatureId = null, workAxis = null, activeOperationLabel = "" }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
@@ -129,19 +91,13 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const [progress, setProgress] = useState(initialProgress);
   const [speed, setSpeed] = useState(1);
   const [snapshotLoadError, setSnapshotLoadError] = useState<string | null>(null);
-  const [featureSearch, setFeatureSearch] = useState("");
-  const [isolatedFeatureId, setIsolatedFeatureId] = useState<string | null>(null);
   const featureCounts = useMemo(() => FEATURE_FILTERS.reduce<Record<FeatureFilterKey, number>>((counts, filter) => {
     counts[filter.key] = features.filter((feature) => featureFilterKey(feature) === filter.key).length;
     return counts;
   }, { hole: 0, pocket: 0, slot: 0, surface: 0, turning: 0, profile: 0 }), [features]);
-  const filteredFeatures = useMemo(() => {
-    const query = featureSearch.trim().toLocaleLowerCase("zh-CN");
-    return features.filter((feature) => !query || `${feature.id} ${featureDisplayName(feature)}`.toLocaleLowerCase("zh-CN").includes(query));
-  }, [featureSearch, features]);
   const renderedFeatures = useMemo(() => viewMode === "特征"
-    ? showFeatureExplorer && isolatedFeatureId ? filteredFeatures.filter((feature) => feature.id === isolatedFeatureId) : filteredFeatures
-    : features, [features, filteredFeatures, isolatedFeatureId, showFeatureExplorer, viewMode]);
+    ? isolatedFeatureId ? features.filter((feature) => feature.id === isolatedFeatureId) : features
+    : features, [features, isolatedFeatureId, viewMode]);
   const [activeMotion, setActiveMotion] = useState<{ operation: string; setup?: string; motion: string; removesMaterial: boolean } | null>(null);
   const [targetVisible, setTargetVisible] = useState(false);
   const targetVisibleRef = useRef(false);
@@ -236,6 +192,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       marker.renderOrder = selected ? 5 : 3;
     }
   }, [selectedFeatureIds, viewMode]);
+
+  useEffect(() => {
+    if (isolatedFeatureId) viewApiRef.current?.focusFeature(isolatedFeatureId);
+  }, [isolatedFeatureId]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -1976,11 +1936,6 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   const visibleActiveDefect = activeDefect
     ? spatialDefects?.regions.find((region) => region.id === activeDefect.id) ?? null
     : null;
-  const selectFeature = (featureId: string) => {
-    setIsolatedFeatureId(featureId);
-    onSelectFeature(featureId);
-    viewApiRef.current?.focusFeature(featureId);
-  };
   const modeClass = { "特征": "features", "工艺": "process", "刀路": "toolpath", "仿真": "simulation" }[viewMode];
   const modeTitle = simulationBlocked ? "原始零件" : { "特征": "特征识别", "工艺": "工艺规划", "刀路": "刀路结果", "仿真": "加工仿真" }[viewMode];
   const modeDetail = simulationBlocked ? "整件结果未通过检查，当前显示原始 3D"
@@ -2002,17 +1957,6 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           {FEATURE_FILTERS.map((filter) => <span key={filter.key} className={featureCounts[filter.key] === 0 ? "empty" : ""}><i className={filter.colorClass} />{filter.label}<em>{featureCounts[filter.key]}</em></span>)}
         </div>
       </div> : <div className="viewer-badge"><strong>{modeTitle}</strong><small>{modeDetail}</small></div>}
-      {viewMode === "特征" && showFeatureExplorer && <aside className="feature-explorer" aria-label="制造特征列表">
-        <header><div><small>FEATURE LIST</small><strong>制造特征</strong></div><span>{filteredFeatures.length} / {features.length} 项</span>{onCloseFeatureExplorer && <button type="button" aria-label="关闭制造特征面板" onClick={() => { setIsolatedFeatureId(null); onCloseFeatureExplorer(); }}>×</button>}</header>
-        <input type="search" value={featureSearch} onChange={(event) => setFeatureSearch(event.target.value)} placeholder="搜索编号或特征类型" aria-label="搜索制造特征" />
-        <div className="feature-explorer-list">
-          {filteredFeatures.map((feature) => <button type="button" key={feature.id} className={`${selectedFeatureIds.includes(feature.id) ? "selected" : ""} ${isolatedFeatureId === feature.id ? "isolated" : ""}`} onClick={() => selectFeature(feature.id)}>
-            <i style={{ backgroundColor: `#${featureMarkerColor(feature).toString(16).padStart(6, "0")}` }} />
-            <span><strong>{featureDisplayName(feature)}</strong><small>{feature.id} · {featureDimensionLabel(feature)}</small></span>
-          </button>)}
-          {filteredFeatures.length === 0 && <p>当前筛选条件下没有特征。</p>}
-        </div>
-      </aside>}
       {viewMode === "工艺" && <div className="process-view-legend"><i />当前工序加工区域{workAxis && <small>方向 X{workAxis.x.toFixed(0)} Y{workAxis.y.toFixed(0)} Z{workAxis.z.toFixed(0)}</small>}</div>}
       {(viewMode === "刀路" || viewMode === "仿真") && <div className="viewer-legend">{formingPreview ? <>原始板料 <i className="selected" />落料件 → 预成形 → 终成形样品</> : <><i />快速移动 <i className="selected" />切削轨迹 · 已完成轨迹自动淡化</>}</div>}
       {spatialDefects && spatialDefects.regions.length > 0 && <div className="defect-legend"><span><i className="overcut" />过切</span><span><i className="rest" />残料</span><small>点击色块定位责任工序</small></div>}

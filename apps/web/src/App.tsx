@@ -26,7 +26,7 @@ import {
   X,
 } from "lucide-react";
 import { ModelViewer } from "./ModelViewer";
-import { L32ProgramViewer } from "./L32ProgramViewer";
+import { featureDimensionLabel, featureDisplayName, featureMarkerColor } from "./featurePresentation";
 import { L32Workbench } from "./L32Workbench";
 import { ToolLibraryPanel } from "./ToolLibraryPanel";
 import { ProcessDesigner } from "./ProcessDesigner";
@@ -656,7 +656,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [showSimulationChecks, setShowSimulationChecks] = useState(false);
   const [applyingRemediation, setApplyingRemediation] = useState(false);
   const [inspectionPanel, setInspectionPanel] = useState<"tools" | null>(null);
-  const [showFeatureExplorer, setShowFeatureExplorer] = useState(false);
+  const [isolatedFeatureId, setIsolatedFeatureId] = useState<string | null>(null);
+  const [featureSearch, setFeatureSearch] = useState("");
   const inspectionPanelRef = useRef<HTMLElement>(null);
   const [catalogs, setCatalogs] = useState<Catalogs | null>(null);
   const [deviceLibrary, setDeviceLibrary] = useState<DeviceLibrary | null>(null);
@@ -668,10 +669,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [solidBusy, setSolidBusy] = useState(false);
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
   const [structureExpanded, setStructureExpanded] = useState(true);
-  const [sidebarView, setSidebarView] = useState<"route" | "planning">("route");
-  const [planningEvents, setPlanningEvents] = useState<PlanningProgressEvent[]>([]);
-  const [planningEventsLoading, setPlanningEventsLoading] = useState(true);
-  const [planningEventsError, setPlanningEventsError] = useState("");
+  const [featureStructureExpanded, setFeatureStructureExpanded] = useState(false);
+  const [showOperationViewSwitch, setShowOperationViewSwitch] = useState(false);
   const [showOperationDetails, setShowOperationDetails] = useState(false);
   const [editingOperationDetails, setEditingOperationDetails] = useState(false);
   const [toolDraftId, setToolDraftId] = useState(selectedOperation?.tool.id ?? "");
@@ -679,7 +678,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [playbackMode, setPlaybackMode] = useState<"single" | "cumulative">("single");
   const [playbackResetToken, setPlaybackResetToken] = useState(0);
   const [showL32Workbench, setShowL32Workbench] = useState(false);
-  const [showL32Program, setShowL32Program] = useState(false);
   const [showProcessDesigner, setShowProcessDesigner] = useState(false);
   const [l32Program, setL32Program] = useState<WholePartDraftResult | null>(null);
   const [l32Rotational, setL32Rotational] = useState<RotationalFeatureAnalysis | null>(null);
@@ -723,23 +721,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   useEffect(() => {
     jobSnapshotRef.current = JSON.stringify(job);
   }, [job]);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch(apiUrl(`/api/v1/jobs/${initialJob.id}/planning-events`), { cache: "no-store" })
-      .then(async (response) => {
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.detail || "规划过程加载失败");
-        if (!cancelled) setPlanningEvents(payload as PlanningProgressEvent[]);
-      })
-      .catch((reason) => {
-        if (!cancelled) setPlanningEventsError(reason instanceof Error ? reason.message : "规划过程加载失败");
-      })
-      .finally(() => {
-        if (!cancelled) setPlanningEventsLoading(false);
-      });
-    return () => { cancelled = true; };
-  }, [initialJob.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -896,6 +877,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     () => [...holes, ...prismaticFeatures, ...planarMachiningFeatures, ...internalProfiles, ...rotationalManufacturingFeatures],
     [holes, internalProfiles, planarMachiningFeatures, prismaticFeatures, rotationalManufacturingFeatures],
   );
+  const visibleManufacturingFeatures = useMemo(() => {
+    const query = featureSearch.trim().toLocaleLowerCase("zh-CN");
+    return manufacturingFeatures.filter((feature) => !query || `${feature.id} ${featureDisplayName(feature)}`.toLocaleLowerCase("zh-CN").includes(query));
+  }, [featureSearch, manufacturingFeatures]);
   const coverage = job.plan?.coverage;
   const profileAxialComplete = job.plan?.stock.profile_axial_complete;
   const l32WholePartBlockers = useMemo(() => {
@@ -1570,19 +1555,19 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }, [activeMode, camResult, isL32, job.id, operations, readOnly]);
 
   const chooseOperation = (operation: Operation) => {
-    if (activeMode === "仿真" && camResult && !cutOperationIds.has(operation.id)) return;
     setSelectedOperation(operation);
     setSelectedFeatureIds(operation.feature_ids);
-    if (isL32) {
-      setActiveMode("仿真");
-      void previewL32Operation(operation);
-    }
+    setActiveMode("工艺");
+    setIsolatedFeatureId(null);
+    setShowOperationViewSwitch(true);
   };
 
   const openOperationDetails = (operation: Operation, anchor: HTMLElement) => {
     setSelectedOperation(operation);
     setSelectedFeatureIds(operation.feature_ids);
     setActiveMode("工艺");
+    setIsolatedFeatureId(null);
+    setShowOperationViewSwitch(true);
     setEditingOperationDetails(false);
     setToolDraftId(operation.tool.id);
     setParameterEdits({});
@@ -1608,15 +1593,15 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
 
   const openOperationSimulation = (operation: Operation) => {
     if (operation.enabled === false) return;
-    if (camResult && !isL32 && !cutOperationIds.has(operation.id)) return;
     setSelectedOperation(operation);
     setSelectedFeatureIds(operation.feature_ids);
     setEditingOperationDetails(false);
     setShowOperationDetails(false);
     setPlaybackResetToken((current) => current + 1);
-    setLoadingCam(!camResult && !isL32);
-    setActiveMode("仿真");
-    if (isL32) void previewL32Operation(operation);
+    setLoadingCam(false);
+    setActiveMode("工艺");
+    setIsolatedFeatureId(null);
+    setShowOperationViewSwitch(true);
   };
 
   const cancelOperationEdit = () => {
@@ -1639,11 +1624,21 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     }
     setLoadingCam((mode === "刀路" || mode === "仿真") && !camResult && !isL32);
     setActiveMode(mode);
-    setShowFeatureExplorer(mode === "特征");
+    if (mode !== "特征") setIsolatedFeatureId(null);
+    if (mode === "特征") {
+      setInspectionPanel(null);
+      setShowResourceLibrary(false);
+      setShowProcessDesigner(false);
+      setShowOperationDetails(false);
+    }
     if (mode === "仿真" && isL32 && selectedOperation) void previewL32Operation(selectedOperation);
   };
 
   const chooseFeature = (id: string) => {
+    setActiveMode("特征");
+    setIsolatedFeatureId(id);
+    setShowOperationViewSwitch(false);
+    setShowOperationDetails(false);
     setSelectedFeatureIds([id]);
     const relatedOperation = operations.find((operation) => operation.feature_ids.includes(id));
     if (relatedOperation) setSelectedOperation(relatedOperation);
@@ -1657,16 +1652,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       setSelectedFeatureIds(operation.feature_ids);
     }
     setShowSimulationChecks(true);
-  };
-
-  const openFeatureExplorer = () => {
-    setInspectionPanel(null);
-    setShowResourceLibrary(false);
-    setShowProcessDesigner(false);
-    setShowOperationDetails(false);
-    setActiveMode("特征");
-    setShowFeatureExplorer(true);
-    if (manufacturingFeatures[0]) chooseFeature(manufacturingFeatures[0].id);
   };
 
   const generateCam = async () => {
@@ -2228,23 +2213,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
         </div>
       </header>
-      <nav className="compact-mode-toolbar" aria-label="工作模式">
-        {["特征", "工艺", "刀路", "仿真"].map((mode) => <button key={mode} className={activeMode === mode ? "active" : ""} onClick={() => chooseMode(mode)}>{isSheetForming && mode === "刀路" ? "成形" : mode}</button>)}
-      </nav>
-
-      {showL32Program && <L32ProgramViewer
-        jobId={job.id}
-        operations={operations}
-        stock={job.plan.stock}
-        wholePartBlockers={l32WholePartBlockers}
-        fallbackBounds={solidCandidates.find((item) => item.index === selectedSolidIndex)?.bounds ?? solidCandidates[0]?.bounds ?? null}
-        onClose={() => setShowL32Program(false)}
-        onOpenEngineering={() => {
-          setShowL32Program(false);
-          setShowL32Workbench(true);
-        }}
-      />}
-
       {showProcessDesigner && catalogs && <ProcessDesigner
         job={job}
         catalogs={catalogs}
@@ -2253,7 +2221,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         onUpdated={applyUpdatedJob}
         onPreview={async (operation) => {
           setShowProcessDesigner(false);
-          setShowL32Program(false);
           chooseOperation(operation);
         }}
         onEngineeringReview={(operation) => {
@@ -2340,12 +2307,19 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
 
       <section className="workspace">
         <aside className="workbench-sidebar">
-          <nav className="sidebar-view-tabs" aria-label="左侧工作区">
-            <button className={sidebarView === "planning" ? "active" : ""} onClick={() => setSidebarView("planning")}><History size={14} />规划过程</button>
-            <button className={sidebarView === "route" ? "active" : ""} onClick={() => setSidebarView("route")}><Layers3 size={14} />工艺路线</button>
-          </nav>
-          {sidebarView === "route" ? <section className={`feature-tree panel accordion-panel ${structureExpanded ? "expanded" : "collapsed"}`}>
-            <button className="panel-heading accordion-trigger" aria-expanded={structureExpanded} onClick={() => setStructureExpanded((value) => !value)}><Layers3 size={16} /><span>工艺路线</span><small>{job.plan.setups.length} 装夹 · {operations.length} 工序</small><ChevronRight className="accordion-chevron" size={16} /></button>
+          <section className={`feature-tree panel accordion-panel manufacturing-feature-panel ${featureStructureExpanded ? "expanded" : "collapsed"}`}>
+            <button className="panel-heading accordion-trigger manufacturing-feature-heading" aria-expanded={featureStructureExpanded} onClick={() => { const next = !featureStructureExpanded; setFeatureStructureExpanded(next); if (next) setStructureExpanded(false); }}><CircleDot size={16} /><span>制造特征</span><small>{visibleManufacturingFeatures.length} / {manufacturingFeatures.length} 项</small><ChevronRight className="accordion-chevron" size={16} /></button>
+            {featureStructureExpanded && <><div className="manufacturing-feature-search"><input type="search" value={featureSearch} onChange={(event) => setFeatureSearch(event.target.value)} placeholder="搜索编号或特征类型" aria-label="搜索制造特征" /></div>
+            <div className="panel-content manufacturing-feature-list">
+              {visibleManufacturingFeatures.map((feature) => <button type="button" key={feature.id} className={isolatedFeatureId === feature.id ? "selected" : ""} onClick={() => chooseFeature(feature.id)}>
+                <i style={{ backgroundColor: `#${featureMarkerColor(feature).toString(16).padStart(6, "0")}` }} />
+                <span><strong>{featureDisplayName(feature)}</strong><small>{feature.id} · {featureDimensionLabel(feature)}</small></span>
+              </button>)}
+              {visibleManufacturingFeatures.length === 0 && <p>没有匹配的制造特征。</p>}
+            </div></>}
+          </section>
+          <section className={`feature-tree panel accordion-panel ${structureExpanded ? "expanded" : "collapsed"}`}>
+            <button className="panel-heading accordion-trigger" aria-expanded={structureExpanded} onClick={() => { const next = !structureExpanded; setStructureExpanded(next); if (next) setFeatureStructureExpanded(false); }}><Layers3 size={16} /><span>工艺路线</span><small>{job.plan.setups.length} 装夹 · {operations.length} 工序</small><ChevronRight className="accordion-chevron" size={16} /></button>
             {structureExpanded && <div className="panel-content">
               <div className="tree-section"><strong><Box size={15} /> 毛坯</strong><small>{String((job.plan.stock.size_mm as number[])?.join(" × "))} mm</small></div>
               {job.plan.setups.map((setup) => (
@@ -2353,7 +2327,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
                   <div className="tree-section"><strong><Rotate3D size={15} /> {setup.name}</strong><small>{setup.fixture}</small></div>
                   {setup.operations.map((operation) => (
                     <div key={operation.id} className={`operation-tree-row ${selectedOperation?.id === operation.id ? "selected" : ""} ${operation.enabled === false ? "suppressed" : ""} ${generatingCam && camProgress?.operation_id === operation.id ? "stream-active" : ""}`}>
-                      <button className="operation-tree-main" title={`查看 ${operation.id} 仿真`} disabled={operation.enabled === false || (Boolean(camResult) && !isL32 && !cutOperationIds.has(operation.id))} onClick={() => openOperationSimulation(operation)}>
+                      <button className="operation-tree-main" title={`选择 ${operation.id}`} disabled={operation.enabled === false} onClick={() => openOperationSimulation(operation)}>
                         <span>{operation.id}</span><div><strong>{operation.name}</strong><small>{operation.tool.name}</small></div>
                       </button>
                       <div className="operation-tree-actions">
@@ -2365,18 +2339,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               ))}
               <div className="tree-summary"><CircleDot size={14} /> {holes.length} 孔 · {prismaticFeatures.length} 型腔/槽 · {planarMachiningFeatures.length} 平面区 · {rotationalManufacturingFeatures.length} 回转特征 · {internalProfiles.length} 内轮廓/雕刻 · 共 {manufacturingFeatures.length} 项</div>
             </div>}
-          </section> : <section className="panel planning-history-panel">
-            <header><div><Check size={16} /><strong>工艺规划已完成</strong></div><span>{planningEvents.length} 条记录</span></header>
-            <div className="planning-history-events">
-              {planningEventsLoading && <p><LoaderCircle className="spin" size={15} />正在加载规划过程…</p>}
-              {!planningEventsLoading && planningEventsError && <p className="error"><AlertTriangle size={15} />{planningEventsError}</p>}
-              {!planningEventsLoading && !planningEventsError && planningEvents.length === 0 && <p>该任务生成时尚未保存规划过程。</p>}
-              {planningEvents.map((item, index) => <div key={`${item.stage}-${item.phase ?? "stage"}-${index}`}>
-                <Check size={14} />
-                <span><strong>{item.detail ?? item.message}</strong>{item.detail && <small>{item.message}</small>}{item.created_at && <time>{new Date(item.created_at).toLocaleTimeString("zh-CN", { hour12: false })}</time>}</span>
-              </div>)}
-            </div>
-          </section>}
+          </section>
 
           {showOperationDetails && selectedOperation && <section ref={operationPopoverRef} className="operation-popover inspector panel" style={{ top: operationPopoverPosition.top, left: operationPopoverPosition.left, "--operation-anchor-y": `${operationPopoverPosition.anchorY}px` } as CSSProperties}>
             <header className="operation-popover-heading"><div><Bot size={16} /><span>工序详情</span><small>{selectedOperation.id}</small></div><div className="operation-popover-actions">{!readOnly && !editingOperationDetails && <button className="edit-operation-button" aria-label="编辑工序" title="编辑" onClick={() => { setEditingOperationDetails(true); setToolDraftId(selectedOperation.tool.id); setOperationMessage(""); }}><Pencil size={13} /></button>}<button aria-label="关闭工序详情" title="关闭" onClick={() => { setEditingOperationDetails(false); setShowOperationDetails(false); }}><X size={15} /></button></div></header>
@@ -2493,36 +2456,32 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             spatialDefects={activeMode === "仿真" ? spatialDefects : null}
             onSelectDefect={chooseSpatialDefect}
             viewMode={activeMode as "特征" | "工艺" | "刀路" | "仿真"}
-            showFeatureExplorer={showFeatureExplorer}
-            onCloseFeatureExplorer={() => setShowFeatureExplorer(false)}
+            isolatedFeatureId={isolatedFeatureId}
             workAxis={selectedSetup?.work_axis}
             activeOperationLabel={selectedOperation?.name}
           />
+          {showOperationViewSwitch && selectedOperation && <nav className="operation-view-switch" aria-label={`${selectedOperation.name} 视图切换`}>
+            <button type="button" className={activeMode === "刀路" ? "active" : ""} onClick={() => chooseMode("刀路")}>{isSheetForming ? "成形" : "刀路"}</button>
+            <button type="button" className={activeMode === "仿真" ? "active" : ""} onClick={() => chooseMode("仿真")}>仿真</button>
+          </nav>}
           <nav className="inspection-rail" aria-label="工程检查与工艺工具">
-            {manufacturingFeatures.length > 0 && <button className={`inspection-card feature ${showFeatureExplorer ? "active" : ""}`} onClick={openFeatureExplorer} title="查看已识别的制造特征">
-              <em>{manufacturingFeatures.length}</em>
-              <CircleDot size={19} />
-              <strong>特征</strong>
-              <small>{manufacturingFeatures.length} 项</small>
-            </button>}
-            <button className={`inspection-card tool ${showResourceLibrary ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setShowFeatureExplorer(false); setDeviceInfoId(null); setShowResourceLibrary(true); }} title="打开工序库">
+            <button className={`inspection-card tool ${showResourceLibrary ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setDeviceInfoId(null); setShowResourceLibrary(true); }} title="打开工序库">
               <Library size={19} />
               <strong>工序库</strong>
               <small>{catalogs?.operations.length ?? 0} 项工序</small>
             </button>
-            {operations.length > 0 && <button className={`inspection-card process-design ${showProcessDesigner ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setShowFeatureExplorer(false); setShowProcessDesigner(true); }} title="逐步设计和调整工序">
+            {operations.length > 0 && <button className={`inspection-card process-design ${showProcessDesigner ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setShowProcessDesigner(true); }} title="逐步设计和调整工序">
               <Layers3 size={19} />
               <strong>工序设计</strong>
               <small>编辑与插入</small>
             </button>}
-            {isL32 && <button className={`inspection-card tool ${inspectionPanel === "tools" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => { setShowFeatureExplorer(false); setInspectionPanel((current) => current === "tools" ? null : "tools"); }} title="打开刀具库">
+            {isL32 && <button className={`inspection-card tool ${inspectionPanel === "tools" ? "active" : ""}`} onPointerDown={(event) => event.stopPropagation()} onClick={() => setInspectionPanel((current) => current === "tools" ? null : "tools")} title="打开刀具库">
               <Wrench size={19} />
               <strong>刀具库</strong>
               <small>现场刀具</small>
             </button>}
           </nav>
           {inspectionPanel === "tools" && <section ref={inspectionPanelRef} className="tool-library-container"><ToolLibraryPanel machineInstanceId={job.machine_instance_id} catalogTools={catalogs?.tools ?? []} apiUrl={apiUrl} onClose={() => setInspectionPanel(null)} readOnly={readOnly} /></section>}
-          {!readOnly && activeMode === "刀路" && isL32 && <button className="viewport-generate-button l32-draft-button" onClick={() => setShowL32Program(true)}><Play size={16} />打开 L32 真实刀路</button>}
           {!readOnly && activeMode === "刀路" && !isL32 && <button className="viewport-generate-button" disabled={automationBlocked || generatingCam || applyingRemediation} onClick={generateCam} title={automationBlocked ? "当前工艺不完整，暂时无法生成刀路" : undefined}>
             {generatingCam || applyingRemediation ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}
             {generatingCam ? `生成中 ${Math.round(camProgress?.percent ?? 0)}%` : applyingRemediation ? `纠错中 ${Math.round(camProgress?.percent ?? 0)}%` : isSheetForming ? "生成成形仿真" : camResult ? "重新生成刀路" : "生成刀路"}
