@@ -9,6 +9,12 @@ import { featureMarkerColor } from "./featurePresentation";
 
 type ViewMode = "特征" | "工艺" | "刀路" | "仿真";
 type FeatureFilterKey = "hole" | "pocket" | "slot" | "surface" | "turning" | "profile";
+type ProcessOperationIntent = {
+  type: string;
+  parameters: Record<string, string | number | boolean>;
+  toolDiameterMm: number;
+  toolKind: string;
+};
 
 type Props = {
   modelUrl: string;
@@ -42,6 +48,9 @@ type Props = {
   isolatedFeatureId?: string | null;
   workAxis?: Vec3 | null;
   activeOperationLabel?: string;
+  operationContextVisible?: boolean;
+  operationIntent?: ProcessOperationIntent | null;
+  showFeatureSummary?: boolean;
 };
 
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
@@ -75,7 +84,7 @@ function featureFilterKey(feature: ManufacturingFeature): FeatureFilterKey {
   return "profile";
 }
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", isolatedFeatureId = null, workAxis = null, activeOperationLabel = "" }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", isolatedFeatureId = null, workAxis = null, activeOperationLabel = "", operationContextVisible = false, operationIntent = null, showFeatureSummary = true }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
@@ -324,6 +333,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     let activePath: THREE.Line | null = null;
     let trailPath: THREE.LineSegments | null = null;
     let cadEdges: THREE.LineSegments | null = null;
+    const processIntentMeshes: THREE.Mesh[] = [];
     let modelCenter = new THREE.Vector3();
     let viewSize = 100;
     let viewHeight = 200;
@@ -453,9 +463,9 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
           // Keep the normal CAD view opaque. Transparent whole-model rendering
           // makes triangle ordering and coplanar edge overlays visibly shimmer
           // as the camera moves.
-          transparent: Boolean(simulation || turningStage || formingPreview || viewMode === "刀路"),
-          opacity: simulation || turningStage ? 0.16 : viewMode === "刀路" ? 0.34 : 1,
-          depthWrite: !simulation && !turningStage && viewMode !== "刀路",
+          transparent: Boolean(simulation || turningStage || formingPreview || viewMode === "刀路" || (viewMode === "工艺" && renderedFeatures.length)),
+          opacity: simulation || turningStage ? 0.16 : viewMode === "刀路" ? 0.34 : viewMode === "工艺" && renderedFeatures.length ? 0.48 : 1,
+          depthWrite: !simulation && !turningStage && viewMode !== "刀路" && !(viewMode === "工艺" && renderedFeatures.length),
           // Keep coplanar CAD edge overlays stable when zoomed in. Without a
           // small depth bias the edge and surface alternate at sub-pixel depth,
           // producing the broken/dotted outlines visible at high zoom.
@@ -471,6 +481,60 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       model.castShadow = true;
       model.receiveShadow = true;
       scene.add(model);
+
+      if (viewMode === "工艺" && operationIntent && bounds) {
+        const axis = new THREE.Vector3(workAxis?.x ?? 1, workAxis?.y ?? 0, workAxis?.z ?? 0);
+        if (axis.lengthSq() < 1e-6) axis.set(1, 0, 0);
+        axis.normalize();
+        const absoluteAxis = [Math.abs(axis.x), Math.abs(axis.y), Math.abs(axis.z)];
+        const axisIndex = absoluteAxis.indexOf(Math.max(...absoluteAxis));
+        const size = bounds.getSize(new THREE.Vector3());
+        const centeredMin = bounds.min.clone().sub(modelCenter);
+        const centeredMax = bounds.max.clone().sub(modelCenter);
+        const axialLength = Math.max(size.getComponent(axisIndex), 0.5);
+        const radialAxes = [0, 1, 2].filter((index) => index !== axisIndex);
+        const outerRadius = Math.max(size.getComponent(radialAxes[0]), size.getComponent(radialAxes[1])) / 2;
+        const parameterNumber = (...keys: string[]) => {
+          for (const key of keys) {
+            const value = Number(operationIntent.parameters[key]);
+            if (Number.isFinite(value)) return value;
+          }
+          return 0;
+        };
+        const alignToAxis = (mesh: THREE.Mesh) => mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis);
+        const addIntentMesh = (mesh: THREE.Mesh, renderOrder = 6) => {
+          mesh.renderOrder = renderOrder;
+          processIntentMeshes.push(mesh);
+          markerGroup.add(mesh);
+          return mesh;
+        };
+        const intentMaterial = (color: number, opacity: number, wireframe = false) => new THREE.MeshBasicMaterial({ color, transparent: true, opacity, wireframe, depthTest: false, depthWrite: false, side: THREE.DoubleSide });
+        const type = operationIntent.type;
+        const isFacing = type === "turn_facing";
+        const isGrooving = type.includes("groov");
+        const isCutoff = type.includes("cutoff");
+        const isAxial = type.includes("drill") || type.includes("bor") || type.includes("thread") || type.includes("inner") || type.includes("turn_id");
+
+        if (isFacing) {
+          const thickness = Math.max(parameterNumber("depth_of_cut_mm", "axial_allowance_mm"), axialLength * 0.015, 0.15);
+          const face = addIntentMesh(new THREE.Mesh(new THREE.CylinderGeometry(outerRadius * 1.06, outerRadius * 1.06, thickness, 48), intentMaterial(0x21c997, 0.3)));
+          alignToAxis(face);
+          face.position.copy(axis).multiplyScalar(centeredMax.getComponent(axisIndex) - thickness / 2);
+        } else if (isGrooving || isCutoff) {
+          const bandWidth = Math.max(parameterNumber("groove_width_mm", "confirmed_groove_width_mm"), operationIntent.toolDiameterMm, axialLength * (isCutoff ? 0.025 : 0.06), 0.2);
+          const grooveDepth = Math.max(parameterNumber("groove_depth_mm", "confirmed_groove_depth_mm", "depth_of_cut_mm"), outerRadius * 0.12);
+          const bandRadius = Math.max(outerRadius - grooveDepth / 2, outerRadius * 0.3);
+          const band = addIntentMesh(new THREE.Mesh(new THREE.CylinderGeometry(bandRadius, bandRadius, bandWidth, 48, 1, true), intentMaterial(isCutoff ? 0xe85d75 : 0xf0a23b, 0.55, true)));
+          alignToAxis(band);
+          band.position.copy(axis).multiplyScalar(isCutoff ? centeredMin.getComponent(axisIndex) + bandWidth : axialLength * 0.12);
+        } else if (isAxial) {
+          const diameter = Math.max(parameterNumber("target_bore_diameter_mm", "final_diameter_mm"), operationIntent.toolDiameterMm, outerRadius * 0.12);
+          const depth = Math.min(Math.max(parameterNumber("profile_depth_mm", "depth_mm", "full_diameter_depth_mm"), axialLength * 0.58), axialLength);
+          const bore = addIntentMesh(new THREE.Mesh(new THREE.CylinderGeometry(diameter / 2, diameter / 2, depth, 36, 1, true), intentMaterial(0x24a8b8, 0.5, true)));
+          alignToAxis(bore);
+          bore.position.copy(axis).multiplyScalar(centeredMax.getComponent(axisIndex) - depth / 2);
+        }
+      }
 
       requestMaterialSnapshot(0);
 
@@ -1075,8 +1139,9 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         setToolVisible: (visible) => { if (playbackTool) playbackTool.visible = visible; },
         setTrailVisible: (visible) => { if (trailPath) trailPath.visible = visible; },
       };
-      if (isolatedFeatureId) focusFeature(isolatedFeatureId);
       fitDirection(camera.position.clone());
+      if (isolatedFeatureId) focusFeature(isolatedFeatureId);
+      else if (viewMode === "工艺" && selectedIdsRef.current[0]) focusFeature(selectedIdsRef.current[0]);
       // Restore only the same mode, operation and geometry revision. New
       // previews receive a fresh fit so stale panning cannot hide the stock.
       const savedCamera = cameraMemory[cameraKey];
@@ -1878,6 +1943,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
         marker.geometry.dispose();
         (marker.material as THREE.Material).dispose();
       }
+      for (const mesh of processIntentMeshes) {
+        mesh.geometry.dispose();
+        (mesh.material as THREE.Material).dispose();
+      }
       for (const child of markerGroup.children) {
         if (child instanceof THREE.LineSegments) {
           child.geometry.dispose();
@@ -1889,7 +1958,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       host.removeChild(renderer.domElement);
       axisHost.removeChild(axisRenderer.domElement);
     };
-  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, isolatedFeatureId, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationTools, playbackKey, profileBoundaries, renderedFeatures, simulation, spatialDefects, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
+  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, isolatedFeatureId, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationIntent, operationTools, playbackKey, profileBoundaries, renderedFeatures, simulation, spatialDefects, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
   const activeFormingStage = formingPreview?.stages.length
@@ -1950,14 +2019,14 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
   return (
     <div className={`model-viewer mode-${modeClass}`} ref={hostRef}>
       <div className="orientation-axis" ref={axisHostRef} aria-label="视图坐标轴"><small>视图坐标</small></div>
-      {viewMode === "特征" ? <div className="viewer-badge feature-view-summary" aria-label="特征识别概览">
+      {viewMode === "特征" && showFeatureSummary ? <div className="viewer-badge feature-view-summary" aria-label="特征识别概览">
         <strong>{modeTitle}</strong>
         <small>{modeDetail}</small>
         <div className="feature-filter-kinds" aria-label="特征类型图例">
           {FEATURE_FILTERS.map((filter) => <span key={filter.key} className={featureCounts[filter.key] === 0 ? "empty" : ""}><i className={filter.colorClass} />{filter.label}<em>{featureCounts[filter.key]}</em></span>)}
         </div>
-      </div> : <div className="viewer-badge"><strong>{modeTitle}</strong><small>{modeDetail}</small></div>}
-      {viewMode === "工艺" && <div className="process-view-legend"><i />当前工序加工区域{workAxis && <small>方向 X{workAxis.x.toFixed(0)} Y{workAxis.y.toFixed(0)} Z{workAxis.z.toFixed(0)}</small>}</div>}
+      </div> : viewMode !== "特征" && !operationContextVisible && <div className="viewer-badge"><strong>{modeTitle}</strong><small>{modeDetail}</small></div>}
+      {viewMode === "工艺" && !operationContextVisible && <div className="process-view-legend"><i />当前工序加工区域{workAxis && <small>方向 X{workAxis.x.toFixed(0)} Y{workAxis.y.toFixed(0)} Z{workAxis.z.toFixed(0)}</small>}</div>}
       {(viewMode === "刀路" || viewMode === "仿真") && <div className="viewer-legend">{formingPreview ? <>原始板料 <i className="selected" />落料件 → 预成形 → 终成形样品</> : <><i />快速移动 <i className="selected" />切削轨迹 · 已完成轨迹自动淡化</>}</div>}
       {spatialDefects && spatialDefects.regions.length > 0 && <div className="defect-legend"><span><i className="overcut" />过切</span><span><i className="rest" />残料</span><small>点击色块定位责任工序</small></div>}
       {visibleActiveDefect && <div className={`defect-focus-card ${visibleActiveDefect.kind}`}>

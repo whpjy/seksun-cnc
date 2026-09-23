@@ -30,7 +30,7 @@ import { featureDimensionLabel, featureDisplayName, featureMarkerColor } from ".
 import { L32Workbench } from "./L32Workbench";
 import { ToolLibraryPanel } from "./ToolLibraryPanel";
 import { ProcessDesigner } from "./ProcessDesigner";
-import type { BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, ManufacturingFeature, Operation, RotationalFeatureAnalysis, RotationalManufacturingFeature, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
+import type { BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, ManufacturingFeature, Operation, RotationalFeatureAnalysis, RotationalManufacturingFeature, RotationalProfile, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 const APP_NAME = (import.meta.env.VITE_APP_NAME ?? "NEXUS CNC").trim() || "NEXUS CNC";
@@ -83,6 +83,136 @@ type L32GroovePreview = {
   stockRadius: number;
   strips: Array<{ z_min_mm: number; z_max_mm: number; cut_to_radius_mm: number }>;
 };
+
+type OperationSimulationSummary = {
+  status: "passed" | "warning" | "failed";
+  statusLabel: string;
+  engineLabel: string;
+  metrics: Array<{ label: string; value: string; detail: string }>;
+  note: string;
+};
+
+function TurningProcessDiagram({ profile, operation }: { profile: RotationalProfile; operation: Operation }) {
+  const points = [...profile.points].sort((left, right) => left.z - right.z);
+  if (points.length < 2) return null;
+  const numeric = (key: string, fallback = 0) => {
+    const value = Number(operation.parameters[key]);
+    return Number.isFinite(value) ? value : fallback;
+  };
+  const allMinZ = Math.min(...points.map((point) => point.z));
+  const allMaxZ = Math.max(...points.map((point) => point.z));
+  const grooveCenter = numeric("z_mm", (allMinZ + allMaxZ) / 2);
+  const rangeStart = Math.min(numeric("profile_z_min_mm", numeric("start_z_mm", numeric("groove_start_z_mm", grooveCenter))), numeric("profile_z_max_mm", numeric("end_z_mm", numeric("groove_end_z_mm", grooveCenter))));
+  const rangeEnd = Math.max(numeric("profile_z_min_mm", numeric("start_z_mm", numeric("groove_start_z_mm", grooveCenter))), numeric("profile_z_max_mm", numeric("end_z_mm", numeric("groove_end_z_mm", grooveCenter))));
+  const affected = points.filter((point) => point.z >= rangeStart - 1e-6 && point.z <= rangeEnd + 1e-6);
+  const activePoints = affected.length >= 2 ? affected : points;
+  const allowance = Math.max(numeric("radial_allowance_mm"), 0);
+  const cuttingDepth = operation.type.includes("rough") ? Math.max(numeric("depth_of_cut_mm", 0), 0) : 0;
+  const maxRadius = Math.max(...points.map((point) => point.radius), ...activePoints.map((point) => point.radius + allowance + cuttingDepth), 0.1);
+  const width = 304;
+  const height = 112;
+  const marginX = 10;
+  const centerY = 54;
+  const usableWidth = width - marginX * 2;
+  const radialScale = 40 / maxRadius;
+  const x = (z: number) => marginX + ((z - allMinZ) / Math.max(allMaxZ - allMinZ, 0.001)) * usableWidth;
+  const line = (items: typeof points, offset: number, sign: 1 | -1) => items.map((point, index) => `${index ? "L" : "M"}${x(point.z).toFixed(1)},${(centerY - sign * (point.radius + offset) * radialScale).toFixed(1)}`).join(" ");
+  const closedBand = (items: typeof points, outerOffset: number, innerOffset: number, sign: 1 | -1) => `${line(items, outerOffset, sign)} ${[...items].reverse().map((point) => `L${x(point.z).toFixed(1)},${(centerY - sign * (point.radius + innerOffset) * radialScale).toFixed(1)}`).join(" ")} Z`;
+  const body = `${line(points, 0, 1)} ${[...points].reverse().map((point) => `L${x(point.z).toFixed(1)},${(centerY + point.radius * radialScale).toFixed(1)}`).join(" ")} Z`;
+  const isBandOperation = operation.type.includes("groov") || operation.type.includes("cutoff");
+  const bandWidth = Math.max(numeric("groove_width_mm", numeric("cutting_width_mm", operation.tool.cutting_width_mm ?? 0.5)), 0.2);
+  const bandX = x(grooveCenter);
+  const bandPixelWidth = Math.max(5, bandWidth / Math.max(allMaxZ - allMinZ, 0.001) * usableWidth);
+  return <div className="turning-process-diagram">
+    <header><strong>轴向剖面示意</strong><small>工艺意图 · 非实际刀路</small></header>
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${operation.name} 轴向剖面`}>
+      <line className="centerline" x1={marginX} y1={centerY} x2={width - marginX} y2={centerY} />
+      <path className="part-profile" d={body} />
+      {cuttingDepth > 0 && <><path className="removal-layer" d={closedBand(activePoints, allowance + cuttingDepth, allowance, 1)} /><path className="removal-layer" d={closedBand(activePoints, allowance + cuttingDepth, allowance, -1)} /></>}
+      {allowance > 0 && <><path className="allowance-line" d={line(activePoints, allowance, 1)} /><path className="allowance-line" d={line(activePoints, allowance, -1)} /></>}
+      {!isBandOperation && <><path className="target-line" d={line(activePoints, 0, 1)} /><path className="target-line" d={line(activePoints, 0, -1)} /></>}
+      {isBandOperation && <rect className={operation.type.includes("cutoff") ? "cutoff-band" : "groove-band"} x={bandX - bandPixelWidth / 2} y="10" width={bandPixelWidth} height="88" rx="2" />}
+    </svg>
+    <footer><span><i className="target" />目标轮廓</span>{cuttingDepth > 0 && <span><i className="removal" />本工序去除</span>}{allowance > 0 && <span><i className="allowance" />保留余量 {allowance} mm</span>}</footer>
+  </div>;
+}
+
+function MillingProcessDiagram({ feature, operation }: { feature: ManufacturingFeature | null; operation: Operation }) {
+  const numeric = (key: string, fallback = 0) => {
+    const value = Number(operation.parameters[key]);
+    return Number.isFinite(value) ? value : fallback;
+  };
+  const featureLength = feature && "depth" in feature ? feature.length : Math.abs(numeric("region_z_max_mm") - numeric("region_z_min_mm"));
+  const featureWidth = feature && "depth" in feature ? feature.width : Math.max(operation.tool.diameter_mm * 3, featureLength * 0.55);
+  const depth = Math.max(numeric("depth_mm", feature && "depth" in feature ? feature.depth : 0), 0.01);
+  const stepDown = Math.max(numeric("step_down_mm", depth), 0.01);
+  const layerCount = Math.max(1, Math.ceil(depth / stepDown));
+  const visibleLayers = Math.min(layerCount, 8);
+  const wallAllowance = Math.max(numeric("wall_allowance_mm", numeric("radial_allowance_mm")), 0);
+  const floorAllowance = Math.max(numeric("floor_allowance_mm"), 0);
+  const roughing = operation.type.includes("rough");
+  const pocket = operation.type.includes("pocket");
+  const safeLength = Math.max(featureLength, operation.tool.diameter_mm * 4, 1);
+  const safeWidth = Math.max(featureWidth, operation.tool.diameter_mm * 2, 1);
+  const planWidth = safeLength >= safeWidth ? 182 : Math.max(96, 182 * safeLength / safeWidth);
+  const planHeight = safeWidth >= safeLength ? 82 : Math.max(48, 82 * safeWidth / safeLength);
+  const planX = 10 + (190 - planWidth) / 2;
+  const planY = 12 + (86 - planHeight) / 2;
+  const inset = Math.min(10, Math.max(3, wallAllowance * 10 + 3));
+  const toolRadius = Math.max(4, Math.min(13, operation.tool.diameter_mm / Math.max(safeLength, safeWidth) * 150));
+  return <div className="milling-process-diagram">
+    <header><strong>{pocket ? "型腔加工平面" : "轮廓加工平面"}</strong><small>{feature ? "真实特征尺寸" : "根据工序参数推算"}</small></header>
+    <svg viewBox="0 0 304 116" role="img" aria-label={`${operation.name} 加工平面与深度分层`}>
+      <defs><pattern id={`milling-hatch-${operation.id}`} width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(35)"><line x1="0" y1="0" x2="0" y2="7" /></pattern></defs>
+      <text className="diagram-caption" x="10" y="10">加工范围</text>
+      <rect className="milling-boundary" x={planX} y={planY} width={planWidth} height={planHeight} rx={pocket ? 10 : 3} />
+      {roughing && <rect className="milling-removal" x={planX + inset} y={planY + inset} width={Math.max(4, planWidth - inset * 2)} height={Math.max(4, planHeight - inset * 2)} rx={pocket ? 7 : 2} fill={`url(#milling-hatch-${operation.id})`} />}
+      <rect className="milling-target" x={planX + inset} y={planY + inset} width={Math.max(4, planWidth - inset * 2)} height={Math.max(4, planHeight - inset * 2)} rx={pocket ? 7 : 2} />
+      {wallAllowance > 0 && <rect className="milling-allowance" x={planX + inset / 2} y={planY + inset / 2} width={Math.max(4, planWidth - inset)} height={Math.max(4, planHeight - inset)} rx={pocket ? 8 : 2} />}
+      <circle className="milling-tool" cx={planX + toolRadius + 4} cy={planY + toolRadius + 4} r={toolRadius} />
+      <text className="tool-label" x={planX + toolRadius + 4} y={planY + toolRadius + 7}>Ø{operation.tool.diameter_mm}</text>
+      <text className="diagram-caption" x="218" y="10">深度分层</text>
+      <rect className="depth-column" x="224" y="19" width="48" height="76" rx="3" />
+      {Array.from({ length: visibleLayers }, (_, index) => <line key={index} className="depth-layer" x1="224" x2="272" y1={19 + ((index + 1) / visibleLayers) * 76} y2={19 + ((index + 1) / visibleLayers) * 76} />)}
+      <path className="depth-arrow" d="M282 19 L282 95 M278 24 L282 19 L286 24 M278 90 L282 95 L286 90" />
+      <text className="depth-label" x="218" y="108">{depth.toFixed(2)} mm · {layerCount} 层</text>
+      {floorAllowance > 0 && <line className="floor-allowance" x1="224" x2="272" y1="91" y2="91" />}
+    </svg>
+    <footer><span><i className="target" />目标边界</span>{roughing && <span><i className="removal" />去除区域</span>}{wallAllowance > 0 && <span><i className="allowance" />侧壁余量 {wallAllowance} mm</span>}<span>每层 {stepDown} mm</span></footer>
+  </div>;
+}
+
+function ToolpathOverview({ segments, loaded }: { segments: ToolpathSegment[]; loaded: boolean }) {
+  const rapid = segments.filter((segment) => segment.motion === "rapid");
+  const cutting = segments.filter((segment) => segment.motion === "cut");
+  const lengthOf = (items: ToolpathSegment[]) => items.reduce((total, segment) => total + Math.hypot(segment.x2 - segment.x1, segment.y2 - segment.y1, segment.z2 - segment.z1), 0);
+  const rapidLength = lengthOf(rapid);
+  const cuttingLength = lengthOf(cutting);
+  const totalLength = Math.max(rapidLength + cuttingLength, 0.001);
+  return <div className="operation-mode-overview toolpath-overview">
+    <header><strong>轨迹构成</strong><small>{loaded ? `${segments.length} 段运动` : "正在加载刀路"}</small></header>
+    <div className="toolpath-ratio" aria-label="刀路轨迹构成">
+      <span className="rapid" style={{ width: `${Math.max(rapidLength / totalLength * 100, rapid.length ? 8 : 0)}%` }} />
+      <span className="cut" style={{ width: `${Math.max(cuttingLength / totalLength * 100, cutting.length ? 8 : 0)}%` }} />
+    </div>
+    <div className="overview-metrics">
+      <div><i className="rapid" /><span>快速移动</span><strong>{rapid.length} 段</strong><small>{rapidLength.toFixed(1)} mm</small></div>
+      <div><i className="cut" /><span>切削轨迹</span><strong>{cutting.length} 段</strong><small>{cuttingLength.toFixed(1)} mm</small></div>
+    </div>
+    <footer>{segments.length ? "右侧模型显示当前工序的空间运动轨迹" : loaded ? "当前工序没有可显示的轨迹数据" : "结果就绪后将自动显示"}</footer>
+  </div>;
+}
+
+function SimulationOverview({ summary, loading, hasPreview }: { summary: OperationSimulationSummary | null; loading: boolean; hasPreview: boolean }) {
+  return <div className={`operation-mode-overview simulation-overview ${summary?.status ?? "pending"}`}>
+    <header><strong>加工结果</strong><small>{summary ? "工序仿真数据" : loading ? "计算中" : "尚未生成"}</small></header>
+    {summary && <div className="overview-metrics simulation-metrics-compact">
+      {summary.metrics.map((metric) => <div key={metric.label}><span>{metric.label}</span><strong>{metric.value}</strong><small>{metric.detail}</small></div>)}
+    </div>}
+    {!summary && <div className="operation-mode-empty"><span>{loading ? "正在计算当前工序数据" : hasPreview ? "当前仅有几何预览，尚无可量化结果" : "请先生成或加载当前工序结果"}</span></div>}
+    {summary?.note && <footer>{summary.note}</footer>}
+  </div>;
+}
 
 type L32GeometricMove = { kind: "rapid" | "feed"; point: { x: number; y: number; z: number } };
 type L32GeometricDraft = {
@@ -596,9 +726,6 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
         <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
       </div>
     </header>
-    <nav className="compact-mode-toolbar processing-mode-toolbar" aria-label="工作模式">
-      {["特征", "工艺", "刀路", "仿真"].map((mode) => <button key={mode} className={mode === "工艺" ? "active" : ""} disabled>{mode}</button>)}
-    </nav>
     <section className="workspace processing-workspace">
       <aside className="workbench-sidebar processing-sidebar">
         <section className="panel planning-workbench-panel">
@@ -621,7 +748,7 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
       </aside>
       <section className="viewport panel processing-viewport">
         {previewJob.model_url
-          ? <ModelViewer modelUrl={apiUrl(previewJob.model_url)} features={EMPTY_MANUFACTURING_FEATURES} selectedFeatureIds={EMPTY_SELECTED_FEATURE_IDS} onSelectFeature={IGNORE_FEATURE_SELECTION} viewMode="特征" />
+          ? <ModelViewer modelUrl={apiUrl(previewJob.model_url)} features={EMPTY_MANUFACTURING_FEATURES} selectedFeatureIds={EMPTY_SELECTED_FEATURE_IDS} onSelectFeature={IGNORE_FEATURE_SELECTION} viewMode="特征" showFeatureSummary={false} />
           : <div className="processing-model-placeholder"><LoaderCircle className="spin" size={28} /><strong>正在构建三维预览</strong><small>完成 STEP 拓扑解析后将在这里显示原始模型</small></div>}
         {!previewJob.model_url && <div className="processing-model-badge"><Box size={14} /><span>模型解析中</span></div>}
       </section>
@@ -671,6 +798,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [structureExpanded, setStructureExpanded] = useState(true);
   const [featureStructureExpanded, setFeatureStructureExpanded] = useState(false);
   const [showOperationViewSwitch, setShowOperationViewSwitch] = useState(false);
+  const [stockSelected, setStockSelected] = useState(false);
   const [showOperationDetails, setShowOperationDetails] = useState(false);
   const [editingOperationDetails, setEditingOperationDetails] = useState(false);
   const [toolDraftId, setToolDraftId] = useState(selectedOperation?.tool.id ?? "");
@@ -685,6 +813,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [l32TurningPreviews, setL32TurningPreviews] = useState<Record<string, L32TurningPreview>>({});
   const [l32GroovePreviews, setL32GroovePreviews] = useState<Record<string, L32GroovePreview>>({});
   const [l32MillingPreviews, setL32MillingPreviews] = useState<Record<string, ToolpathSegment[]>>({});
+  const [l32SimulationSummaries, setL32SimulationSummaries] = useState<Record<string, OperationSimulationSummary>>({});
   const [l32GrooveSegments, setL32GrooveSegments] = useState<Record<string, ToolpathSegment[]>>({});
   const [l32MaterialSnapshots, setL32MaterialSnapshots] = useState<{ key: string; files: Record<string, string[]> } | null>(null);
   const [l32MaterialSnapshotError, setL32MaterialSnapshotError] = useState<{ key: string; message: string } | null>(null);
@@ -969,9 +1098,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     () => manufacturingFeatures.filter((feature) => selectedFeatureIds.includes(feature.id)),
     [manufacturingFeatures, selectedFeatureIds],
   );
+  const selectedOperationIsMilling = Boolean(selectedOperation && (selectedOperation.type.includes("mill") || selectedOperation.type.includes("pocket") || selectedOperation.type.includes("contour") || selectedOperation.type.includes("surface")));
   const viewerFeatures = useMemo(
-    () => activeMode === "特征" ? manufacturingFeatures : activeMode === "工艺" ? selectedFeatures : [],
-    [activeMode, manufacturingFeatures, selectedFeatures],
+    () => activeMode === "特征" ? manufacturingFeatures : activeMode === "工艺" && !selectedOperationIsMilling ? selectedFeatures : [],
+    [activeMode, manufacturingFeatures, selectedFeatures, selectedOperationIsMilling],
   );
   const selectedSetup = useMemo(
     () => job.plan?.setups.find((setup) => setup.operations.some((operation) => operation.id === selectedOperation?.id)) ?? job.plan?.setups[0],
@@ -981,6 +1111,31 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     () => catalogs?.operations.find((item) => item.id === (selectedOperation?.definition_id || selectedOperation?.type)) ?? null,
     [catalogs?.operations, selectedOperation?.definition_id, selectedOperation?.type],
   );
+  const operationIntent = useMemo(() => selectedOperation ? {
+    type: selectedOperation.type,
+    parameters: selectedOperation.parameters,
+    toolDiameterMm: selectedOperation.tool.diameter_mm,
+    toolKind: selectedOperation.tool.kind,
+  } : null, [selectedOperation]);
+  const turningProcessProfile = useMemo(() => {
+    if (!l32Rotational || !selectedOperation) return null;
+    const wantsInnerProfile = selectedOperation.type.includes("turn_id") || selectedOperation.type.includes("drill") || selectedOperation.type.includes("bor") || selectedOperation.type.includes("inner");
+    const side = wantsInnerProfile ? "inner" : "outer";
+    return l32Rotational.profiles.find((profile) => profile.side === side && profile.review_state === "accepted")
+      ?? l32Rotational.profiles.find((profile) => profile.side === side)
+      ?? null;
+  }, [l32Rotational, selectedOperation]);
+  const visualizedProcessParameters = useMemo(() => {
+    if (!selectedOperation) return [];
+    const preferredKeys = ["radial_allowance_mm", "axial_allowance_mm", "stock_allowance_mm", "depth_of_cut_mm", "radial_depth_mm", "groove_width_mm", "groove_depth_mm", "depth_mm", "profile_depth_mm", "cutting_speed_m_min", "maximum_spindle_rpm", "spindle_rpm", "feed_per_revolution_mm", "feed_rate_mm_min"];
+    const definitions = selectedDefinition?.parameters ?? [];
+    return preferredKeys.flatMap((key) => {
+      const value = selectedOperation.parameters[key];
+      if (value === undefined || value === null || value === "") return [];
+      const definition = definitions.find((item) => item.key === key);
+      return [{ key, label: definition?.label ?? key, value: `${String(value)}${definition?.unit ? ` ${definition.unit}` : ""}` }];
+    }).slice(0, 6);
+  }, [selectedDefinition?.parameters, selectedOperation]);
   const displayedTool = editingOperationDetails
     ? catalogs?.tools.find((tool) => tool.id === toolDraftId) ?? selectedOperation?.tool
     : selectedOperation?.tool;
@@ -1033,6 +1188,35 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       ?? l32Rotational.axes[0]
       ?? null;
   }, [l32Rotational]);
+  const stockDimensionLabel = useMemo(() => {
+    const diameter = Number(job.plan?.stock.diameter_mm);
+    const length = Number(job.plan?.stock.length_mm);
+    if (Number.isFinite(diameter) && Number.isFinite(length)) return `Ø${diameter} × ${length} mm`;
+    const size = job.plan?.stock.size_mm;
+    return Array.isArray(size) && size.length ? `${size.join(" × ")} mm` : "尺寸待确认";
+  }, [job.plan?.stock]);
+  const stockTurningStage = useMemo<TurningStageView | null>(() => {
+    if (!stockSelected || !l32Axis) return null;
+    const diameter = Number(job.plan?.stock.diameter_mm);
+    const length = Number(job.plan?.stock.length_mm);
+    if (!Number.isFinite(diameter) || diameter <= 0 || !Number.isFinite(length) || length <= 0) return null;
+    const outerProfile = l32Rotational?.profiles.find((profile) => profile.side === "outer" && profile.review_state === "accepted")
+      ?? l32Rotational?.profiles.find((profile) => profile.side === "outer");
+    const profileZ = outerProfile?.points.map((point) => point.z) ?? [];
+    const centerZ = profileZ.length ? (Math.min(...profileZ) + Math.max(...profileZ)) / 2 : 0;
+    const samples = [
+      { z: centerZ - length / 2, outer_radius: diameter / 2, inner_radius: 0 },
+      { z: centerZ + length / 2, outer_radius: diameter / 2, inner_radius: 0 },
+    ];
+    return {
+      operation_id: "stock",
+      channel_id: "main",
+      before_samples: samples,
+      after_samples: samples,
+      axis_origin: l32Axis.origin,
+      axis_direction: l32Axis.direction,
+    };
+  }, [job.plan?.stock.diameter_mm, job.plan?.stock.length_mm, l32Axis, l32Rotational?.profiles, stockSelected]);
 
   useEffect(() => {
     if (!isL32 || !job.machine_instance_id || !l32Rotational) return undefined;
@@ -1051,7 +1235,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               };
             }>;
           }>(`${job.id}:front-groove-geometry`, `/api/v1/jobs/${job.id}/l32/front-groove-geometry`),
-          fetchL32PreviewJson(`${job.id}:front-groove-sweep`, `/api/v1/jobs/${job.id}/l32/front-groove-sweep-check`),
+          fetchL32PreviewJson<{ target_gouge_check_passed: boolean; check: { removed_volume_mm3: number } }>(`${job.id}:front-groove-sweep`, `/api/v1/jobs/${job.id}/l32/front-groove-sweep-check`),
         ]);
         results = grooveResults;
         const groove = grooveResults[0].payload.grooves.find((item) => item.operation_id === operation.id);
@@ -1065,6 +1249,17 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             ...current,
             [operation.id]: preview,
           }));
+          const sweep = grooveResults[1].payload;
+          setL32SimulationSummaries((current) => ({ ...current, [operation.id]: {
+            status: sweep.target_gouge_check_passed ? "passed" : "failed",
+            statusLabel: sweep.target_gouge_check_passed ? "切槽扫掠校核通过" : "检测到目标过切",
+            engineLabel: "L32 精确槽形扫掠",
+            metrics: [
+              { label: "材料去除", value: `${sweep.check.removed_volume_mm3.toFixed(3)} mm³`, detail: "当前切槽工序" },
+              { label: "目标过切", value: sweep.target_gouge_check_passed ? "0" : "有", detail: sweep.target_gouge_check_passed ? "未侵入成品轮廓" : "需要调整工艺" },
+            ],
+            note: "数据来自当前工序的精确槽形与刀具扫掠校核。",
+          } }));
           if (l32Axis) setL32GrooveSegments((current) => ({ ...current, [operation.id]: l32GroovePreviewToSegments(preview, l32Axis) }));
         }
       } else if (operation.type === "pocket_roughing" || operation.type === "pocket_finishing") {
@@ -1072,7 +1267,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         if (!featureId) return;
         const pocketResults = await Promise.all([
           fetchL32PreviewJson<L32GeometricDraft>(`${job.id}:pocket:${featureId}:draft`, `/api/v1/jobs/${job.id}/l32/catalog-back-pocket/${featureId}/draft`),
-          fetchL32PreviewJson(`${job.id}:pocket:${featureId}:sweep`, `/api/v1/jobs/${job.id}/l32/catalog-back-pocket/${featureId}/sweep-check`),
+          fetchL32PreviewJson<{ pocket_region_status: string; removed_pocket_region_mm3: number; remaining_pocket_region_mm3: number }>(`${job.id}:pocket:${featureId}:sweep`, `/api/v1/jobs/${job.id}/l32/catalog-back-pocket/${featureId}/sweep-check`),
         ]);
         results = pocketResults;
         if (!cancelled && pocketResults.every((result) => result.ok)) {
@@ -1080,6 +1275,18 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             ...current,
             [operation.id]: l32DraftsToSegments(operation, [pocketResults[0].payload]),
           }));
+          const sweep = pocketResults[1].payload;
+          const passed = sweep.pocket_region_status === "passed" || sweep.remaining_pocket_region_mm3 <= 1e-6;
+          setL32SimulationSummaries((current) => ({ ...current, [operation.id]: {
+            status: passed ? "passed" : "warning",
+            statusLabel: passed ? "型腔材料校核通过" : "型腔仍有剩余材料",
+            engineLabel: "L32 型腔材料扫掠",
+            metrics: [
+              { label: "材料去除", value: `${sweep.removed_pocket_region_mm3.toFixed(3)} mm³`, detail: "当前型腔工序" },
+              { label: "剩余材料", value: `${sweep.remaining_pocket_region_mm3.toFixed(3)} mm³`, detail: passed ? "已达到目标区域" : "需要后续工序" },
+            ],
+            note: "按真实型腔区域统计当前工序的材料变化。",
+          } }));
         }
       } else if (operation.type === "live_tool_contour_roughing" || operation.type === "live_tool_contour_finishing") {
         const roughing = operation.type === "live_tool_contour_roughing";
@@ -1087,7 +1294,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         const checkPath = roughing ? "catalog-exterior-sweep-check" : "catalog-ear-sweep-check";
         const millingResults = await Promise.all([
           fetchL32PreviewJson<{ exterior_drafts?: L32GeometricDraft[]; side_drafts?: L32GeometricDraft[] }>(`${job.id}:${draftPath}`, `/api/v1/jobs/${job.id}/l32/${draftPath}`),
-          fetchL32PreviewJson(`${job.id}:${checkPath}`, `/api/v1/jobs/${job.id}/l32/${checkPath}`),
+          fetchL32PreviewJson<{ target_gouge_check_passed: boolean; whole_part_material_verified?: boolean; checks?: Array<{ checked_feed_segments: number; contacting_segments: number; maximum_single_contact_mm3: number }> }>(`${job.id}:${checkPath}`, `/api/v1/jobs/${job.id}/l32/${checkPath}`),
         ]);
         results = millingResults;
         if (!cancelled && millingResults.every((result) => result.ok)) {
@@ -1096,6 +1303,20 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             ...current,
             [operation.id]: l32DraftsToSegments(operation, drafts),
           }));
+          const sweep = millingResults[1].payload;
+          const checkedSegments = (sweep.checks ?? []).reduce((total, check) => total + check.checked_feed_segments, 0);
+          const contactingSegments = (sweep.checks ?? []).reduce((total, check) => total + check.contacting_segments, 0);
+          const maximumContact = Math.max(0, ...(sweep.checks ?? []).map((check) => check.maximum_single_contact_mm3));
+          setL32SimulationSummaries((current) => ({ ...current, [operation.id]: {
+            status: sweep.target_gouge_check_passed ? "passed" : "failed",
+            statusLabel: sweep.target_gouge_check_passed ? "刀具扫掠校核通过" : "检测到目标过切",
+            engineLabel: "L32 真实几何扫掠",
+            metrics: [
+              { label: "已校核轨迹", value: `${checkedSegments} 段`, detail: `${drafts.length} 个加工方向` },
+              { label: "目标过切", value: `${contactingSegments} 段`, detail: maximumContact > 0 ? `最大 ${maximumContact.toFixed(4)} mm³` : "未接触成品实体" },
+            ],
+            note: sweep.whole_part_material_verified ? "已完成整件材料校核。" : "当前为工序级刀具扫掠校核；整件材料去除量需连续材料仿真。",
+          } }));
         }
       } else if (operation.channel_id !== "sub") {
         const profile = l32Rotational.profiles.find((item) => operation.feature_ids.includes(item.id));
@@ -1398,6 +1619,65 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     };
   }, [activeMode, isL32, l32Axis, l32GroovePreviews, l32OperationPreview, l32Program, l32TurningPreviews, l32WholePartBlocked, operations, selectedOperation]);
 
+  const activeSimulationSummary = useMemo<OperationSimulationSummary | null>(() => {
+    if (!selectedOperation) return null;
+    if (!isL32) {
+      if (!camResult) return null;
+      const removedPercent = camResult.simulation.metrics.removed_percent;
+      const removedVolume = camResult.simulation.metrics.removed_volume_mm3;
+      const collisionCount = camResult.collision.metrics.collision_count;
+      const status = validationStatus ?? "warning";
+      return {
+        status,
+        statusLabel: status === "passed" ? "材料与安全校核通过" : status === "failed" ? "加工校核失败" : "加工结果存在警告",
+        engineLabel: `仿真引擎 ${camResult.engine}`,
+        metrics: [
+          { label: "材料去除", value: `${removedPercent}%`, detail: `${removedVolume.toFixed(2)} mm³` },
+          { label: "碰撞记录", value: `${collisionCount}`, detail: collisionCount ? "需要检查" : "未发现碰撞" },
+        ],
+        note: `网格精度 ${camResult.simulation.metrics.resolution_mm} mm。`,
+      };
+    }
+
+    const directSummary = l32SimulationSummaries[selectedOperation.id];
+    if (directSummary) return directSummary;
+    const stage = l32Program?.continuous_simulation.stage_snapshots?.find((item) => item.operation_id === selectedOperation.id);
+    if (stage) {
+      const verification = l32Program?.stages.find((item) => item.operation_id === selectedOperation.id)?.verification_status ?? "not_applicable";
+      const status = verification === "failed" ? "failed" : verification === "warning" || verification === "not_applicable" ? "warning" : "passed";
+      return {
+        status,
+        statusLabel: status === "passed" ? "连续材料仿真通过" : status === "failed" ? "连续材料仿真失败" : "材料结果已生成，校核有限",
+        engineLabel: "L32 连续材料仿真",
+        metrics: [
+          { label: "本工序去除", value: `${stage.metrics.removed_volume_mm3.toFixed(3)} mm³`, detail: `去除率 ${stage.metrics.removal_percent.toFixed(2)}%` },
+          { label: "工序后余料", value: `${stage.metrics.remaining_volume_mm3.toFixed(3)} mm³`, detail: `工序前 ${stage.metrics.initial_volume_mm3.toFixed(3)} mm³` },
+        ],
+        note: "数据来自整件连续加工中的当前工序阶段。",
+      };
+    }
+
+    const turningPreview = l32TurningPreviews[selectedOperation.id]
+      ?? (l32OperationPreview?.operationId === selectedOperation.id ? l32OperationPreview : null);
+    if (!turningPreview) return null;
+    const simulation = turningPreview.draft.simulation;
+    const verification = turningPreview.draft.verification;
+    const status = simulation.status === "failed" || verification?.status === "failed"
+      ? "failed"
+      : verification?.status === "warning" ? "warning" : "passed";
+    const deviationCount = (verification?.metrics.overcut_sample_count ?? 0) + (verification?.metrics.excess_stock_sample_count ?? 0);
+    return {
+      status,
+      statusLabel: status === "passed" ? "车削材料校核通过" : status === "failed" ? "车削材料校核失败" : "车削结果存在偏差",
+      engineLabel: `L32 回转材料仿真 · ${simulation.approximation}`,
+      metrics: [
+        { label: "本工序去除", value: `${simulation.metrics.removed_volume_mm3.toFixed(3)} mm³`, detail: `去除率 ${simulation.metrics.removal_percent.toFixed(2)}%` },
+        { label: "轮廓偏差", value: `${deviationCount} 点`, detail: verification ? `最大过切 ${verification.metrics.maximum_overcut_mm.toFixed(3)} mm` : "当前工序不适用轮廓校核" },
+      ],
+      note: `仿真分辨率 ${simulation.resolution_mm} mm，工序后剩余 ${simulation.metrics.remaining_volume_mm3.toFixed(3)} mm³。`,
+    };
+  }, [camResult, isL32, l32OperationPreview, l32Program, l32SimulationSummaries, l32TurningPreviews, selectedOperation, validationStatus]);
+
   const visibleToolpathSegments = useMemo(() => {
     if (isL32 && (activeMode === "刀路" || activeMode === "仿真") && playbackMode === "single" && l32OperationPreviewSegments.some((segment) => segment.motion === "cut")) return l32OperationPreviewSegments;
     if (isL32 && l32WholePartBlocked && activeMode !== "仿真") return EMPTY_TOOLPATH_SEGMENTS;
@@ -1555,11 +1835,21 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }, [activeMode, camResult, isL32, job.id, operations, readOnly]);
 
   const chooseOperation = (operation: Operation) => {
+    setStockSelected(false);
     setSelectedOperation(operation);
     setSelectedFeatureIds(operation.feature_ids);
     setActiveMode("工艺");
     setIsolatedFeatureId(null);
     setShowOperationViewSwitch(true);
+  };
+
+  const chooseStock = () => {
+    setStockSelected(true);
+    setActiveMode("工艺");
+    setSelectedFeatureIds([]);
+    setIsolatedFeatureId(null);
+    setShowOperationViewSwitch(false);
+    setShowOperationDetails(false);
   };
 
   const openOperationDetails = (operation: Operation, anchor: HTMLElement) => {
@@ -1593,6 +1883,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
 
   const openOperationSimulation = (operation: Operation) => {
     if (operation.enabled === false) return;
+    setStockSelected(false);
     setSelectedOperation(operation);
     setSelectedFeatureIds(operation.feature_ids);
     setEditingOperationDetails(false);
@@ -1635,6 +1926,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   };
 
   const chooseFeature = (id: string) => {
+    setStockSelected(false);
     setActiveMode("特征");
     setIsolatedFeatureId(id);
     setShowOperationViewSwitch(false);
@@ -1734,6 +2026,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     setL32GroovePreviews({});
     setL32GrooveSegments({});
     setL32MillingPreviews({});
+    setL32SimulationSummaries({});
     setWarmingL32Previews(false);
     setL32MaterialSnapshots(null);
     setL32MaterialSnapshotError(null);
@@ -1808,6 +2101,16 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         const segments = l32GroovePreviewToSegments(preview, l32Axis);
         setL32GroovePreviews((current) => ({ ...current, [operation.id]: preview }));
         setL32GrooveSegments((current) => ({ ...current, [operation.id]: segments }));
+        setL32SimulationSummaries((current) => ({ ...current, [operation.id]: {
+          status: sweep.target_gouge_check_passed ? "passed" : "failed",
+          statusLabel: sweep.target_gouge_check_passed ? "切槽扫掠校核通过" : "检测到目标过切",
+          engineLabel: "L32 精确槽形扫掠",
+          metrics: [
+            { label: "材料去除", value: `${sweep.check.removed_volume_mm3.toFixed(3)} mm³`, detail: "当前切槽工序" },
+            { label: "目标过切", value: sweep.target_gouge_check_passed ? "0" : "有", detail: sweep.target_gouge_check_passed ? "未侵入成品轮廓" : "需要调整工艺" },
+          ],
+          note: "数据来自当前工序的精确槽形与刀具扫掠校核。",
+        } }));
         if (requestId === l32PreviewRequestRef.current) {
           setL32OperationPreview(null);
           setL32MillingPreview({ operationId:operation.id, segments });
@@ -1872,6 +2175,17 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           if (draft.bound_machine_has_required_module === false) throw new Error("当前 L32 配置缺少 U151B 背面动力刀具模块");
           drafts = [draft];
           resultDetail = `去除 ${sweep.removed_pocket_region_mm3.toFixed(3)} mm³，剩余尖角材料 ${sweep.remaining_pocket_region_mm3.toFixed(3)} mm³`;
+          const passed = sweep.pocket_region_status === "passed" || sweep.remaining_pocket_region_mm3 <= 1e-6;
+          setL32SimulationSummaries((current) => ({ ...current, [operation.id]: {
+            status: passed ? "passed" : "warning",
+            statusLabel: passed ? "型腔材料校核通过" : "型腔仍有剩余材料",
+            engineLabel: "L32 型腔材料扫掠",
+            metrics: [
+              { label: "材料去除", value: `${sweep.removed_pocket_region_mm3.toFixed(3)} mm³`, detail: "当前型腔工序" },
+              { label: "剩余材料", value: `${sweep.remaining_pocket_region_mm3.toFixed(3)} mm³`, detail: passed ? "已达到目标区域" : "需要后续工序" },
+            ],
+            note: "按真实型腔区域统计当前工序的材料变化。",
+          } }));
         } else {
           const roughing = previewOperation.type === "live_tool_contour_roughing";
           const draftPath = roughing ? "catalog-exterior-toolpaths" : "catalog-ear-toolpaths";
@@ -1881,7 +2195,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               detail?: string; bound_machine_has_required_module?: boolean | null;
               exterior_drafts?: GeometricDraft[]; side_drafts?: GeometricDraft[];
             }>(`${job.id}:${draftPath}`, `/api/v1/jobs/${job.id}/l32/${draftPath}`),
-            fetchL32PreviewJson<{ detail?: string; target_gouge_check_passed?: boolean }>(
+            fetchL32PreviewJson<{ detail?: string; target_gouge_check_passed?: boolean; whole_part_material_verified?: boolean; checks?: Array<{ checked_feed_segments: number; contacting_segments: number; maximum_single_contact_mm3: number }> }>(
               `${job.id}:${checkPath}`, `/api/v1/jobs/${job.id}/l32/${checkPath}`,
             ),
           ]);
@@ -1893,6 +2207,19 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           if (sweep.target_gouge_check_passed !== true) throw new Error("非回转外形刀路未通过原始 STEP 过切检查");
           drafts = payload.exterior_drafts ?? payload.side_drafts ?? [];
           resultDetail = `${drafts.length} 个径向方向的刀具扫掠已通过目标实体过切检查`;
+          const checkedSegments = (sweep.checks ?? []).reduce((total, check) => total + check.checked_feed_segments, 0);
+          const contactingSegments = (sweep.checks ?? []).reduce((total, check) => total + check.contacting_segments, 0);
+          const maximumContact = Math.max(0, ...(sweep.checks ?? []).map((check) => check.maximum_single_contact_mm3));
+          setL32SimulationSummaries((current) => ({ ...current, [operation.id]: {
+            status: sweep.target_gouge_check_passed ? "passed" : "failed",
+            statusLabel: sweep.target_gouge_check_passed ? "刀具扫掠校核通过" : "检测到目标过切",
+            engineLabel: "L32 真实几何扫掠",
+            metrics: [
+              { label: "已校核轨迹", value: `${checkedSegments} 段`, detail: `${drafts.length} 个加工方向` },
+              { label: "目标过切", value: `${contactingSegments} 段`, detail: maximumContact > 0 ? `最大 ${maximumContact.toFixed(4)} mm³` : "未接触成品实体" },
+            ],
+            note: sweep.whole_part_material_verified ? "已完成整件材料校核。" : "当前为工序级刀具扫掠校核；整件材料去除量需连续材料仿真。",
+          } }));
         }
         const segments = toSegments(drafts);
         if (!segments.some((segment) => segment.motion === "cut")) throw new Error("工序未生成有效切削段");
@@ -2321,7 +2648,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           <section className={`feature-tree panel accordion-panel ${structureExpanded ? "expanded" : "collapsed"}`}>
             <button className="panel-heading accordion-trigger" aria-expanded={structureExpanded} onClick={() => { const next = !structureExpanded; setStructureExpanded(next); if (next) setFeatureStructureExpanded(false); }}><Layers3 size={16} /><span>工艺路线</span><small>{job.plan.setups.length} 装夹 · {operations.length} 工序</small><ChevronRight className="accordion-chevron" size={16} /></button>
             {structureExpanded && <div className="panel-content">
-              <div className="tree-section"><strong><Box size={15} /> 毛坯</strong><small>{String((job.plan.stock.size_mm as number[])?.join(" × "))} mm</small></div>
+              <button type="button" className={`tree-section stock-tree-row ${stockSelected ? "selected" : ""}`} aria-pressed={stockSelected} onClick={chooseStock}><strong><Box size={15} /> 毛坯</strong><small>{stockDimensionLabel}</small></button>
               {job.plan.setups.map((setup) => (
                 <div key={setup.id} className="setup-tree">
                   <div className="tree-section"><strong><Rotate3D size={15} /> {setup.name}</strong><small>{setup.fixture}</small></div>
@@ -2439,7 +2766,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             profileBoundaries={visibleProfileBoundaries}
             simulation={visibleSimulation}
             simulationBlocked={isL32 && playbackMode === "cumulative" && l32WholePartBlocked && visibleMaterialSnapshots.urls.length === 0 && l32PreviewOperationId !== selectedOperation?.id && previewingL32OperationId !== selectedOperation?.id && (activeMode === "仿真" || activeMode === "刀路")}
-            turningStage={visibleMaterialSnapshots.urls.length ? null : visibleTurningStage}
+            turningStage={stockTurningStage ?? (visibleMaterialSnapshots.urls.length ? null : visibleTurningStage)}
             camoticsSurface={visibleCamoticsSurface}
             fixtureComponents={visibleFixtureComponents}
             animateToolpath={activeMode === "仿真" && (playbackMode === "single" || !l32WholePartBlocked || visibleMaterialSnapshots.urls.length > 0 || l32PreviewOperationId === selectedOperation?.id)}
@@ -2447,8 +2774,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             playbackResetToken={playbackResetToken}
             operationTools={operationTools}
             topologyEdges={visibleTopologyEdges}
-            activeOperationId={selectedOperation?.id}
-            isFinalOperation={selectedOperation?.id === operations[operations.length - 1]?.id}
+            activeOperationId={stockSelected ? undefined : selectedOperation?.id}
+            isFinalOperation={!stockSelected && selectedOperation?.id === operations[operations.length - 1]?.id}
             playbackMode={playbackMode}
             onPlaybackModeChange={setPlaybackMode}
             toolpathLoaded={isL32 ? !loadingL32Program && (l32Program !== null || !warmingL32Previews) : !loadingCam}
@@ -2459,11 +2786,37 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             isolatedFeatureId={isolatedFeatureId}
             workAxis={selectedSetup?.work_axis}
             activeOperationLabel={selectedOperation?.name}
+            operationContextVisible={showOperationViewSwitch || stockSelected}
+            operationIntent={stockSelected ? null : operationIntent}
           />
-          {showOperationViewSwitch && selectedOperation && <nav className="operation-view-switch" aria-label={`${selectedOperation.name} 视图切换`}>
-            <button type="button" className={activeMode === "刀路" ? "active" : ""} onClick={() => chooseMode("刀路")}>{isSheetForming ? "成形" : "刀路"}</button>
-            <button type="button" className={activeMode === "仿真" ? "active" : ""} onClick={() => chooseMode("仿真")}>仿真</button>
-          </nav>}
+          {stockSelected && <section className="operation-context-card stock-context-card" aria-label="毛坯视图">
+            <header><span>加工起点</span><div><button type="button" aria-label="关闭毛坯窗口" title="关闭" onClick={() => setStockSelected(false)}><X size={15} /></button></div></header>
+            <strong>毛坯</strong>
+            <div className="operation-context-meta"><span>{job.plan.stock.type === "round_bar" ? "圆棒料" : "预制毛坯"}</span><span>{stockDimensionLabel}</span></div>
+            <div className="stock-context-overview"><Box size={22} /><div><strong>加工前原始材料</strong><span>右侧显示工艺路线开始前的毛坯外形</span></div></div>
+            <footer><i />工艺路线起始状态</footer>
+          </section>}
+          {showOperationViewSwitch && selectedOperation && <section className="operation-context-card" aria-label={`${selectedOperation.name} 工序视图`}>
+            <header><span>当前工序</span><div><em>{selectedOperation.id}</em><button type="button" aria-label="关闭工序窗口" title="关闭" onClick={() => setShowOperationViewSwitch(false)}><X size={15} /></button></div></header>
+            <strong>{selectedOperation.name}</strong>
+            <div className="operation-context-meta"><span>{selectedOperation.tool.name}</span>{selectedSetup?.work_axis && <span>方向 X{selectedSetup.work_axis.x.toFixed(0)} Y{selectedSetup.work_axis.y.toFixed(0)} Z{selectedSetup.work_axis.z.toFixed(0)}</span>}</div>
+            <nav className="operation-view-tabs" aria-label="工序视图切换">
+              <button type="button" className={activeMode === "工艺" ? "active" : ""} aria-current={activeMode === "工艺" ? "page" : undefined} onClick={() => chooseMode("工艺")}><span>工艺意图</span><small>加工什么</small></button>
+              <button type="button" className={activeMode === "刀路" ? "active" : ""} aria-current={activeMode === "刀路" ? "page" : undefined} onClick={() => chooseMode("刀路")}><span>{isSheetForming ? "成形路径" : "刀路轨迹"}</span><small>如何运动</small></button>
+              <button type="button" className={activeMode === "仿真" ? "active" : ""} aria-current={activeMode === "仿真" ? "page" : undefined} onClick={() => chooseMode("仿真")}><span>加工仿真</span><small>加工结果</small></button>
+            </nav>
+            {visualizedProcessParameters.length > 0 && <div className="process-parameter-chips">{visualizedProcessParameters.map((parameter) => <span key={parameter.key}><small>{parameter.label}</small><b>{parameter.value}</b></span>)}</div>}
+            <div className="operation-mode-content">
+              {activeMode === "工艺" && <>
+                {turningProcessProfile && (selectedOperation.type.startsWith("turn_") || selectedOperation.type === "axial_drilling") && <TurningProcessDiagram profile={turningProcessProfile} operation={selectedOperation} />}
+                {selectedOperationIsMilling && <MillingProcessDiagram feature={selectedFeatures[0] ?? null} operation={selectedOperation} />}
+                {!turningProcessProfile && !selectedOperationIsMilling && <div className="operation-mode-empty"><Layers3 size={22} /><strong>工艺意图</strong><span>当前工序没有可生成的几何示意，请查看工序参数和规划依据。</span></div>}
+              </>}
+              {activeMode === "刀路" && <ToolpathOverview segments={visibleToolpathSegments} loaded={isL32 ? !loadingL32Program && (l32Program !== null || !warmingL32Previews) : !loadingCam} />}
+              {activeMode === "仿真" && <SimulationOverview summary={activeSimulationSummary} loading={isL32 ? previewingL32OperationId === selectedOperation.id || warmingL32Previews : loadingCam || generatingCam} hasPreview={Boolean(visibleSimulation || visibleTurningStage || visibleMaterialSnapshots.urls.length || visibleToolpathSegments.length)} />}
+            </div>
+            <footer><i />{activeMode === "工艺" ? selectedFeatures.length ? `真实特征区域 · ${selectedFeatures.length} 项` : "根据工序参数推算加工区域" : activeMode === "刀路" ? loadingCam ? "正在加载刀路数据" : `${visibleToolpathSegments.length} 段运动轨迹` : "材料去除过程与安全校验"}</footer>
+          </section>}
           <nav className="inspection-rail" aria-label="工程检查与工艺工具">
             <button className={`inspection-card tool ${showResourceLibrary ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setDeviceInfoId(null); setShowResourceLibrary(true); }} title="打开工序库">
               <Library size={19} />

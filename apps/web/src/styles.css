@@ -808,12 +808,15 @@ body { min-width: 980px; background: #eef3f9; }
   cursor: pointer;
 }
 .accordion-trigger span { font-weight: 700; letter-spacing: .02em; }
-.accordion-trigger small { margin-left: auto; color: #dbe3ff; font: 8px "JetBrains Mono"; letter-spacing: 0; }
+.accordion-trigger small { margin-left: auto; color: #eef2ff; font: 9px "JetBrains Mono"; letter-spacing: 0; }
 .accordion-chevron { transition: transform .18s ease; }
 .accordion-panel.expanded .accordion-chevron { transform: rotate(90deg); }
 .feature-tree, .inspector { overflow: hidden; color: #263650; background: #fff; border-width: 1px; }
 .feature-tree .tree-section { border-bottom-color: #e5ebf3; }
-.feature-tree .tree-section small, .feature-tree .setup-tree button small { color: #78869a; }
+.feature-tree .tree-section small, .feature-tree .setup-tree button small { color: #62728a; font-size: 10px; line-height: 1.4; }
+.feature-tree .stock-tree-row { width: 100%; color: inherit; background: transparent; border: 0; border-bottom: 1px solid #e5ebf3; cursor: pointer; text-align: left; font: inherit; }
+.feature-tree .stock-tree-row:hover { background: #f3f6fd; }
+.feature-tree .stock-tree-row.selected { color: #294fae; background: #eaf0ff; box-shadow: inset 3px 0 #4569e7; }
 .feature-tree .setup-tree > button { min-height: 48px; color: #2e3c53; border-bottom-color: #e8edf4; }
 .feature-tree .setup-tree > button:hover { background: #f3f6fd; }
 .feature-tree .setup-tree > button.selected { background: #edf2ff; box-shadow: inset 3px 0 #4569e7; }
@@ -824,10 +827,10 @@ body { min-width: 980px; background: #eef3f9; }
 .feature-tree .operation-tree-row.suppressed .operation-tree-main { opacity: .48; text-decoration: line-through; }
 .feature-tree .operation-tree-main { flex: 1; min-width: 0; min-height: 48px; padding: 7px 4px 7px 10px; display: flex; align-items: flex-start; gap: 8px; text-align: left; color: #2e3c53; background: transparent; border: 0; cursor: pointer; }
 .feature-tree .operation-tree-main:disabled { cursor: not-allowed; }
-.feature-tree .operation-tree-main > span { flex: none; padding-top: 2px; color: #4569e7; font: 9px "JetBrains Mono", monospace; }
+.feature-tree .operation-tree-main > span { flex: none; padding-top: 2px; color: #3f61dc; font: 10px "JetBrains Mono", monospace; }
 .feature-tree .operation-tree-main > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.feature-tree .operation-tree-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
-.feature-tree .operation-tree-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #78869a; font-size: 9px; }
+.feature-tree .operation-tree-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; line-height: 1.35; }
+.feature-tree .operation-tree-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #62728a; font-size: 10px; line-height: 1.35; }
 .feature-tree .operation-tree-actions { flex: none; display: flex; align-items: center; gap: 2px; padding-right: 6px; }
 .feature-tree .operation-tree-actions button { width: 28px; height: 28px; display: grid; place-items: center; color: #5872a4; background: transparent; border: 1px solid transparent; border-radius: 6px; cursor: pointer; }
 .feature-tree .operation-tree-actions button:hover { color: #4569e7; background: #fff; border-color: #cbd8f5; }
@@ -1185,33 +1188,121 @@ body { min-width: 980px; background: #eef3f9; }
 }
 .compact-mode-toolbar button:hover { color: #3f63dc; background: #f0f4ff; }
 .compact-mode-toolbar button.active { color: #fff; background: #4569e7; box-shadow: 0 3px 8px #4569e73d; font-weight: 700; }
-.operation-view-switch {
+.operation-context-card {
   position: absolute;
   z-index: 14;
-  right: 88px;
-  bottom: 16px;
-  padding: 4px;
-  display: flex;
-  gap: 4px;
-  background: #fff;
+  top: 16px;
+  left: 16px;
+  width: 340px;
+  padding: 12px;
+  display: grid;
+  gap: 7px;
+  color: #33445e;
+  background: #fffffff2;
   border: 1px solid #d4def0;
-  border-radius: 9px;
-  box-shadow: 0 7px 22px #2944752b;
+  border-left: 4px solid #4569e7;
+  border-radius: 10px;
+  box-shadow: 0 8px 26px #29447526;
+  backdrop-filter: blur(8px);
 }
-.operation-view-switch button {
-  min-width: 64px;
-  height: 32px;
-  padding: 0 12px;
-  color: #53647d;
-  background: transparent;
-  border: 0;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 10px;
-  font-weight: 600;
-}
-.operation-view-switch button:hover { color: #365bd7; background: #eef3ff; }
-.operation-view-switch button.active { color: #fff; background: #4569e7; box-shadow: 0 3px 8px #4569e73d; }
+.operation-context-card > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.operation-context-card > header span { color: #566983; font-size: 10px; font-weight: 700; letter-spacing: .06em; }
+.operation-context-card > header > div { display: flex; align-items: center; gap: 8px; }
+.operation-context-card > header em { color: #3f61dc; font: 500 9px "JetBrains Mono", monospace; }
+.operation-context-card > header button { width: 26px; height: 26px; margin: -5px -5px -5px 0; padding: 0; display: grid; place-items: center; color: #71819a; background: transparent; border: 0; border-radius: 6px; cursor: pointer; }
+.operation-context-card > header button:hover { color: #3459d1; background: #edf2ff; }
+.operation-context-card > header button:focus-visible { outline: 2px solid #7892ea; outline-offset: 1px; }
+.operation-context-card > strong { overflow: hidden; font-size: 13px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.operation-context-meta { display: flex; align-items: center; gap: 8px; color: #5f7189; font-size: 10px; }
+.operation-context-meta span + span { padding-left: 8px; border-left: 1px solid #d9e1ed; font-family: "JetBrains Mono", monospace; }
+.operation-view-tabs { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid #dce4ef; }
+.operation-view-tabs button { position: relative; min-width: 0; height: 42px; padding: 5px 4px 7px; display: grid; place-content: center; gap: 2px; color: #76859b; background: transparent; border: 0; cursor: pointer; text-align: center; }
+.operation-view-tabs button::after { content: ""; position: absolute; right: 12px; bottom: -1px; left: 12px; height: 2px; background: transparent; border-radius: 2px 2px 0 0; }
+.operation-view-tabs button:hover { color: #4569e7; background: #f6f8fd; }
+.operation-view-tabs button.active { color: #365bd7; }
+.operation-view-tabs button.active::after { background: #4569e7; }
+.operation-view-tabs span { overflow: hidden; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.operation-view-tabs small { color: #7f8da1; font-size: 9px; font-weight: 400; }
+.operation-view-tabs button.active small { color: #5e74ad; }
+.process-parameter-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.process-parameter-chips > span { min-width: 70px; padding: 5px 7px; display: grid; gap: 2px; background: #f3f6fb; border: 1px solid #dce4f0; border-radius: 6px; }
+.process-parameter-chips small { color: #65758c; font-size: 9px; }
+.process-parameter-chips b { color: #354f7d; font: 500 10px "JetBrains Mono", monospace; }
+.operation-mode-content { min-height: 152px; display: grid; }
+.operation-mode-content > * { min-height: 0; }
+.operation-mode-empty { min-height: 138px; padding: 14px; display: grid; place-content: center; justify-items: center; gap: 6px; color: #718198; background: #f8fafc; border: 1px solid #dce4ee; border-radius: 7px; text-align: center; }
+.operation-mode-empty svg { color: #8799ba; }
+.operation-mode-empty strong { color: #4e607c; font-size: 9px; }
+.operation-mode-empty span { max-width: 250px; font-size: 8px; line-height: 1.55; }
+.operation-mode-overview { min-height: 138px; padding: 10px; display: grid; align-content: start; gap: 10px; color: #53647d; background: #f8fafc; border: 1px solid #dce4ee; border-radius: 7px; box-sizing: border-box; }
+.operation-mode-overview > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.operation-mode-overview > header strong { color: #394e6e; font-size: 10px; }
+.operation-mode-overview > header small { color: #6f7f94; font-size: 9px; }
+.toolpath-ratio { height: 8px; display: flex; overflow: hidden; background: #e6ebf2; border-radius: 5px; }
+.toolpath-ratio span { min-width: 0; height: 100%; }
+.toolpath-ratio .rapid { background: #6aa4df; }
+.toolpath-ratio .cut { background: #21c997; }
+.overview-metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px; }
+.overview-metrics > div { min-width: 0; padding: 7px; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 3px 6px; background: #fff; border: 1px solid #e0e6ef; border-radius: 6px; }
+.overview-metrics i { width: 7px; height: 7px; grid-row: 1 / 3; border-radius: 50%; }
+.overview-metrics i.rapid { background: #6aa4df; }
+.overview-metrics i.cut { background: #21c997; }
+.overview-metrics span { color: #65758b; font-size: 9px; }
+.overview-metrics strong { color: #354e72; font: 500 10px "JetBrains Mono", monospace; }
+.overview-metrics small { grid-column: 2; color: #748399; font: 9px "JetBrains Mono", monospace; }
+.operation-mode-overview > footer { color: #62738a; font-size: 9px; line-height: 1.5; }
+.simulation-metrics-compact > div { grid-template-columns: 1fr; }
+.simulation-metrics-compact small { grid-column: 1; }
+.turning-process-diagram { padding: 7px 7px 5px; display: grid; gap: 4px; background: #f8fafc; border: 1px solid #dce4ee; border-radius: 7px; }
+.turning-process-diagram > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.turning-process-diagram > header strong { color: #445776; font-size: 8px; }
+.turning-process-diagram > header small { color: #8a96a7; font-size: 7px; }
+.turning-process-diagram svg { width: 100%; height: 112px; overflow: visible; }
+.turning-process-diagram .centerline { stroke: #aab6c5; stroke-width: 1; stroke-dasharray: 4 3; }
+.turning-process-diagram .part-profile { fill: #dce3e8; stroke: #8997a5; stroke-width: 1.2; }
+.turning-process-diagram .target-line { fill: none; stroke: #16a879; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.turning-process-diagram .removal-layer { fill: #f0a23b9c; stroke: #df8d22; stroke-width: .8; }
+.turning-process-diagram .allowance-line { fill: none; stroke: #4569e7; stroke-width: 2; stroke-dasharray: 4 2; }
+.turning-process-diagram .groove-band { fill: #f0a23b99; stroke: #d9891e; stroke-width: 1.2; }
+.turning-process-diagram .cutoff-band { fill: #e85d758f; stroke: #cc405b; stroke-width: 1.2; }
+.turning-process-diagram > footer { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: #68788e; font-size: 7px; }
+.turning-process-diagram > footer span { display: inline-flex; align-items: center; gap: 4px; }
+.turning-process-diagram > footer i { width: 12px; height: 4px; border-radius: 2px; }
+.turning-process-diagram > footer i.target { background: #16a879; }
+.turning-process-diagram > footer i.removal { background: #f0a23b; }
+.turning-process-diagram > footer i.allowance { background: #4569e7; }
+.milling-process-diagram { padding: 7px 7px 5px; display: grid; gap: 4px; background: #f8fafc; border: 1px solid #dce4ee; border-radius: 7px; }
+.milling-process-diagram > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.milling-process-diagram > header strong { color: #445776; font-size: 8px; }
+.milling-process-diagram > header small { color: #8a96a7; font-size: 7px; }
+.milling-process-diagram svg { width: 100%; height: 116px; }
+.milling-process-diagram .diagram-caption { fill: #8491a3; font: 7px sans-serif; }
+.milling-process-diagram .milling-boundary { fill: #e1e7eb; stroke: #8493a4; stroke-width: 1.2; }
+.milling-process-diagram pattern line { stroke: #e59a31; stroke-width: 3; opacity: .65; }
+.milling-process-diagram .milling-removal { stroke: #df8d22; stroke-width: 1; }
+.milling-process-diagram .milling-target { fill: none; stroke: #16a879; stroke-width: 2.5; }
+.milling-process-diagram .milling-allowance { fill: none; stroke: #4569e7; stroke-width: 1.5; stroke-dasharray: 4 2; }
+.milling-process-diagram .milling-tool { fill: #ffffffdb; stroke: #4569e7; stroke-width: 1.5; }
+.milling-process-diagram .tool-label { fill: #4569e7; font: 6px "JetBrains Mono", monospace; text-anchor: middle; }
+.milling-process-diagram .depth-column { fill: #e4eaee; stroke: #8b99a8; stroke-width: 1; }
+.milling-process-diagram .depth-layer { stroke: #e59a31; stroke-width: 1.5; }
+.milling-process-diagram .depth-arrow { fill: none; stroke: #526b93; stroke-width: 1; }
+.milling-process-diagram .depth-label { fill: #526b93; font: 7px "JetBrains Mono", monospace; }
+.milling-process-diagram .floor-allowance { stroke: #4569e7; stroke-width: 2; stroke-dasharray: 3 2; }
+.milling-process-diagram > footer { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: #68788e; font-size: 7px; }
+.milling-process-diagram > footer span { display: inline-flex; align-items: center; gap: 4px; }
+.milling-process-diagram > footer i { width: 12px; height: 4px; border-radius: 2px; }
+.milling-process-diagram > footer i.target { background: #16a879; }
+.milling-process-diagram > footer i.removal { background: #f0a23b; }
+.milling-process-diagram > footer i.allowance { background: #4569e7; }
+.operation-context-card > footer { padding-top: 7px; display: flex; align-items: center; gap: 6px; color: #566a84; border-top: 1px solid #d8e0ec; font-size: 9px; line-height: 1.4; }
+.operation-context-card > footer i { width: 7px; height: 7px; flex: none; background: #21c997; border-radius: 50%; box-shadow: 0 0 6px #21c99780; }
+.stock-context-card { gap: 9px; }
+.stock-context-overview { min-height: 76px; padding: 12px; display: flex; align-items: center; gap: 11px; color: #60728a; background: #f5f7fa; border: 1px solid #dce4ee; border-radius: 7px; }
+.stock-context-overview > svg { flex: none; color: #58709a; }
+.stock-context-overview > div { min-width: 0; display: grid; gap: 4px; }
+.stock-context-overview strong { color: #3d506b; font-size: 11px; }
+.stock-context-overview span { color: #6c7c90; font-size: 9px; line-height: 1.45; }
 @media (max-width: 1250px) {
   .compact-mode-toolbar { width: 280px; }
   .app-header .project-title { width: 280px; }
@@ -1441,7 +1532,6 @@ body { min-width: 980px; background: #eef3f9; }
 .planning-stage-copy .planning-stage-detail { color: #7a8798; font: 9px/1.45 "Microsoft YaHei", sans-serif; font-weight: 400; white-space: normal; }
 .planning-progress-stages .planning-stage-meta { margin-left: auto; padding-top: 2px; flex: 0 0 auto; color: #8995a6; font: 9px "JetBrains Mono", monospace; }
 .planning-header-state { display: flex; align-items: center; gap: 6px; color: #dce5ff; font-size: 10px; }
-.processing-mode-toolbar button:disabled { cursor: default; }
 .processing-workspace { min-height: 0; }
 .processing-sidebar { min-height: 0; }
 .planning-workbench-panel { min-height: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; color: #3d4e65; background: #fff; border: 1px solid #d6e0ee; border-radius: 9px; }
