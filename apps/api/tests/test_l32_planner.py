@@ -5,7 +5,7 @@ from app.l32_configuration import snapshot_l32_instance
 from app.l32_front_chain import FrontChainDraftRequest, compile_front_chain_draft
 from app.main import app
 from app.machine_models import MachineInstance
-from app.models import GeometryAnalysis, JobResponse, PlanarFeature, PrismaticFeature, RotationalSectionCandidate
+from app.models import GeometryAnalysis, JobResponse, PlanarFeature, PrismaticFeature, RotationalSectionCandidate, Vec3
 from app.planner import build_process_plan
 from app.rotational_features import RotationalFeatureAnalysis, clip_rotational_profile, infer_rotational_features
 from app.requirements_adapter import import_measurement_specification
@@ -144,6 +144,16 @@ def bored_shaft_analysis() -> GeometryAnalysis:
     source = shaft_analysis(radius=10)
     source.cylindrical_features[0].id = "HF-BORE"
     source.cylindrical_features[0].source_face_ids = ["CF-BORE"]
+    source.cylindrical_features.append(source.cylindrical_features[0].model_copy(update={
+        "id": "HF-INNER-BORE",
+        "kind": "hole",
+        "radius": 6,
+        "diameter": 12,
+        "length": 20,
+        "center": Vec3(x=0, y=0, z=-10),
+        "source_face_ids": ["CF-INNER-BORE"],
+        "review_state": "accepted",
+    }))
     source.rotational_sections = [RotationalSectionCandidate.model_validate({
         "source_feature_id": "CF-BORE",
         "axis_origin": {"x": 0, "y": 0, "z": 0},

@@ -1,3 +1,7 @@
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from app import main
@@ -221,6 +225,95 @@ def test_rear_shoulder_drafts_bridge_groove_before_coordinate_transform() -> Non
         assert result.draft.verification.status == expected_status
         assert result.draft.verification.metrics.maximum_overcut_mm <= 0.05
         assert result.nc_generated is False
+
+
+def test_default_l32_instance_enables_supported_backside_operations(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "d" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    analysis = _regional_analysis()
+    job = JobResponse(
+        id=job_id,
+        status="completed",
+        filename="regional.step",
+        created_at=main.utc_now(),
+        material="S45C",
+        machine="Citizen Cincom L32",
+        device_id="citizen-cincom-l32",
+        analysis=analysis,
+        plan=build_process_plan(analysis, "S45C", "Citizen Cincom L32"),
+    )
+
+    main.provision_default_l32_planning_instance(job, directory)
+
+    back_operations = [
+        operation
+        for setup in job.plan.setups
+        for operation in setup.operations
+        if operation.workpiece_side == "back"
+    ]
+    assert [operation.id for operation in back_operations] == [
+        "OP50", "OP55-BACK", "OP58-BACK",
+    ]
+    assert all(operation.enabled for operation in back_operations)
+
+
+def test_material_snapshots_support_fully_rotational_plan_and_skip_backside_stages(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "e" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    analysis = _regional_analysis()
+    rotational = infer_rotational_features(analysis)
+    plan = build_process_plan(analysis, "S45C", "Citizen Cincom L32")
+    plan.stock.pop("nonrotational_region_z_mm", None)
+    job = JobResponse(
+        id=job_id,
+        status="completed",
+        filename="shaft.step",
+        created_at=main.utc_now(),
+        material="S45C",
+        machine="Citizen Cincom L32",
+        device_id="citizen-cincom-l32",
+        analysis=analysis,
+        plan=plan,
+    )
+    (directory / job.filename).write_text("dummy STEP", encoding="utf-8")
+    main.write_json(
+        directory / "rotational-features.json",
+        rotational.model_dump(mode="json"),
+    )
+    main.save_job(directory, job)
+
+    def fake_freecad(_executable, _script, arguments, **_kwargs):
+        output = Path(arguments[1])
+        stages = json.loads(arguments[2].read_text(encoding="utf-8"))["stages"]
+        operations = []
+        for stage in stages:
+            name = f"l32-material-{stage['operation_id']}-00.stl"
+            (output / name).write_bytes(b"solid snapshot\n" + b"x" * 100)
+            operations.append({
+                "operation_id": stage["operation_id"],
+                "files": [name],
+                "volumes_mm3": [100.0],
+            })
+        return SimpleNamespace(
+            stdout="CNC_L32_MATERIAL " + json.dumps({"operations": operations}),
+        )
+
+    monkeypatch.setattr(main, "run_freecad_adapter", fake_freecad)
+
+    response = client.get(f"/api/v1/jobs/{job_id}/l32/material-snapshots")
+
+    assert response.status_code == 200, response.text
+    operation_ids = [item["operation_id"] for item in response.json()["operations"]]
+    assert "OP20" in operation_ids
+    assert not {"OP50", "OP55-BACK", "OP58-BACK"} & set(operation_ids)
 
 
 def test_rear_shoulder_api_requires_module_and_exact_cutoff_datum(

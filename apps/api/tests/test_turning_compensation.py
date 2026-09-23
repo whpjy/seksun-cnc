@@ -49,6 +49,20 @@ def test_taper_offset_remains_one_nose_radius_from_target_line() -> None:
         assert distance == pytest.approx(nose_radius)
 
 
+def test_sharp_outer_transition_uses_offset_line_intersection_instead_of_inside_chord() -> None:
+    nose_radius = 0.2
+    corner = (-1.9, 10.05)
+    compensated = compensate_profile_for_nose(
+        profile("outer", [(-2.1, 10.25), corner, (-1.833333, 2.0)]),
+        nose_radius_mm=nose_radius,
+    )
+
+    compensated_corner = compensated[1]
+    assert hypot(
+        compensated_corner.z - corner[0], compensated_corner.radius - corner[1],
+    ) > nose_radius
+
+
 def test_compensation_rejects_inner_path_crossing_centerline() -> None:
     with pytest.raises(ValueError, match="centerline"):
         compensate_profile_for_nose(

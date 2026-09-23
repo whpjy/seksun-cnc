@@ -136,6 +136,14 @@ def test_prefers_exact_section_and_keeps_inner_profile_review_only() -> None:
     source = analysis_with_cylinder()
     source.cylindrical_features[0].id = "HF-1"
     source.cylindrical_features[0].source_face_ids = ["CF-1"]
+    source.cylindrical_features.append(source.cylindrical_features[0].model_copy(update={
+        "id": "HF-INNER-1",
+        "kind": "hole",
+        "radius": 3,
+        "diameter": 6,
+        "center": Vec3(x=0, y=0, z=5),
+        "review_state": "accepted",
+    }))
     source = GeometryAnalysis.model_validate({
         **source.model_dump(),
         "rotational_sections": [{
@@ -176,6 +184,86 @@ def test_prefers_exact_section_and_keeps_inner_profile_review_only() -> None:
     assert groove.width_mm == 5
     assert groove.depth_mm == 2
     assert any(feature.kind == "cutoff_boundary" for feature in result.features)
+
+
+def test_suppresses_inner_section_created_by_offset_axial_holes() -> None:
+    source = analysis_with_cylinder(axis={"x": 0, "y": 1, "z": 0})
+    source.measurements["bounding_box"] = Bounds.model_validate({
+        "minimum": {"x": -10, "y": -50, "z": -10},
+        "maximum": {"x": 10, "y": 50, "z": 10},
+        "size": {"x": 20, "y": 100, "z": 20},
+    })
+    source.cylindrical_features[0].id = "HF-OUTER"
+    source.cylindrical_features[0].source_face_ids = ["CF-OUTER"]
+    source.cylindrical_features.append(source.cylindrical_features[0].model_copy(update={
+        "id": "HF-OFFSET-HOLE",
+        "kind": "hole",
+        "radius": 3.15,
+        "diameter": 6.3,
+        "center": Vec3(x=5.15, y=0, z=0),
+        "review_state": "accepted",
+    }))
+    source = GeometryAnalysis.model_validate({
+        **source.model_dump(),
+        "rotational_sections": [{
+            "source_feature_id": "CF-OUTER",
+            "axis_origin": {"x": 0, "y": 0, "z": 0},
+            "axis": {"x": 0, "y": 1, "z": 0},
+            "plane_normal": {"x": 0, "y": 0, "z": 1},
+            "outer_profile": [
+                {"z": -20, "radius": 10},
+                {"z": 20, "radius": 10},
+            ],
+            "inner_profile": [
+                {"z": -5, "radius": 2},
+                {"z": 5, "radius": 8.3},
+            ],
+            "tolerance_mm": 0.005,
+            "warnings": ["review inner envelope"],
+        }],
+    })
+
+    result = infer_rotational_features(source)
+
+    assert [profile.side for profile in result.profiles] == ["outer"]
+    assert result.evidence["suppressed_inner_profile_reason"] == "no_coaxial_cylindrical_surface"
+    assert not any(feature.profile_id == "RP-INNER-1" for feature in result.features)
+    assert any("缺少同轴圆柱面佐证" in warning for warning in result.warnings)
+
+
+def test_exact_section_coordinates_follow_canonical_axis_direction() -> None:
+    source = analysis_with_cylinder(axis={"x": 0, "y": -1, "z": 0})
+    source.measurements["bounding_box"] = Bounds.model_validate({
+        "minimum": {"x": -10, "y": -40, "z": -10},
+        "maximum": {"x": 10, "y": 0, "z": 10},
+        "size": {"x": 20, "y": 40, "z": 20},
+    })
+    source.cylindrical_features[0].id = "HF-OUTER"
+    source.cylindrical_features[0].source_face_ids = ["CF-OUTER"]
+    source.cylindrical_features[0].center = Vec3(x=0, y=-35, z=0)
+    source = GeometryAnalysis.model_validate({
+        **source.model_dump(),
+        "rotational_sections": [{
+            "source_feature_id": "CF-OUTER",
+            "axis_origin": {"x": 0, "y": -35, "z": 0},
+            "axis": {"x": 0, "y": -1, "z": 0},
+            "plane_normal": {"x": 0, "y": 0, "z": 1},
+            "outer_profile": [
+                {"z": -35, "radius": 2},
+                {"z": 5, "radius": 10},
+            ],
+            "inner_profile": [],
+            "tolerance_mm": 0.005,
+            "warnings": [],
+        }],
+    })
+
+    result = infer_rotational_features(source)
+
+    assert result.axes[0].direction == Vec3(x=0, y=1, z=0)
+    assert [(item.z, item.radius) for item in result.profiles[0].points] == [
+        (-5, 10), (35, 2),
+    ]
 
 
 def test_exact_section_may_use_excluded_local_source_face_when_axis_and_span_match() -> None:

@@ -123,6 +123,28 @@ def _radial_distance(point: Vec3, origin: Vec3, direction: Vec3) -> float:
     return sqrt(radial_x * radial_x + radial_y * radial_y + radial_z * radial_z)
 
 
+def _has_coaxial_inner_surface(
+    analysis: GeometryAnalysis,
+    origin: Vec3,
+    direction: Vec3,
+    tolerance_mm: float,
+) -> bool:
+    """Require cylindrical evidence before treating section gaps as a turned bore.
+
+    A section through an indexed axial-hole pattern also contains multiple radii.
+    Without this guard those intersections look like an inner turning profile even
+    though every hole axis is offset from the spindle axis.
+    """
+    radial_tolerance = max(tolerance_mm * 4, 0.05)
+    return any(
+        feature.kind == "hole"
+        and feature.review_state != "excluded"
+        and abs(_dot(_normalize_direction(feature.axis), direction)) >= 0.995
+        and _radial_distance(feature.center, origin, direction) <= radial_tolerance
+        for feature in analysis.cylindrical_features
+    )
+
+
 def _cross(left: Vec3, right: Vec3) -> Vec3:
     return Vec3(
         x=left.y * right.z - left.z * right.y,
@@ -755,6 +777,11 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
         _, exact_section, reference = max(section_candidates, key=lambda item: item[0])
     direction = _normalize_direction(exact_section.axis if exact_section else reference.axis)
     axis_origin = exact_section.axis_origin if exact_section else reference.center
+    section_axis_sign = (
+        1.0
+        if exact_section is None or _dot(exact_section.axis, direction) >= 0
+        else -1.0
+    )
     axis = RotationalAxisCandidate(
         id="RA-1",
         origin=axis_origin,
@@ -770,10 +797,16 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
     start = -reference.length / 2
     end = reference.length / 2
     if exact_section:
-        profile_points = [
-            RotationalProfilePoint(z=item.z, radius=item.radius)
-            for item in exact_section.outer_profile
-        ]
+        profile_points = sorted(
+            (
+                RotationalProfilePoint(
+                    z=item.z * section_axis_sign,
+                    radius=item.radius,
+                )
+                for item in exact_section.outer_profile
+            ),
+            key=lambda item: item.z,
+        )
     else:
         profile_points = projected_profile or [
             RotationalProfilePoint(z=start, radius=reference.radius),
@@ -850,15 +883,31 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
             "轮廓来自 OCCT 精确平面截线的外包络，生成刀路前仍须确认回转轴、截面方向和非回转特征。"
         ]
     profiles = [outer_profile]
-    if exact_section and len(exact_section.inner_profile) >= 2:
+    inner_section_supported = bool(
+        exact_section
+        and len(exact_section.inner_profile) >= 2
+        and _has_coaxial_inner_surface(
+            analysis, axis_origin, direction, exact_section.tolerance_mm,
+        )
+    )
+    if exact_section and exact_section.inner_profile and not inner_section_supported:
+        evidence["suppressed_inner_profile_reason"] = "no_coaxial_cylindrical_surface"
+    if exact_section and inner_section_supported:
         profiles.append(RotationalProfile(
             id="RP-INNER-1",
             axis_id=axis.id,
             side="inner",
             extraction_method="exact_section",
             points=[
-                RotationalProfilePoint(z=item.z, radius=item.radius)
-                for item in exact_section.inner_profile
+                RotationalProfilePoint(
+                    z=item.z * section_axis_sign,
+                    radius=item.radius,
+                )
+                for item in (
+                    exact_section.inner_profile
+                    if section_axis_sign > 0
+                    else reversed(exact_section.inner_profile)
+                )
             ],
             confidence=min(reference.confidence, 0.65),
             review_state=analysis.rotational_profile_reviews.get("RP-INNER-1", "review"),
@@ -876,6 +925,11 @@ def infer_rotational_features(analysis: GeometryAnalysis) -> RotationalFeatureAn
             else "未取得精确 Z-R 截面；该圆柱包络结果只能用于人工确认。"
         ),
         *(exact_section.warnings if exact_section else []),
+        *(
+            ["截面中的内侧交线缺少同轴圆柱面佐证，已按偏心孔或局部交线抑制，不生成内孔特征。"]
+            if exact_section and exact_section.inner_profile and not inner_section_supported
+            else []
+        ),
         *review_reasons,
     ]
     turning_features = [

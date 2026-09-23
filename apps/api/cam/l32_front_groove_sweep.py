@@ -21,35 +21,38 @@ def main():
         raise ValueError("expected an unbound reference-only groove geometry draft")
     direction = axis["direction"]
     origin = axis["origin"]
-    if (
-        abs(float(direction["x"])-1) > 1e-8
-        or abs(float(direction["y"])) > 1e-8
-        or abs(float(direction["z"])) > 1e-8
-        or abs(float(origin["y"])) > 1e-8
-        or abs(float(origin["z"])) > 1e-8
-    ):
-        raise ValueError("groove sweep currently requires a +X axis through global Y=Z=0")
+    axis_vector = App.Vector(*[float(direction[key]) for key in ("x", "y", "z")])
+    if axis_vector.Length <= 1e-12:
+        raise ValueError("groove sweep requires a non-zero rotational axis")
+    axis_vector.normalize()
+    axis_origin = App.Vector(*[float(origin[key]) for key in ("x", "y", "z")])
     solids = list(Part.read(source_path).Solids)
     if len(solids) != 1:
         raise ValueError(f"expected one original target solid, got {len(solids)}")
     target = solids[0]
-    bounds = target.BoundBox
+    projections = [
+        (vertex.Point - axis_origin).dot(axis_vector)
+        for vertex in target.Vertexes
+    ]
+    if not projections:
+        raise ValueError("groove sweep target does not contain vertices")
+    stock_min = min(projections)
+    stock_max = max(projections)
     radius = float(draft["stock_radius_mm"])
     stock = Part.makeCylinder(
-        radius, bounds.XMax-bounds.XMin,
-        App.Vector(bounds.XMin,0,0), App.Vector(1,0,0),
+        radius, stock_max - stock_min,
+        axis_origin + axis_vector * stock_min, axis_vector,
     )
     initial_volume = stock.Volume
     summed_contact = 0.0
     maximum_contact = 0.0
     for strip in draft["strips"]:
-        left = float(origin["x"])+float(strip["z_min_mm"])
+        left = float(strip["z_min_mm"])
         width = float(strip["z_max_mm"])-float(strip["z_min_mm"])
         cut_to = float(strip["cut_to_radius_mm"])
         if width <= 0 or cut_to <= 0 or cut_to >= radius:
             raise ValueError("invalid groove cutter envelope")
-        base = App.Vector(left,0,0)
-        axis_vector = App.Vector(1,0,0)
+        base = axis_origin + axis_vector * left
         outer = Part.makeCylinder(radius+0.1,width,base,axis_vector)
         inner = Part.makeCylinder(cut_to,width,base,axis_vector)
         cutter = outer.cut(inner)

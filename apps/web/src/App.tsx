@@ -1256,7 +1256,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               };
             }>;
           }>(`${job.id}:front-groove-geometry`, `/api/v1/jobs/${job.id}/l32/front-groove-geometry`),
-          fetchL32PreviewJson<{ target_gouge_check_passed: boolean; check: { removed_volume_mm3: number } }>(`${job.id}:front-groove-sweep`, `/api/v1/jobs/${job.id}/l32/front-groove-sweep-check`),
+          fetchL32PreviewJson<{ target_gouge_check_passed: boolean; check: { removed_volume_mm3: number } }>(`${job.id}:front-groove-sweep:${operation.id}`, `/api/v1/jobs/${job.id}/l32/front-groove-sweep-check?operation_id=${encodeURIComponent(operation.id)}`),
         ]);
         results = grooveResults;
         const groove = grooveResults[0].payload.grooves.find((item) => item.operation_id === operation.id);
@@ -2123,7 +2123,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           fetchL32PreviewJson<{
             detail?: string; target_gouge_check_passed: boolean;
             check: { removed_volume_mm3: number };
-          }>(`${job.id}:front-groove-sweep`, `/api/v1/jobs/${job.id}/l32/front-groove-sweep-check`),
+          }>(`${job.id}:front-groove-sweep:${previewOperation.id}`, `/api/v1/jobs/${job.id}/l32/front-groove-sweep-check?operation_id=${encodeURIComponent(previewOperation.id)}`),
         ]);
         const geometry = geometryResult.payload;
         const sweep = sweepResult.payload;

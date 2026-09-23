@@ -246,6 +246,40 @@ def test_regional_draft_rejects_oversized_nose_and_detected_overcut() -> None:
         raise AssertionError("regional overcut must be blocked")
 
 
+def test_regional_finish_keeps_small_nose_outside_sharp_outward_shoulder() -> None:
+    profile = RotationalProfile(
+        id="RP-1", axis_id="RA-1", side="outer", extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=-2.1, radius=10.25),
+            RotationalProfilePoint(z=-1.9, radius=10.05),
+            RotationalProfilePoint(z=-1.833333, radius=2.0),
+            RotationalProfilePoint(z=0, radius=0.5),
+        ],
+        confidence=1, review_state="accepted",
+    )
+    operation = _operation()
+    operation.tool = get_tool("TURN-OD-MICRO-F")
+    operation.parameters.update({
+        "cut_direction": "negative_z",
+        "profile_z_min_mm": -2.1,
+        "profile_z_max_mm": 0,
+        "profile_region_complete": False,
+        "maximum_finish_nose_radius_mm": 0.2,
+    })
+
+    result = compile_turning_draft(
+        "a" * 32,
+        _request(
+            operation=operation, profile=profile, stock_radius_mm=11.25,
+            z_min_mm=-4, z_max_mm=2, resolution_mm=0.1,
+        ),
+        _snapshot(),
+    )
+
+    assert result.verification is not None
+    assert result.verification.metrics.maximum_overcut_mm <= 0.05
+
+
 def test_cutoff_draft_does_not_claim_whole_profile_verification() -> None:
     result = compile_turning_draft(
         "a" * 32,

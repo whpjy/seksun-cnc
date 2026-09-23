@@ -62,11 +62,54 @@ def compensate_profile_for_nose(
         else:
             normal_z /= normal_length
             normal_r /= normal_length
-        radius = point.radius + material_offset + nose_radius_mm * normal_r
-        if radius < 0:
+        candidate_z = point.z + nose_radius_mm * normal_z
+        candidate_radius = point.radius + material_offset + nose_radius_mm * normal_r
+        if 0 < index < len(points) - 1:
+            previous = points[index - 1]
+            following = points[index + 1]
+            previous_direction = (point.z - previous.z, point.radius - previous.radius)
+            next_direction = (following.z - point.z, following.radius - point.radius)
+            denominator = (
+                previous_direction[0] * next_direction[1]
+                - previous_direction[1] * next_direction[0]
+            )
+            outward_corner = (
+                denominator < -1e-12
+                if profile.side == "outer"
+                else denominator > 1e-12
+            )
+            if outward_corner:
+                previous_offset = (
+                    point.z + nose_radius_mm * segment_normals[index - 1][0],
+                    point.radius + material_offset + nose_radius_mm * segment_normals[index - 1][1],
+                )
+                next_offset = (
+                    point.z + nose_radius_mm * segment_normals[index][0],
+                    point.radius + material_offset + nose_radius_mm * segment_normals[index][1],
+                )
+                offset_delta = (
+                    next_offset[0] - previous_offset[0],
+                    next_offset[1] - previous_offset[1],
+                )
+                distance = (
+                    offset_delta[0] * next_direction[1]
+                    - offset_delta[1] * next_direction[0]
+                ) / denominator
+                intersection = (
+                    previous_offset[0] + distance * previous_direction[0],
+                    previous_offset[1] + distance * previous_direction[1],
+                )
+                # Use the true intersection of the adjacent offset lines at
+                # ordinary shoulders. Averaging their normals creates an
+                # inside chord that lets the circular insert overcut a sharp
+                # accepted profile. Retain the bounded fallback at degenerate
+                # or extreme cusps where a miter would be impractically long.
+                if hypot(intersection[0] - point.z, intersection[1] - point.radius) <= 20 * nose_radius_mm:
+                    candidate_z, candidate_radius = intersection
+        if candidate_radius < 0:
             raise ValueError("nose compensation crosses the rotational centerline")
         compensated.append(RotationalProfilePoint(
-            z=point.z + nose_radius_mm * normal_z,
-            radius=radius,
+            z=candidate_z,
+            radius=candidate_radius,
         ))
     return compensated

@@ -780,18 +780,43 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
     rotational = RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8"))
     if not rotational.axes:
         raise HTTPException(status_code=422, detail="No rotational axis is available")
-    region = job.plan.stock.get("nonrotational_region_z_mm")
-    if not isinstance(region, list) or len(region) != 2:
-        raise HTTPException(status_code=422, detail="Nonrotational stock region is unavailable")
     source_profile = next(
         (profile for profile in rotational.profiles if profile.id == job.plan.stock.get("rotational_profile_id")),
         None,
     )
     if source_profile is None or source_profile.review_state != "accepted":
         raise HTTPException(status_code=422, detail="Accepted outer rotational profile is unavailable")
-    face_operation = next((item for item in operations if item.enabled is not False and item.type == "turn_facing"), None)
-    rough_operation = next((item for item in operations if item.enabled is not False and item.type == "turn_od_roughing"), None)
-    front_min = max(max(float(region[0]), float(region[1])), min(point.z for point in source_profile.points))
+    profile_min = min(point.z for point in source_profile.points)
+    profile_max = max(point.z for point in source_profile.points)
+    region = job.plan.stock.get("nonrotational_region_z_mm")
+    explicit_nonrotational_region = isinstance(region, list) and len(region) == 2
+    if explicit_nonrotational_region:
+        region_min, region_max = sorted((float(region[0]), float(region[1])))
+    else:
+        # A fully rotational part legitimately has no nonrotational region.
+        # Its accepted exact profile is the material snapshot axial envelope.
+        region_min, region_max = profile_min, profile_max
+    face_operation = next((
+        item for item in operations
+        if item.enabled is not False and item.type == "turn_facing" and item.workpiece_side == "front"
+    ), None)
+    rough_operation = next((
+        item for item in operations
+        if item.enabled is not False and item.type == "turn_od_roughing" and item.workpiece_side == "front"
+    ), None)
+    planned_front_minima = [
+        float(item.parameters["profile_z_min_mm"])
+        for item in operations
+        if item.enabled is not False and item.workpiece_side == "front"
+        and item.type in {"turn_od_roughing", "turn_od_finishing"}
+        and isinstance(item.parameters.get("profile_z_min_mm"), (int, float))
+    ]
+    front_min = max(
+        profile_min,
+        min(planned_front_minima) if planned_front_minima else (
+            region_max if explicit_nonrotational_region else profile_min
+        ),
+    )
     front_max = float(face_operation.parameters.get("face_z_mm", max(point.z for point in source_profile.points))) if face_operation else max(point.z for point in source_profile.points)
     if front_max <= front_min:
         raise HTTPException(status_code=422, detail="Front turning region has no axial extent")
@@ -805,9 +830,9 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
     for operation in operations:
         if operation.enabled is False:
             continue
-        if operation.type == "turn_facing":
+        if operation.type == "turn_facing" and operation.workpiece_side == "front":
             stages.append({"operation_id": operation.id, "kind": "face", "rough": False})
-        elif operation.type in {"turn_od_roughing", "turn_od_finishing"}:
+        elif operation.type in {"turn_od_roughing", "turn_od_finishing"} and operation.workpiece_side == "front":
             stages.append({"operation_id": operation.id, "kind": "front", "rough": operation.type == "turn_od_roughing"})
         elif operation.type == "turn_grooving" and operation.workpiece_side == "front":
             feature = next((item for item in rotational.features if item.id in operation.feature_ids and item.kind == "external_groove_candidate"), None)
@@ -838,7 +863,7 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
             lower, upper = center - width / 2, center + width / 2
             # The sacrificial kerf must remain behind the retained STEP part.
             # An invalid or overlapping setup cannot be represented as verified IPW.
-            if not all(isfinite(value) for value in (width, center, lower, upper)) or width <= 0 or upper > min(float(region[0]), float(region[1])) + 1e-6:
+            if not all(isfinite(value) for value in (width, center, lower, upper)) or width <= 0 or upper > region_min + 1e-6:
                 continue
             cutoffs[operation.id] = {"minimum": lower, "maximum": upper}
             stages.append({"operation_id": operation.id, "kind": "cutoff", "rough": False})
@@ -867,8 +892,8 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
         "axis_origin": axis.origin.model_dump(mode="json"),
         "axis_direction": axis.direction.model_dump(mode="json"),
         "stock_radius": stock_radius,
-        "region_min": min(float(region[0]), float(region[1])),
-        "region_max": max(float(region[0]), float(region[1])),
+        "region_min": region_min,
+        "region_max": region_max,
         "front_region_min": front_min,
         "front_region_max": front_max,
         "front_rough_radius": min(stock_radius, front_profile_radius + rough_allowance),
@@ -995,9 +1020,17 @@ def get_l32_front_groove_geometry(job_id: str) -> dict[str, object]:
 
 
 @app.get("/api/v1/jobs/{job_id}/l32/front-groove-sweep-check")
-def check_l32_front_groove_sweep(job_id: str) -> dict[str, object]:
+def check_l32_front_groove_sweep(
+    job_id: str, operation_id: str | None = None,
+) -> dict[str, object]:
     geometry = get_l32_front_groove_geometry(job_id)
-    if len(geometry["grooves"]) != 1:
+    matching = [
+        item for item in geometry["grooves"]
+        if operation_id is None or item["operation_id"] == operation_id
+    ]
+    if operation_id is not None and not matching:
+        raise HTTPException(status_code=404, detail="Front groove operation was not found")
+    if len(matching) != 1:
         raise HTTPException(status_code=422, detail="Exactly one exact front external groove is required")
     job = load_job(job_id)
     source = job_directory(job_id) / job.filename
@@ -1005,7 +1038,8 @@ def check_l32_front_groove_sweep(job_id: str) -> dict[str, object]:
         raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
     analysis_path = job_directory(job_id) / "rotational-features.json"
     analysis = RotationalFeatureAnalysis.model_validate_json(analysis_path.read_text(encoding="utf-8"))
-    draft = geometry["grooves"][0]["draft"]
+    selected = matching[0]
+    draft = selected["draft"]
     profile = next(item for item in analysis.profiles if item.id == draft["profile_id"])
     axis = next(item for item in analysis.axes if item.id == profile.axis_id)
     if axis.review_state != "accepted":
@@ -1035,6 +1069,7 @@ def check_l32_front_groove_sweep(job_id: str) -> dict[str, object]:
         raise HTTPException(status_code=502, detail=f"Front groove OCC sweep failed: {error}") from error
     payload = {
         "schema_version":"1.0.0","job_id":job_id,"reference_only":True,"nc_generated":False,
+        "operation_id":selected["operation_id"],
         "actual_planned_tool_fits_floor":draft["actual_tool_fits_floor"],
         "target_gouge_check_passed":bool(result["target_solid_valid"] and result["remaining_stock_valid"]
             and result["summed_target_contact_mm3"] <= 0.000001
@@ -1125,6 +1160,77 @@ def update_l32_physical_tool(
         return record
 
 
+def apply_l32_machine_configuration(
+    job: JobResponse,
+    snapshot: MachineConfigurationSnapshot,
+) -> None:
+    """Apply one validated machine snapshot to every capability-gated operation."""
+    job.machine_instance_id = snapshot.instance.id
+    job.machine_configuration_hash = snapshot.configuration_hash
+    if not job.plan:
+        return
+    job.plan.stock["machine_instance_id"] = snapshot.instance.id
+    job.plan.stock["machine_configuration_hash"] = snapshot.configuration_hash
+    back_module_available = "back_turning" in snapshot.validation.capabilities
+    back_live_tool_available = "back_live_tool_milling" in snapshot.validation.capabilities
+    back_turning_enabled = (
+        back_module_available
+        and job.plan.stock.get("nonrotational_turning_limit_z_mm") is None
+    )
+    regional_backside = any(
+        item.id == "OP58-BACK"
+        for setup in job.plan.setups for item in setup.operations
+    )
+    for setup in job.plan.setups:
+        for operation in setup.operations:
+            if operation.workpiece_side != "back":
+                continue
+            if operation.type in {"pocket_roughing", "pocket_finishing"}:
+                operation.enabled = back_live_tool_available
+            else:
+                operation.enabled = back_turning_enabled and not (
+                    regional_backside and operation.id == "OP60"
+                )
+            operation.generation_state = "dirty"
+    warning = (
+        "当前零件背面含非回转结构，原背轴车削工序会误切成品，已保持禁用。"
+        if back_module_available and not back_turning_enabled
+        else "当前绑定设备实例未确认 back_turning 刀具模块，背面工序保持禁用。"
+    )
+    legacy_warning = "当前绑定设备实例未确认 back_turning 刀具模块，OP50/OP60 背面工序保持禁用。"
+    job.plan.warnings = [item for item in job.plan.warnings if item != legacy_warning]
+    if back_turning_enabled:
+        job.plan.warnings = [item for item in job.plan.warnings if item != warning]
+    elif warning not in job.plan.warnings:
+        job.plan.warnings.append(warning)
+    redundant_cleanup_warning = "背面区域精车 OP58-BACK 已覆盖切断邻域；旧版 OP60 清根工序保持禁用以防重复过切。"
+    if regional_backside and any(
+        item.id == "OP60" for setup in job.plan.setups for item in setup.operations
+    ):
+        if redundant_cleanup_warning not in job.plan.warnings:
+            job.plan.warnings.append(redundant_cleanup_warning)
+    else:
+        job.plan.warnings = [
+            item for item in job.plan.warnings if item != redundant_cleanup_warning
+        ]
+    if job.analysis:
+        job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan)
+        job.plan.manufacturing_route = build_manufacturing_route(job.analysis, job.plan)
+        job.plan.knowledge_assessment = assess_plan_knowledge(job.analysis, job.plan)
+
+
+def reapply_bound_l32_machine_configuration(job: JobResponse, directory: Path) -> None:
+    if not job.machine_instance_id or not job.machine_configuration_hash or not job.plan:
+        return
+    snapshot = load_machine_snapshot(directory / "machine-configuration.json")
+    if (
+        snapshot.instance.id != job.machine_instance_id
+        or snapshot.configuration_hash != job.machine_configuration_hash
+    ):
+        raise ValueError("bound machine configuration integrity check failed")
+    apply_l32_machine_configuration(job, snapshot)
+
+
 @app.put("/api/v1/jobs/{job_id}/machine-instance", response_model=JobResponse)
 def bind_job_machine_instance(job_id: str, request: MachineBindingRequest) -> JobResponse:
     job = load_job(job_id)
@@ -1142,57 +1248,9 @@ def bind_job_machine_instance(job_id: str, request: MachineBindingRequest) -> Jo
         required_option = job.plan.stock.get("required_option")
         if required_option and required_option not in snapshot.instance.enabled_options:
             raise HTTPException(status_code=422, detail=f"Machine instance lacks required option: {required_option}")
-        job.plan.stock["machine_instance_id"] = snapshot.instance.id
-        job.plan.stock["machine_configuration_hash"] = snapshot.configuration_hash
-        back_module_available = "back_turning" in snapshot.validation.capabilities
-        back_live_tool_available = "back_live_tool_milling" in snapshot.validation.capabilities
-        back_turning_enabled = (
-            back_module_available
-            and job.plan.stock.get("nonrotational_turning_limit_z_mm") is None
-        )
-        regional_backside = any(
-            item.id == "OP58-BACK"
-            for setup in job.plan.setups for item in setup.operations
-        )
-        for setup in job.plan.setups:
-            for operation in setup.operations:
-                if operation.workpiece_side == "back":
-                    if operation.type in {"pocket_roughing", "pocket_finishing"}:
-                        operation.enabled = back_live_tool_available
-                    else:
-                        operation.enabled = back_turning_enabled and not (
-                            regional_backside and operation.id == "OP60"
-                        )
-                    operation.generation_state = "dirty"
-        warning = (
-            "当前零件背面含非回转结构，原背轴车削工序会误切成品，已保持禁用。"
-            if back_module_available and not back_turning_enabled
-            else "当前绑定设备实例未确认 back_turning 刀具模块，背面工序保持禁用。"
-        )
-        legacy_warning = "当前绑定设备实例未确认 back_turning 刀具模块，OP50/OP60 背面工序保持禁用。"
-        job.plan.warnings = [item for item in job.plan.warnings if item != legacy_warning]
-        if back_turning_enabled:
-            job.plan.warnings = [item for item in job.plan.warnings if item != warning]
-        else:
-            if warning not in job.plan.warnings:
-                job.plan.warnings.append(warning)
-        redundant_cleanup_warning = "背面区域精车 OP58-BACK 已覆盖切断邻域；旧版 OP60 清根工序保持禁用以防重复过切。"
-        if regional_backside and any(
-            item.id == "OP60" for setup in job.plan.setups for item in setup.operations
-        ):
-            if redundant_cleanup_warning not in job.plan.warnings:
-                job.plan.warnings.append(redundant_cleanup_warning)
-        else:
-            job.plan.warnings = [
-                item for item in job.plan.warnings if item != redundant_cleanup_warning
-            ]
-        job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan) if job.analysis else job.plan.coverage
-        job.plan.manufacturing_route = build_manufacturing_route(job.analysis, job.plan) if job.analysis else job.plan.manufacturing_route
-        job.plan.knowledge_assessment = assess_plan_knowledge(job.analysis, job.plan) if job.analysis else job.plan.knowledge_assessment
+    apply_l32_machine_configuration(job, snapshot)
 
     directory = job_directory(job_id)
-    job.machine_instance_id = snapshot.instance.id
-    job.machine_configuration_hash = snapshot.configuration_hash
     invalidate_cam_artifacts(directory)
     write_json(directory / "machine-configuration.json", snapshot.model_dump(mode="json"))
     if job.plan:
@@ -1715,10 +1773,7 @@ def provision_default_l32_planning_instance(job: JobResponse, directory: Path) -
     snapshot = snapshot_l32_instance(instance)
     if not snapshot.validation.valid:
         raise ValueError("default L32 planning instance is invalid")
-    job.machine_instance_id = instance.id
-    job.machine_configuration_hash = snapshot.configuration_hash
-    job.plan.stock["machine_instance_id"] = instance.id
-    job.plan.stock["machine_configuration_hash"] = snapshot.configuration_hash
+    apply_l32_machine_configuration(job, snapshot)
     instance_path = machine_instance_path(instance.id)
     instance_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(instance_path, snapshot.model_dump(mode="json"))
@@ -1734,6 +1789,7 @@ def bind_default_l32_planning_instance(job_id: str) -> JobResponse:
     provision_default_l32_planning_instance(job, directory)
     if not job.machine_instance_id:
         raise HTTPException(status_code=422, detail="The job cannot use the default L32 configuration")
+    reapply_bound_l32_machine_configuration(job, directory)
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
     save_job(directory, job)
     return job
@@ -2282,6 +2338,7 @@ def review_job_rotational_profile(
                 and job.plan.stock.get("nonrotational_turning_limit_z_mm") is None
             ):
                 operation.enabled = True
+    reapply_bound_l32_machine_configuration(job, directory)
     write_json(directory / "analysis.json", job.analysis.model_dump(mode="json"))
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
     result = persist_rotational_analysis(directory, job, job.analysis)
@@ -2352,6 +2409,7 @@ def import_job_manufacturing_requirements(
                 operation.status = "proposed"
                 operation.generation_state = "dirty"
     directory = job_directory(job_id)
+    reapply_bound_l32_machine_configuration(job, directory)
     invalidate_cam_artifacts(directory)
     write_json(directory / "manufacturing-requirements.json", requirements.model_dump(mode="json"))
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
@@ -2501,6 +2559,7 @@ def confirm_job_groove_binding(
                 setup.operations[index] = previous
 
     directory = job_directory(job_id)
+    reapply_bound_l32_machine_configuration(job, directory)
     invalidate_cam_artifacts(directory)
     write_json(directory / "manufacturing-requirements.json", requirements.model_dump(mode="json"))
     write_json(directory / "groove-binding.json", {
@@ -2623,6 +2682,7 @@ def confirm_job_thread_binding(
                 operation.enabled = True
 
     directory = job_directory(job_id)
+    reapply_bound_l32_machine_configuration(job, directory)
     invalidate_cam_artifacts(directory)
     write_json(directory / "manufacturing-requirements.json", requirements.model_dump(mode="json"))
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
@@ -3209,11 +3269,12 @@ def reanalyze_job(job_id: str) -> JobResponse:
             analysis, material=job.material, machine=job.machine,
             requirements=job.plan.manufacturing_requirements if job.plan else None,
         )
-        write_json(directory / "plan.json", plan.model_dump(mode="json"))
         job.status = "completed"
         job.analysis = analysis
         job.plan = plan
         job.model_url = f"/api/v1/jobs/{job_id}/files/model.stl"
+        reapply_bound_l32_machine_configuration(job, directory)
+        write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
     except (subprocess.SubprocessError, OSError, ValueError) as error:
         job.status = "failed"
         details = getattr(error, "stderr", None) or str(error)
@@ -3262,7 +3323,8 @@ def select_job_solid(job_id: str, request: SolidSelectionRequest) -> JobResponse
     job.error = None
     job.analysis = analysis
     job.plan = plan
-    write_json(directory / "plan.json", plan.model_dump(mode="json"))
+    reapply_bound_l32_machine_configuration(job, directory)
+    write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
     save_job(directory, job)
     return job
 
@@ -3381,6 +3443,7 @@ def review_feature(job_id: str, feature_id: str, request: FeatureReviewRequest) 
         requirements=job.plan.manufacturing_requirements if job.plan else None,
     )
     directory = job_directory(job_id)
+    reapply_bound_l32_machine_configuration(job, directory)
     (directory / "ai-plan.json").unlink(missing_ok=True)
     save_job(directory, job)
     write_json(directory / "analysis.json", job.analysis.model_dump(mode="json"))
