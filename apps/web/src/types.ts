@@ -1021,3 +1021,63 @@ export type Job = {
     } | null;
   } | null;
 };
+
+export type AgentViewerFocus = {
+  kind: "model" | "features" | "operation" | "artifact";
+  url?: string;
+  feature_ids?: string[];
+  operation_id?: string;
+  mode?: string;
+};
+
+export type AgentArtifact = {
+  id: string;
+  label: string;
+  filename?: string;
+  kind: "model" | "json" | "text" | string;
+  group?: string;
+  url: string;
+  size_bytes?: number;
+  viewer?: AgentViewerFocus | null;
+};
+
+export type AgentTraceEvent = {
+  schema_version?: string;
+  event_id?: string;
+  sequence?: number;
+  stage: string;
+  subgraph?: string;
+  node_id?: string;
+  title?: string;
+  kind?: string;
+  status?: "running" | "completed" | "failed" | "blocked" | "waiting";
+  message: string;
+  summary?: string;
+  detail?: string;
+  phase?: string;
+  created_at?: string;
+  percent: number;
+  evidence?: Array<{ label?: string; value?: unknown; [key: string]: unknown }>;
+  metrics?: Record<string, string | number | boolean | null>;
+  artifacts?: AgentArtifact[];
+  viewer?: AgentViewerFocus | null;
+  model_url?: string;
+  feature_count?: number;
+  hole_count?: number;
+  requirement_count?: number;
+  matched_count?: number;
+  setup_count?: number;
+  operation_count?: number;
+  coverage_score?: number;
+  warning?: string;
+};
+
+export type AgentWorkspace = {
+  schema_version: string;
+  job_id: string;
+  thread_id: string;
+  status: Job["status"];
+  active_event_id: string | null;
+  events: AgentTraceEvent[];
+  artifacts: AgentArtifact[];
+};

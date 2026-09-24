@@ -30,7 +30,8 @@ import { featureDimensionLabel, featureDisplayName, featureMarkerColor } from ".
 import { L32Workbench } from "./L32Workbench";
 import { ToolLibraryPanel } from "./ToolLibraryPanel";
 import { ProcessDesigner } from "./ProcessDesigner";
-import type { BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, ManufacturingFeature, Operation, RotationalFeatureAnalysis, RotationalManufacturingFeature, RotationalProfile, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
+import { AgentWorkspacePanel } from "./AgentWorkspacePanel";
+import type { AgentArtifact, AgentTraceEvent, AgentWorkspace, BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, ManufacturingFeature, Operation, RotationalFeatureAnalysis, RotationalManufacturingFeature, RotationalProfile, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 const APP_NAME = (import.meta.env.VITE_APP_NAME ?? "NEXUS CNC").trim() || "NEXUS CNC";
@@ -46,23 +47,7 @@ function apiUrl(path: string) {
   return `${API_BASE}${path}`;
 }
 
-type PlanningProgressEvent = {
-  stage: string;
-  message: string;
-  detail?: string;
-  phase?: string;
-  created_at?: string;
-  percent: number;
-  model_url?: string;
-  feature_count?: number;
-  hole_count?: number;
-  requirement_count?: number;
-  matched_count?: number;
-  setup_count?: number;
-  operation_count?: number;
-  coverage_score?: number;
-  warning?: string;
-};
+type PlanningProgressEvent = AgentTraceEvent;
 
 type CachedPreviewResponse<T> = {
   ok: boolean;
@@ -585,20 +570,34 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
   onHistory: () => void;
 }) {
   const streamRef = useRef<EventSource | null>(null);
-  const timerRef = useRef<number | null>(null);
-  const queueRef = useRef<PlanningProgressEvent[]>([]);
-  const pendingStageUpdateRef = useRef<PlanningProgressEvent | null>(null);
-  const activeStageRef = useRef<string | null>("uploading");
   const [previewJob, setPreviewJob] = useState(initialJob);
   const [progressEvents, setProgressEvents] = useState<PlanningProgressEvent[]>([
-    { stage: "uploading", message: "三维模型上传完成", percent: 6 },
+    { stage: "uploading", message: "三维模型上传完成", title: "模型接入", status: "completed", percent: 6 },
   ]);
+  const [artifacts, setArtifacts] = useState<AgentArtifact[]>([]);
+  const [activeAgentEvent, setActiveAgentEvent] = useState<PlanningProgressEvent | null>(null);
   const [error, setError] = useState(initialJob.error ?? "");
   const latestProgress = progressEvents.at(-1);
 
   useEffect(() => {
-    const pacedStages = new Set(["geometry_analysis", "draft_planning"]);
     let disposed = false;
+
+    const refreshWorkspace = async () => {
+      try {
+        const response = await fetch(apiUrl(`/api/v1/jobs/${initialJob.id}/agent/workspace`), { cache: "no-store" });
+        if (!response.ok) return;
+        const workspace = await response.json() as AgentWorkspace;
+        if (disposed) return;
+        if (workspace.events.length) {
+          setProgressEvents(workspace.events);
+          const active = workspace.events.find((item) => item.event_id === workspace.active_event_id) ?? workspace.events.at(-1) ?? null;
+          setActiveAgentEvent(active);
+        }
+        setArtifacts(workspace.artifacts);
+      } catch {
+        // SSE remains the primary live channel; the next event retries artifact discovery.
+      }
+    };
 
     const refreshJob = async (expectCompleted = false) => {
       try {
@@ -616,14 +615,12 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
     };
 
     const presentUpdate = (update: PlanningProgressEvent) => {
-      activeStageRef.current = update.stage;
+      setActiveAgentEvent(update);
       setProgressEvents((current) => {
-        if (update.stage === "ai_planning") return [...current, update];
-        const withoutStage = current.filter((item) => item.stage !== update.stage);
-        return [...withoutStage, update].sort(
-          (left, right) => PLANNING_STAGE_ORDER.indexOf(left.stage) - PLANNING_STAGE_ORDER.indexOf(right.stage),
-        );
+        if (update.event_id && current.some((item) => item.event_id === update.event_id)) return current;
+        return [...current, update];
       });
+      void refreshWorkspace();
       if (update.stage === "error") {
         setError(update.message);
         return;
@@ -631,44 +628,11 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
       if (update.stage === "completed") void refreshJob(true);
     };
 
-    const drainQueue = () => {
-      if (timerRef.current !== null) return;
-      const update = queueRef.current.shift();
-      if (!update) return;
-      presentUpdate(update);
-      if (pacedStages.has(update.stage)) {
-        const delay = 5_000 + Math.floor(Math.random() * 5_001);
-        timerRef.current = window.setTimeout(() => {
-          const finalStageUpdate = pendingStageUpdateRef.current;
-          pendingStageUpdateRef.current = null;
-          if (finalStageUpdate) presentUpdate(finalStageUpdate);
-          timerRef.current = null;
-          drainQueue();
-        }, delay);
-        return;
-      }
-      if (update.stage === "ai_planning" && queueRef.current.length > 0) {
-        const delay = 3_000 + Math.floor(Math.random() * 2_001);
-        timerRef.current = window.setTimeout(() => {
-          timerRef.current = null;
-          drainQueue();
-        }, delay);
-        return;
-      }
-      drainQueue();
-    };
-
     const enqueueUpdate = (update: PlanningProgressEvent) => {
       if (update.model_url) setPreviewJob((current) => ({ ...current, model_url: update.model_url ?? current.model_url }));
       if (update.stage === "error") {
         streamRef.current?.close();
         streamRef.current = null;
-        queueRef.current = [];
-        pendingStageUpdateRef.current = null;
-        if (timerRef.current !== null) {
-          window.clearTimeout(timerRef.current);
-          timerRef.current = null;
-        }
         presentUpdate(update);
         return;
       }
@@ -676,27 +640,10 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
         streamRef.current?.close();
         streamRef.current = null;
       }
-      if (activeStageRef.current === update.stage) {
-        if (timerRef.current !== null && pacedStages.has(update.stage)) {
-          pendingStageUpdateRef.current = update;
-          return;
-        }
-        if (timerRef.current !== null && update.stage === "ai_planning") {
-          queueRef.current.push(update);
-          return;
-        }
-        presentUpdate(update);
-        return;
-      }
-      if (update.stage === "ai_planning") queueRef.current.push(update);
-      else {
-        const queuedIndex = queueRef.current.findIndex((item) => item.stage === update.stage);
-        if (queuedIndex >= 0) queueRef.current[queuedIndex] = update;
-        else queueRef.current.push(update);
-      }
-      drainQueue();
+      presentUpdate(update);
     };
 
+    void refreshWorkspace();
     const stream = new EventSource(apiUrl(`/api/v1/jobs/${initialJob.id}/events`));
     streamRef.current = stream;
     stream.onmessage = (event) => enqueueUpdate(JSON.parse(event.data) as PlanningProgressEvent);
@@ -708,10 +655,6 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
       disposed = true;
       stream.close();
       streamRef.current = null;
-      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
-      timerRef.current = null;
-      queueRef.current = [];
-      pendingStageUpdateRef.current = null;
     };
   }, [initialJob.id, onCompleted]);
 
@@ -728,29 +671,15 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
     </header>
     <section className="workspace processing-workspace workbench-workspace left-panel-open">
       <aside className="workbench-sidebar processing-sidebar">
-        <section className="panel planning-workbench-panel">
-          <header><div><LoaderCircle className="spin" size={16} /><strong>正在生成工艺方案</strong></div><span>{Math.round(latestProgress?.percent ?? 6)}%</span></header>
-          <div className="planning-progress-track"><i style={{ width: `${latestProgress?.percent ?? 6}%` }} /></div>
-          <p>{latestProgress?.detail ?? latestProgress?.message ?? "正在准备工艺规划"}</p>
-          <div className="planning-workbench-stages">
-            {progressEvents.filter((item) => item.stage !== "completed").map((item, index, items) => {
-              const active = index === items.length - 1 && !error;
-              return <div className={active ? "active" : "done"} key={`${item.stage}-${item.phase ?? "stage"}-${index}`}>
-                {active ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
-                <span><strong>{item.stage === "ai_planning" && item.detail ? item.detail : item.message}</strong>
-                  {item.stage !== "ai_planning" && item.detail && <small>{item.detail}</small>}
-                </span>
-              </div>;
-            })}
-          </div>
-          {error && <div className="planning-workbench-error"><AlertTriangle size={15} /><span>{error}</span><button onClick={onNew}>新建任务</button></div>}
-        </section>
+        <AgentWorkspacePanel events={progressEvents} artifacts={artifacts} activeEventId={activeAgentEvent?.event_id} progress={latestProgress?.percent ?? 6} live apiUrl={apiUrl} onSelectEvent={setActiveAgentEvent} onSelectArtifact={(artifact) => { if (artifact.kind === "model") setPreviewJob((current) => ({ ...current, model_url: artifact.url })); }} />
+        {error && <div className="planning-workbench-error floating"><AlertTriangle size={15} /><span>{error}</span><button onClick={onNew}>新建任务</button></div>}
       </aside>
       <section className="viewport panel processing-viewport">
         {previewJob.model_url
           ? <ModelViewer modelUrl={apiUrl(previewJob.model_url)} features={EMPTY_MANUFACTURING_FEATURES} selectedFeatureIds={EMPTY_SELECTED_FEATURE_IDS} onSelectFeature={IGNORE_FEATURE_SELECTION} viewMode="特征" showFeatureSummary={false} />
           : <div className="processing-model-placeholder"><LoaderCircle className="spin" size={28} /><strong>正在构建三维预览</strong><small>完成 STEP 拓扑解析后将在这里显示原始模型</small></div>}
         {!previewJob.model_url && <div className="processing-model-badge"><Box size={14} /><span>模型解析中</span></div>}
+        {activeAgentEvent && <div className="agent-viewport-context"><i>{activeAgentEvent.status === "running" ? <LoaderCircle className="spin" size={15} /> : <Bot size={15} />}</i><span><small>{activeAgentEvent.subgraph ?? "agent"} · {activeAgentEvent.node_id ?? activeAgentEvent.stage}</small><strong>{activeAgentEvent.title ?? activeAgentEvent.message}</strong><em>{activeAgentEvent.summary ?? activeAgentEvent.detail ?? activeAgentEvent.message}</em></span></div>}
       </section>
     </section>
   </main>;
@@ -794,7 +723,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [operationBusy, setOperationBusy] = useState(false);
   const [solidBusy, setSolidBusy] = useState(false);
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
-  const [leftWorkbenchPanel, setLeftWorkbenchPanel] = useState<"features" | "process" | null>("process");
+  const [leftWorkbenchPanel, setLeftWorkbenchPanel] = useState<"features" | "process" | "agent" | null>("process");
+  const [agentWorkspace, setAgentWorkspace] = useState<AgentWorkspace | null>(null);
+  const [activeAgentEvent, setActiveAgentEvent] = useState<AgentTraceEvent | null>(null);
   const [showOperationViewSwitch, setShowOperationViewSwitch] = useState(false);
   const [stockSelected, setStockSelected] = useState(false);
   const [showOperationDetails, setShowOperationDetails] = useState(false);
@@ -891,6 +822,22 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [initialJob.id]);
+
+  const refreshAgentWorkspace = useCallback(async () => {
+    try {
+      const response = await fetch(apiUrl(`/api/v1/jobs/${initialJob.id}/agent/workspace`), { cache: "no-store" });
+      if (!response.ok) throw new Error("无法加载智能体执行记录");
+      const workspace = await response.json() as AgentWorkspace;
+      setAgentWorkspace(workspace);
+      setActiveAgentEvent(workspace.events.find((event) => event.event_id === workspace.active_event_id) ?? workspace.events.at(-1) ?? null);
+    } catch {
+      // Historical tasks created before the agent event schema remain usable.
+    }
+  }, [initialJob.id]);
+
+  useEffect(() => {
+    void refreshAgentWorkspace();
+  }, [refreshAgentWorkspace]);
 
   const operations = useMemo(
     () => job.plan?.setups.flatMap((setup) => setup.operations) ?? [],
@@ -1972,6 +1919,25 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     if (relatedOperation) setSelectedOperation(relatedOperation);
   };
 
+  const focusAgentEvent = (event: AgentTraceEvent) => {
+    setActiveAgentEvent(event);
+    const operationId = event.viewer?.operation_id;
+    const featureIds = event.viewer?.feature_ids ?? [];
+    if (operationId) {
+      const operation = operations.find((item) => item.id === operationId);
+      if (operation) openOperationSimulation(operation);
+      return;
+    }
+    if (featureIds.length) {
+      setStockSelected(false);
+      setActiveMode("特征");
+      setShowOperationViewSwitch(false);
+      setShowOperationDetails(false);
+      setSelectedFeatureIds(featureIds);
+      setIsolatedFeatureId(featureIds.length === 1 ? featureIds[0] : null);
+    }
+  };
+
   const chooseSpatialDefect = (region: SpatialDefectRegion) => {
     const operationId = region.attribution[0]?.operation_id;
     const operation = operations.find((item) => item.id === operationId);
@@ -2018,6 +1984,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             if (!response.ok) throw new Error(payload.detail || "刀路结果加载失败");
             const generated = payload as CamResult;
             setCamResult(generated);
+            await refreshAgentWorkspace();
             if (isSheetForming) {
               setShowSimulationChecks(true);
               setActiveMode("仿真");
@@ -2430,6 +2397,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       const updatedJob = jobPayload as Job;
       setJob(updatedJob);
       setCamResult(camPayload as CamResult);
+      await refreshAgentWorkspace();
       setClearance(updatedJob.plan?.safety?.clearance_mm ?? clearance);
       setViseGripHeight(updatedJob.plan?.safety?.vise_grip_height_mm ?? viseGripHeight);
       setSupportThickness(updatedJob.plan?.safety?.support_thickness_mm ?? supportThickness);
@@ -2672,6 +2640,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         <nav className="workbench-panel-switcher" aria-label="工作区面板">
           <button type="button" className={leftWorkbenchPanel === "features" ? "active" : ""} aria-pressed={leftWorkbenchPanel === "features"} onClick={() => { const opening = leftWorkbenchPanel !== "features"; setLeftWorkbenchPanel(opening ? "features" : null); setShowOperationViewSwitch(false); setShowOperationDetails(false); setEditingOperationDetails(false); setStockSelected(false); if (opening) { setActiveMode("特征"); setIsolatedFeatureId(null); setSelectedFeatureIds([]); } }}><CircleDot size={15} /><span>制造特征</span></button>
           <button type="button" className={leftWorkbenchPanel === "process" ? "active" : ""} aria-pressed={leftWorkbenchPanel === "process"} onClick={() => { const closing = leftWorkbenchPanel === "process"; setLeftWorkbenchPanel(closing ? null : "process"); setShowOperationDetails(false); setEditingOperationDetails(false); if (closing) { setShowOperationViewSwitch(false); setStockSelected(false); } }}><Layers3 size={15} /><span>工艺路线</span></button>
+          <button type="button" className={leftWorkbenchPanel === "agent" ? "active" : ""} aria-pressed={leftWorkbenchPanel === "agent"} onClick={() => { const closing = leftWorkbenchPanel === "agent"; setLeftWorkbenchPanel(closing ? null : "agent"); setShowOperationDetails(false); setEditingOperationDetails(false); }}><Bot size={15} /><span>AI 智能体</span></button>
         </nav>
 
         {leftWorkbenchPanel && <aside className="workbench-sidebar floating-workbench-panel">
@@ -2709,6 +2678,24 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               <div className="tree-summary"><CircleDot size={14} /> {holes.length} 孔 · {prismaticFeatures.length} 型腔/槽 · {planarMachiningFeatures.length} 平面区 · {rotationalManufacturingFeatures.length} 回转特征 · {internalProfiles.length} 内轮廓/雕刻 · 共 {manufacturingFeatures.length} 项</div>
             </div>
           </section>}
+          {leftWorkbenchPanel === "agent" && <AgentWorkspacePanel
+            events={agentWorkspace?.events ?? []}
+            artifacts={agentWorkspace?.artifacts ?? []}
+            activeEventId={activeAgentEvent?.event_id}
+            progress={agentWorkspace?.events.at(-1)?.percent ?? (job.status === "completed" ? 100 : 0)}
+            apiUrl={apiUrl}
+            onSelectEvent={focusAgentEvent}
+            onSelectArtifact={(artifact) => {
+              if (artifact.kind === "model") {
+                setStockSelected(false);
+                setSelectedFeatureIds([]);
+                setIsolatedFeatureId(null);
+                setShowOperationViewSwitch(false);
+                setActiveMode("特征");
+              }
+            }}
+            onClose={() => setLeftWorkbenchPanel(null)}
+          />}
 
           {showOperationDetails && selectedOperation && <section ref={operationPopoverRef} className="operation-popover inspector panel" style={{ top: operationPopoverPosition.top, left: operationPopoverPosition.left, "--operation-anchor-y": `${operationPopoverPosition.anchorY}px` } as CSSProperties}>
             <header className="operation-popover-heading"><div><Bot size={16} /><span>工序详情</span><small>{selectedOperation.id}</small></div><div className="operation-popover-actions">{!readOnly && !editingOperationDetails && <button className="edit-operation-button" aria-label="编辑工序" title="编辑" onClick={() => { setEditingOperationDetails(true); setToolDraftId(selectedOperation.tool.id); setOperationMessage(""); }}><Pencil size={13} /></button>}<button aria-label="关闭工序详情" title="关闭" onClick={() => { setEditingOperationDetails(false); setShowOperationDetails(false); }}><X size={15} /></button></div></header>
@@ -2837,6 +2824,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             compositionInsetRightRatio={leftWorkbenchPanel ? 0.04 : 0}
             showFeatureAnnotations={leftWorkbenchPanel === "features" && isolatedFeatureId !== null}
           />}
+          {leftWorkbenchPanel === "agent" && activeAgentEvent && <div className="agent-viewport-context"><i>{activeAgentEvent.status === "running" ? <LoaderCircle className="spin" size={15} /> : <Bot size={15} />}</i><span><small>{activeAgentEvent.subgraph ?? "agent"} · {activeAgentEvent.node_id ?? activeAgentEvent.stage}</small><strong>{activeAgentEvent.title ?? activeAgentEvent.message}</strong><em>{activeAgentEvent.summary ?? activeAgentEvent.detail ?? activeAgentEvent.message}</em></span></div>}
           {stockSelected && <section className="operation-context-card stock-context-card" aria-label="毛坯视图">
             <header><span>加工起点</span><div><button type="button" aria-label="关闭毛坯窗口" title="关闭" onClick={() => setStockSelected(false)}><X size={15} /></button></div></header>
             <strong>毛坯</strong>

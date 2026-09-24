@@ -1,0 +1,121 @@
+%%{init: {"theme":"base","flowchart":{"defaultRenderer":"elk","curve":"basis","nodeSpacing":32,"rankSpacing":48},"themeVariables":{"fontFamily":"Microsoft YaHei, Arial, sans-serif","fontSize":"16px","lineColor":"#718096","clusterBkg":"#F8FAFC","clusterBorder":"#CBD5E1"}}}%%
+flowchart TB
+  classDef main fill:#4169E1,stroke:#2447B8,color:#FFFFFF,stroke-width:2px
+  classDef current fill:#EAF1FF,stroke:#4169E1,color:#18306B,stroke-width:1.6px
+  classDef future fill:#F3EEFF,stroke:#7C5CE5,color:#443080,stroke-width:1.5px,stroke-dasharray:6 4
+  classDef deterministic fill:#E9F8F1,stroke:#2E9D73,color:#164C38,stroke-width:1.5px
+  classDef ai fill:#FFF3DC,stroke:#D69228,color:#684512,stroke-width:1.6px
+  classDef decision fill:#FFF7E8,stroke:#DB9B2B,color:#67460F,stroke-width:1.5px
+  classDef human fill:#FFF0EE,stroke:#CF6256,color:#6E2D26,stroke-width:1.6px
+  classDef data fill:#EEF2F6,stroke:#64748B,color:#263442,stroke-width:1.4px
+  classDef tools fill:#F8FAFC,stroke:#64748B,color:#263442,stroke-width:1.3px
+
+  TITLE["CNC 工艺智能体：主图、子图、节点与工具的关系"]:::main
+
+  subgraph MASTER["主图：负责串联完整制造流程"]
+    direction LR
+    INPUT["输入<br/>STEP · 图纸 · 加工要求"]:::main
+    FEATURE[["① 特征识别子图"]]:::current
+    FEATURE_GATE{"特征完整、可信？"}:::decision
+    PLAN[["② 全局工艺规划子图"]]:::current
+    PLAN_GATE{"设备、装夹、约束通过？"}:::decision
+    EXECUTE[["③ 逐工序执行子图"]]:::current
+    FINAL["最终成品验证<br/>检验规划 · 人工批准"]:::main
+
+    INPUT --> FEATURE --> FEATURE_GATE
+    FEATURE_GATE -->|通过| PLAN --> PLAN_GATE
+    FEATURE_GATE -->|不确定| HUMAN["人工确认"]:::human
+    HUMAN --> FEATURE
+    PLAN_GATE -->|通过| EXECUTE --> FINAL
+    PLAN_GATE -->|不通过| PLAN
+  end
+
+  subgraph FEATURE_SUB["① 特征识别子图：内部由多个节点组成"]
+    direction LR
+    F1["提取几何事实"]:::deterministic
+    F2{"选择识别实现"}:::decision
+    F3["现阶段<br/>现有几何规则识别"]:::current
+    F4["未来<br/>AI 多模态识别智能体"]:::future
+    F5["合并候选特征"]:::deterministic
+    F6["几何验证<br/>尺寸 · 方向 · 拓扑"]:::deterministic
+    F7["输出统一<br/>ManufacturingFeature[]"]:::data
+
+    F1 --> F2
+    F2 -->|当前使用| F3 --> F5
+    F2 -.->|后续替换| F4 --> F5
+    F5 --> F6 --> F7
+  end
+
+  subgraph PLAN_SUB["② 全局工艺规划子图"]
+    direction LR
+    P1["Qwen 理解零件与要求"]:::ai
+    P2["选择毛坯、设备、装夹与基准"]:::ai
+    P3["生成工序依赖图"]:::ai
+    P4["确定性约束检查"]:::deterministic
+    P5{"方案可执行？"}:::decision
+    P6["输出 ProcessPlan"]:::data
+
+    P1 --> P2 --> P3 --> P4 --> P5
+    P5 -->|调整| P1
+    P5 -->|通过| P6
+  end
+
+  subgraph EXEC_SUB["③ 逐工序执行子图：每道工序都形成闭环"]
+    direction LR
+    E1["选择下一工序"]:::deterministic
+    E2["Qwen 生成刀具与参数建议"]:::ai
+    E3["生成刀路"]:::deterministic
+    E4["运行仿真"]:::deterministic
+    E5["验证过切、残留、碰撞"]:::deterministic
+    E6{"验证结果"}:::decision
+    E7["更新在制毛坯<br/>进入下一工序"]:::data
+    DIAG[["④ 诊断与重规划子图"]]:::current
+
+    E1 --> E2 --> E3 --> E4 --> E5 --> E6
+    E6 -->|通过| E7 --> E1
+    E6 -->|失败| DIAG
+  end
+
+  subgraph DIAG_SUB["④ 诊断与重规划子图"]
+    direction LR
+    D1["收集失败证据"]:::deterministic
+    D2["规则 + Qwen 诊断"]:::ai
+    D3{"失败影响范围"}:::decision
+    D4["参数/刀具<br/>局部重试"]:::current
+    D5["装夹问题<br/>返回装夹规划"]:::current
+    D6["路线问题<br/>全局重规划"]:::current
+    D7["高风险/不确定<br/>人工审核"]:::human
+
+    D1 --> D2 --> D3
+    D3 -->|Operation| D4
+    D3 -->|Setup| D5
+    D3 -->|Global| D6
+    D3 -->|Human| D7
+  end
+
+  FEATURE -. "展开" .-> F1
+  PLAN -. "展开" .-> P1
+  EXECUTE -. "展开" .-> E1
+  DIAG -. "展开" .-> D1
+
+  D4 -. "重新选刀/参数" .-> E2
+  D5 -. "退回装夹设计" .-> P2
+  D6 -. "退回整体规划" .-> P1
+  D7 -. "批准后继续" .-> E1
+
+  subgraph FOUNDATION["共享基础：子图通过节点调用工具，并读写统一状态"]
+    direction LR
+    STATE[("LangGraph 统一状态<br/>版本 · 当前工序 · 毛坯引用<br/>缺陷 · 重试次数 · 决策日志")]:::data
+    T1["几何工具<br/>OCCT · 特征事实"]:::tools
+    T2["AI 工具<br/>Qwen 多模态 · 结构化输出"]:::tools
+    T3["制造知识<br/>工艺库 · 刀具库 · 机床库"]:::tools
+    T4["CAM 工具<br/>FreeCAD · 刀路生成"]:::tools
+    T5["验证工具<br/>材料仿真 · 碰撞 · 过切"]:::tools
+    T6["持久化工具<br/>SQLite Checkpoint · 工艺快照"]:::tools
+
+    STATE --- T1 & T2 & T3 & T4 & T5 & T6
+  end
+
+  F1 & F4 & P1 & P4 & E3 & E4 & E5 & D1 & D2 -. "调用工具 / 读写状态" .-> STATE
+
+  TITLE --> INPUT

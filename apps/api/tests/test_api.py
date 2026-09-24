@@ -13,6 +13,22 @@ from app.models import GeometryAnalysis, JobResponse
 client = TestClient(app)
 
 
+def test_agent_architecture_exposes_subgraphs_and_tool_boundaries() -> None:
+    response = client.get("/api/v1/agent/architecture")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["orchestrator"] == "langgraph"
+    assert [item["id"] for item in payload["subgraphs"]] == [
+        "feature_recognition", "process_planning", "operation_execution", "validation_remediation",
+    ]
+    assert any(tool["id"] == "planning.review_with_qwen" and not tool["deterministic"] for tool in payload["tools"])
+    assert any(tool["id"] == "validation.check_result" and tool["deterministic"] for tool in payload["tools"])
+    remediation = next(item for item in payload["subgraphs"] if item["id"] == "validation_remediation")
+    assert remediation["status"] == "implemented"
+    assert "regenerate_and_validate" in remediation["nodes"]
+
+
 def test_device_library_contains_citizen_l32() -> None:
     response = client.get("/api/v1/device-library")
 
@@ -296,7 +312,7 @@ def test_job_progress_stream_replays_structured_events(tmp_path, monkeypatch) ->
     ))
     with main.JOB_EVENT_CONDITION:
         main.JOB_EVENT_LOGS[job_id] = []
-    main.publish_job_event(job_id, "geometry_analysis", "三维几何分析完成", 34, feature_count=12)
+    main.publish_job_event(job_id, "geometry_analysis", "三维几何分析完成", 34, feature_count=12, agent_status="completed")
     main.publish_job_event(job_id, "completed", "工艺方案已生成", 100, operation_count=4)
 
     response = client.get(f"/api/v1/jobs/{job_id}/events")
@@ -308,12 +324,25 @@ def test_job_progress_stream_replays_structured_events(tmp_path, monkeypatch) ->
     assert '"stage": "completed"' in response.text
     persisted = json.loads((directory / "planning-events.json").read_text(encoding="utf-8"))
     assert [item["stage"] for item in persisted] == ["geometry_analysis", "completed"]
+    assert persisted[0]["schema_version"] == "1.0.0"
+    assert persisted[0]["subgraph"] == "feature_recognition"
+    assert persisted[0]["node_id"] == "extract_geometry"
+    assert persisted[0]["metrics"]["feature_count"] == 12
 
     with main.JOB_EVENT_CONDITION:
         main.JOB_EVENT_LOGS.pop(job_id, None)
     history_response = client.get(f"/api/v1/jobs/{job_id}/planning-events")
     assert history_response.status_code == 200
     assert [item["stage"] for item in history_response.json()] == ["geometry_analysis", "completed"]
+
+    (directory / "model.stl").write_bytes(b"solid test\nendsolid test\n")
+    (directory / "analysis.json").write_text('{"topology": {"solids": 1}}', encoding="utf-8")
+    workspace_response = client.get(f"/api/v1/jobs/{job_id}/agent/workspace")
+    assert workspace_response.status_code == 200
+    workspace = workspace_response.json()
+    assert workspace["thread_id"] == job_id
+    assert workspace["active_event_id"] == persisted[-1]["event_id"]
+    assert [artifact["id"] for artifact in workspace["artifacts"]] == ["model", "analysis"]
 
 
 def test_safe_cam_remediation_updates_plan_and_records_iteration(tmp_path, monkeypatch) -> None:

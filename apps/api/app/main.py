@@ -73,6 +73,9 @@ from .l32_backside_chain import (
 from .l32_front_chain import FrontChainDraftRequest, FrontChainDraftResult, compile_front_chain_draft
 from .l32_whole_program import WholePartDraftRequest, WholePartDraftResult, compile_whole_part_draft
 from .inner_bore_chain import InnerBoreChainRequest, InnerBoreChainResult, compile_inner_bore_chain
+from .agent.architecture import agent_architecture
+from .agent.events import build_agent_event
+from .agent.workspace import build_agent_workspace
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -99,15 +102,16 @@ TOOL_INVENTORY_LOCK = threading.Lock()
 
 
 def publish_job_event(job_id: str, stage: str, message: str, percent: float, **details: object) -> None:
-    event = {
-        "stage": stage,
-        "message": message,
-        "percent": max(0, min(round(percent, 1), 100)),
-        "created_at": utc_now(),
-        **{key: value for key, value in details.items() if value is not None},
-    }
     with JOB_EVENT_CONDITION:
         events = JOB_EVENT_LOGS.setdefault(job_id, [])
+        event = build_agent_event(
+            sequence=len(events) + 1,
+            stage=stage,
+            message=message,
+            percent=percent,
+            created_at=utc_now(),
+            details={key: value for key, value in details.items() if value is not None},
+        )
         events.append(event)
         try:
             write_json(job_directory(job_id) / "planning-events.json", events)
@@ -319,6 +323,7 @@ def invalidate_cam_artifacts(directory: Path) -> None:
     for filename in (
         "cam.FCStd", "program.nc", "toolpath.json", "verification.json",
         "simulation.json", "collision.json", "remediation.json", "remediation-history.json", "ai-plan.json",
+        "agent-execution.json", "agent-remediation.json",
         "turning-toolpath-ir.json", "turning-simulation.json", "turning-verification.json", "turning-thread-verification.json", "turning-reachability.json", "turning-draft.json",
         "turning-transfer-ir.json", "turning-transfer-draft.json",
         "turning-backside-ir.json", "turning-backside-draft.json",
@@ -1880,7 +1885,11 @@ def _process_new_job(
             progress_callback(stage, message, percent, **details)
 
     try:
-        report("geometry_analysis", "正在解析 STEP 拓扑与制造特征", 12)
+        report(
+            "geometry_analysis", "正在解析 STEP 拓扑与制造特征", 12,
+            agent_kind="tool_call", agent_status="running",
+            agent_title="读取并解析三维几何",
+        )
         analysis = run_geometry_analyzer(source_path, analysis_path, model_path)
         rotational_analysis = persist_rotational_analysis(directory, job, analysis)
         feature_count = (
@@ -1893,13 +1902,27 @@ def _process_new_job(
         save_job(directory, job)
         report(
             "geometry_analysis", "三维几何分析完成", 34,
+            agent_kind="tool_result", agent_status="completed",
             feature_count=feature_count,
             hole_count=sum(item.kind == "hole" and item.review_state != "excluded" for item in analysis.cylindrical_features),
             rotational_status=rotational_analysis.status if rotational_analysis else None,
             model_url=job.model_url,
+            evidence=[
+                {"label": "制造特征", "value": feature_count},
+                {"label": "孔特征", "value": sum(item.kind == "hole" and item.review_state != "excluded" for item in analysis.cylindrical_features)},
+            ],
+            artifacts=[
+                {"id": "model", "label": "三维模型", "kind": "model", "url": job.model_url},
+                {"id": "analysis", "label": "几何分析", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/analysis.json"},
+            ],
         )
 
-        report("draft_planning", "正在生成确定性工艺草案", 40)
+        report(
+            "draft_planning", "正在生成确定性工艺草案", 40,
+            agent_kind="activity", agent_status="running",
+            agent_title="构建可验证的工艺草案",
+            viewer={"kind": "model", "url": job.model_url},
+        )
         plan = build_process_plan(analysis, material=job.material, machine=job.machine)
         if ai_assisted:
             ai_progress_by_phase = {
@@ -1920,6 +1943,11 @@ def _process_new_job(
                 "ai_schema_validation": 83,
                 "ai_capability_validation": 85,
                 "ai_review_completed": 87,
+                "agent_review": 44,
+                "agent_synthesis": 88,
+                "agent_validation": 89,
+                "agent_decision": 90,
+                "agent_fallback": 90,
             }
             ai_progress_percent = 40
 
@@ -1931,61 +1959,148 @@ def _process_new_job(
                     "ai_planning",
                     "AI 正在判断制造意图、装夹路线与工序策略",
                     ai_progress_percent,
+                    agent_kind="reasoning", agent_status="running",
+                    agent_title="AI 工艺研判",
                     detail=message,
                     phase=stage,
+                    viewer={"kind": "model", "url": job.model_url},
                     **details,
                 )
 
-            try:
-                guidance = review_process_plan(
-                    analysis, plan, progress_callback=report_ai_progress,
+            from .agent.config import load_agent_settings
+            from .agent.planning_graph import run_process_planning_subgraph
+
+            agent_settings = load_agent_settings()
+            if agent_settings.enabled:
+                agent_result = run_process_planning_subgraph(
+                    job_id=job_id,
+                    analysis=analysis,
+                    baseline_plan=plan,
+                    material=job.material,
+                    machine=job.machine,
+                    settings=agent_settings,
+                    progress_callback=report_ai_progress,
                 )
+            else:
+                try:
+                    guidance = review_process_plan(
+                        analysis, plan, progress_callback=report_ai_progress,
+                    )
+                    review = guidance.get("review", {})
+                    legacy_candidate = plan.model_copy(deep=True)
+                    legacy_candidate.ai_planning = {
+                        "provider": guidance.get("provider"),
+                        "model": guidance.get("model"),
+                        "created_at": guidance.get("created_at"),
+                        "manufacturing_intent": review.get("manufacturing_intent"),
+                        "recommended_process_kind": review.get("recommended_process_kind"),
+                        "part_family": review.get("part_family"),
+                        "confidence": float(review.get("confidence", 0) or 0),
+                        "summary": review.get("summary"),
+                        "requires_engineer_review": review.get("requires_engineer_review", False),
+                        "agent_mode": "disabled",
+                    }
+                    agent_result = {
+                        "status": "blocked", "guidance": guidance,
+                        "candidate_plan": legacy_candidate.model_dump(mode="json"),
+                        "evaluation": {
+                            "schema_version": "1.0.0", "mode": "disabled",
+                            "eligible_for_promotion": False,
+                            "production_result_changed": False,
+                            "blocking_reasons": ["LangGraph 智能体编排已禁用"],
+                        },
+                    }
+                except QwenPlanningError as error:
+                    agent_result = {
+                        "status": "fallback", "error": str(error),
+                        "candidate_plan": plan.model_dump(mode="json"),
+                        "evaluation": {
+                            "schema_version": "1.0.0", "mode": "disabled",
+                            "eligible_for_promotion": False,
+                            "production_result_changed": False,
+                            "blocking_reasons": [f"AI 研判不可用：{error}"],
+                        },
+                    }
+            guidance = agent_result.get("guidance")
+            evaluation = agent_result.get("evaluation", {})
+            candidate_payload = agent_result.get("candidate_plan")
+            if guidance:
                 write_json(directory / "planning-guidance.json", guidance)
+            if candidate_payload:
+                write_json(directory / "agent-plan.json", candidate_payload)
+            write_json(directory / "agent-evaluation.json", evaluation)
+
+            if agent_result.get("status") == "fallback" or not guidance:
+                error_message = str(agent_result.get("error") or "AI 研判未产生有效候选方案")
+                plan.ai_planning = {
+                    "status": "fallback", "message": error_message,
+                    "agent_mode": agent_settings.mode,
+                }
+                plan.warnings.append("AI 辅助规划不可用，本次已回退到确定性规则规划")
+                report(
+                    "ai_integration", "AI 暂不可用，已自动回退到规则规划", 90,
+                    agent_kind="warning", agent_status="completed", warning=error_message,
+                    evidence=[{"label": "回退策略", "value": "确定性规则规划"}],
+                    artifacts=[{
+                        "id": "agent-evaluation", "label": "智能体评测", "kind": "json",
+                        "url": f"/api/v1/jobs/{job_id}/files/agent-evaluation.json",
+                    }],
+                )
+            else:
                 review = guidance.get("review", {})
                 recommended_kind = str(review.get("recommended_process_kind", ""))
                 confidence = float(review.get("confidence", 0) or 0)
-                process_kind_hint = (
-                    "sheet_forming"
-                    if recommended_kind == "sheet_forming" and confidence >= 0.7
-                    else None
-                )
-                if process_kind_hint and plan.process_kind != process_kind_hint:
-                    report("process_generation", "正在按 AI 制造意图重新编译工艺路线", 89)
-                    plan = build_process_plan(
-                        analysis, material=job.material, machine=job.machine,
-                        process_kind_hint=process_kind_hint,
-                    )
-                plan.ai_planning = {
-                    "provider": guidance.get("provider"),
-                    "model": guidance.get("model"),
-                    "created_at": guidance.get("created_at"),
-                    "manufacturing_intent": review.get("manufacturing_intent"),
-                    "recommended_process_kind": recommended_kind,
-                    "part_family": review.get("part_family"),
-                    "confidence": confidence,
-                    "summary": review.get("summary"),
-                    "requires_engineer_review": review.get("requires_engineer_review", False),
-                }
+                candidate = ProcessPlan.model_validate(candidate_payload)
+                promoted = bool(evaluation.get("production_result_changed"))
+                if promoted:
+                    plan = candidate
+                else:
+                    plan.ai_planning = candidate.ai_planning
                 report(
-                    "ai_integration", "AI 规划意图已纳入工艺编译", 89,
+                    "ai_integration",
+                    "智能体候选方案已通过评测并晋级正式方案" if promoted else "智能体候选方案已完成影子评测，正式方案保持不变",
+                    90,
+                    agent_kind="decision", agent_status="completed",
+                    agent_title="候选方案晋级判断",
                     manufacturing_intent=review.get("manufacturing_intent"),
                     recommended_process_kind=recommended_kind,
                     confidence=confidence,
+                    agent_mode=agent_settings.mode,
+                    eligible_for_promotion=bool(evaluation.get("eligible_for_promotion")),
+                    production_result_changed=promoted,
+                    evidence=[
+                        {"label": "制造意图", "value": review.get("manufacturing_intent")},
+                        {"label": "建议工艺类型", "value": recommended_kind},
+                        {"label": "置信度", "value": confidence},
+                        {"label": "运行模式", "value": agent_settings.mode},
+                        {"label": "是否可晋级", "value": bool(evaluation.get("eligible_for_promotion"))},
+                    ],
+                    artifacts=[
+                        {"id": "planning-guidance", "label": "AI 规划建议", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/planning-guidance.json"},
+                        {"id": "agent-plan", "label": "智能体候选方案", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/agent-plan.json"},
+                        {"id": "agent-evaluation", "label": "候选方案评测", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/agent-evaluation.json"},
+                    ],
                 )
-            except QwenPlanningError as error:
-                plan.ai_planning = {"status": "fallback", "message": str(error)}
-                plan.warnings.append("AI 辅助规划不可用，本次已回退到确定性规则规划")
-                report("ai_integration", "AI 暂不可用，已自动回退到规则规划", 89, warning=str(error))
 
-        report("process_generation", "正在生成装夹、工序、刀具与切削参数", 92)
+        report(
+            "process_generation", "正在生成装夹、工序、刀具与切削参数", 92,
+            agent_kind="tool_call", agent_status="running",
+            viewer={"kind": "model", "url": job.model_url},
+        )
         plan.coverage = evaluate_plan_coverage(analysis, plan)
         plan.manufacturing_route = build_manufacturing_route(analysis, plan)
         plan.knowledge_assessment = assess_plan_knowledge(analysis, plan)
         operation_count = sum(len(setup.operations) for setup in plan.setups)
         report(
             "coverage_validation", "正在检查工艺覆盖率和 CAM 能力", 96,
+            agent_kind="validation", agent_status="completed",
             setup_count=len(plan.setups), operation_count=operation_count,
             coverage_score=plan.coverage.score if plan.coverage else None,
+            evidence=[
+                {"label": "装夹数", "value": len(plan.setups)},
+                {"label": "工序数", "value": operation_count},
+                {"label": "覆盖率", "value": plan.coverage.score if plan.coverage else None},
+            ],
         )
 
         job.status = "completed"
@@ -1998,8 +2113,15 @@ def _process_new_job(
         save_job(directory, job)
         report(
             "completed", "工艺方案已生成", 100,
+            agent_kind="result", agent_status="completed",
             setup_count=len(plan.setups), operation_count=operation_count,
             coverage_score=plan.coverage.score if plan.coverage else None,
+            artifacts=[
+                {"id": "model", "label": "三维模型", "kind": "model", "url": job.model_url},
+                {"id": "analysis", "label": "几何分析", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/analysis.json"},
+                {"id": "plan", "label": "工艺方案", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/plan.json"},
+            ],
+            viewer={"kind": "model", "url": job.model_url},
         )
         return job
     except (subprocess.SubprocessError, OSError, ValueError) as error:
@@ -2007,7 +2129,11 @@ def _process_new_job(
         details = getattr(error, "stderr", None) or str(error)
         job.error = details[-2000:]
         save_job(directory, job)
-        report("error", job.error or "工艺生成失败", 100)
+        report(
+            "error", job.error or "工艺生成失败", 100,
+            agent_kind="error", agent_status="failed",
+            evidence=[{"label": "异常", "value": job.error or str(error)}],
+        )
         return job
 
 
@@ -2163,6 +2289,25 @@ def get_job_planning_events(job_id: str) -> list[dict[str, object]]:
         if job_id in JOB_EVENT_LOGS:
             return list(JOB_EVENT_LOGS[job_id])
     return load_job_events(job_id)
+
+
+@app.get("/api/v1/agent/architecture")
+def get_agent_architecture() -> dict[str, object]:
+    return agent_architecture()
+
+
+@app.get("/api/v1/jobs/{job_id}/agent/workspace")
+def get_job_agent_workspace(job_id: str) -> dict[str, object]:
+    job = load_job(job_id)
+    directory = job_directory(job_id)
+    with JOB_EVENT_CONDITION:
+        events = list(JOB_EVENT_LOGS[job_id]) if job_id in JOB_EVENT_LOGS else load_job_events(job_id)
+    return build_agent_workspace(
+        job_id=job_id,
+        job_status=job.status,
+        directory=directory,
+        events=events,
+    )
 
 
 @app.get("/api/v1/jobs/{job_id}", response_model=JobResponse)
@@ -3334,7 +3479,8 @@ def get_job_file(job_id: str, filename: str) -> FileResponse:
     allowed = {
         "model.stl", "drawing.pdf", "analysis.json", "rotational-features.json", "plan.json",
         "manufacturing-specification.json", "manufacturing-requirements.json", "measurement-link.json",
-        "planning-guidance.json",
+        "planning-guidance.json", "agent-plan.json", "agent-evaluation.json", "agent-execution.json",
+        "agent-remediation.json",
         "ai-plan.json", "cam.FCStd", "program.nc", "toolpath.json", "verification.json",
         "simulation.json", "collision.json", "remediation.json", "remediation-history.json",
         "turning-toolpath-ir.json", "turning-simulation.json", "turning-verification.json", "turning-reachability.json", "turning-draft.json",
@@ -3754,6 +3900,101 @@ def apply_cam_remediation(job_id: str) -> dict[str, object]:
     return _apply_cam_remediation(job_id)
 
 
+def _run_operation_execution_agent(
+    job_id: str,
+    job: JobResponse,
+    result: dict[str, object],
+    verification: dict[str, object],
+    simulation: dict[str, object],
+    collision: dict[str, object],
+    remediation: dict[str, object],
+    *,
+    cam_progress_callback: Callable[..., None] | None = None,
+) -> dict[str, object] | None:
+    from .agent.config import load_agent_settings
+    from .agent.execution_graph import run_operation_execution_subgraph
+
+    settings = load_agent_settings()
+    if not settings.enabled or not job.plan:
+        return None
+    operations = [
+        {
+            **operation.model_dump(mode="json"),
+            "setup_id": setup.id,
+        }
+        for setup in job.plan.setups
+        for operation in setup.operations
+        if operation.enabled
+    ]
+
+    def report(stage: str, message: str, **details: object) -> None:
+        operation_id = details.get("operation_id")
+        feature_ids = details.get("feature_ids")
+        terminal = stage in {"verify_operation", "summarize_execution"}
+        viewer: dict[str, object] | None = None
+        if operation_id:
+            viewer = {
+                "kind": "operation", "operation_id": operation_id,
+                "feature_ids": feature_ids if isinstance(feature_ids, list) else [],
+                "mode": "仿真",
+            }
+        publish_job_event(
+            job_id, "operation_execution", message, 100,
+            agent_node=stage,
+            agent_title=("逐工序执行汇总" if stage == "summarize_execution" else f"工序验证 · {operation_id or stage}"),
+            agent_kind="validation" if terminal else "tool_result",
+            agent_status="completed" if terminal else "running",
+            viewer=viewer,
+            evidence=[
+                {"label": key, "value": value}
+                for key, value in details.items()
+                if key not in {"feature_ids"} and isinstance(value, (str, int, float, bool))
+            ],
+            **details,
+        )
+        if cam_progress_callback:
+            cam_progress_callback(
+                "agent_execution", message, 99,
+                agent_node=stage, operation_id=operation_id,
+                **{key: value for key, value in details.items() if key != "operation_id"},
+            )
+
+    trace = run_operation_execution_subgraph(
+        job_id=job_id,
+        operations=operations,
+        cam_result=result,
+        simulation=simulation,
+        verification=verification,
+        collision=collision,
+        remediation=remediation,
+        settings=settings,
+        progress_callback=report,
+    )
+    payload = {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "mode": settings.mode,
+        "status": trace.get("status"),
+        "summary": trace.get("summary", {}),
+        "records": trace.get("records", []),
+    }
+    write_json(job_directory(job_id) / "agent-execution.json", payload)
+    publish_job_event(
+        job_id, "operation_execution", "逐工序执行记录已归档", 100,
+        agent_node="archive_execution_trace", agent_title="逐工序执行记录",
+        agent_kind="result", agent_status="completed",
+        evidence=[
+            {"label": "状态", "value": payload.get("status")},
+            {"label": "工序数", "value": len(payload["records"])},
+        ],
+        artifacts=[{
+            "id": "agent-execution", "label": "逐工序执行记录", "kind": "json",
+            "url": f"/api/v1/jobs/{job_id}/files/agent-execution.json",
+        }],
+    )
+    return payload
+
+
 def _create_cam_artifact(
     job_id: str,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
@@ -3808,13 +4049,20 @@ def _create_cam_artifact(
         write_json(directory / "simulation.json", simulation)
         write_json(directory / "collision.json", collision)
         write_json(directory / "remediation.json", remediation)
+        agent_execution = _run_operation_execution_agent(
+            job_id, job, result, verification, simulation, collision, remediation,
+            cam_progress_callback=report,
+        )
         save_job(directory, job)
         write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
         report(
             "completed", "薄板成形工序与分阶段仿真已生成", 100,
             generated=len(operations), verification=verification["status"], collision=collision["status"],
         )
-        return cam_response(job_id, result, verification, simulation, collision, remediation)
+        response = cam_response(job_id, result, verification, simulation, collision, remediation)
+        if agent_execution:
+            response["agent_execution"] = agent_execution
+        return response
     if job.analysis and job.plan.safety and any(component.setup_id is None for component in job.plan.safety.fixture_components):
         job.plan.safety = build_safety_configuration(
             job.analysis,
@@ -4031,6 +4279,10 @@ def _create_cam_artifact(
         iteration=len(remediation_history) if isinstance(remediation_history, list) else 0,
     )
     write_json(directory / "remediation.json", remediation)
+    agent_execution = _run_operation_execution_agent(
+        job_id, job, result, verification, simulation, collision, remediation,
+        cam_progress_callback=report,
+    )
     full_preview_count = len(result.get("preview_segments", []))
     result["preview_segments"] = compact_preview_segments(list(result.get("preview_segments", [])))
     result["preview_segment_count_raw"] = full_preview_count
@@ -4045,6 +4297,8 @@ def _create_cam_artifact(
         job_id, result, verification, simulation, collision, remediation,
         stdout=completed.stdout[-1000:],
     )
+    if agent_execution:
+        response["agent_execution"] = agent_execution
     report(
         "completed", "CAM 刀路与仿真已完成", 100,
         generated=len(generated_operation_ids),
@@ -4058,7 +4312,10 @@ def _run_cam_remediation_loop(
     job_id: str,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
-    """Apply safe corrections and regenerate CAM until validation converges or blocks."""
+    """Run the durable validation/remediation graph until it converges or blocks."""
+
+    from .agent.config import load_agent_settings
+    from .agent.remediation_graph import run_validation_remediation_subgraph
 
     def report(stage: str, message: str, percent: float, **details: object) -> None:
         if progress_callback:
@@ -4069,33 +4326,60 @@ def _run_cam_remediation_loop(
                 **details,
             })
 
-    latest_result: dict[str, object] | None = None
-    while True:
-        directory = job_directory(job_id)
-        remediation_path = directory / "remediation.json"
-        if not remediation_path.is_file():
-            raise HTTPException(status_code=409, detail="请先生成刀路和仿真，再启动自动纠错")
-        current_report = json.loads(remediation_path.read_text(encoding="utf-8"))
-        if not current_report.get("can_auto_replan"):
-            raise HTTPException(status_code=409, detail="当前缺陷不能进入自动纠错闭环")
+    directory = job_directory(job_id)
+    remediation_path = directory / "remediation.json"
+    if not remediation_path.is_file():
+        raise HTTPException(status_code=409, detail="请先生成刀路和仿真，再启动自动纠错")
+    current_report = json.loads(remediation_path.read_text(encoding="utf-8"))
+    if not current_report.get("can_auto_replan"):
+        raise HTTPException(status_code=409, detail="当前缺陷不能进入自动纠错闭环")
+    settings = load_agent_settings()
 
-        applied = _apply_cam_remediation(job_id, auto_approve=True)
-        iteration = int(applied["iteration"])
-        max_iterations = max(int(current_report.get("max_iterations", 3)), 1)
-        action_labels = [
-            str(item.get("label", ""))
-            for item in applied.get("applied_actions", [])
-            if isinstance(item, dict)
-        ]
-        report(
-            "remediation_applied",
-            f"第 {iteration} 轮：已应用 {len(action_labels)} 项安全修复",
-            min((iteration - 1) / max_iterations * 100 + 2, 92),
-            iteration=iteration,
-            max_iterations=max_iterations,
-            actions=action_labels,
+    def graph_report(stage: str, message: str, **details: object) -> None:
+        iteration = int(details.get("iteration", 0) or 0)
+        max_iterations = max(int(details.get("max_iterations", settings.max_local_retries) or settings.max_local_retries), 1)
+        base_percent = {
+            "attribute_defect": 2,
+            "choose_repair_scope": 4,
+            "replan_local": 7,
+            "regenerate_and_validate": 94,
+            "assess_revalidation": 96,
+            "finalize_remediation": 98,
+        }.get(stage, 1)
+        if iteration:
+            base_percent = min(((iteration - 1) / max_iterations) * 94 + base_percent / max_iterations, 98)
+        terminal = stage == "finalize_remediation"
+        operation_ids = details.get("operation_ids")
+        operation_id = operation_ids[0] if isinstance(operation_ids, list) and len(operation_ids) == 1 else None
+        event_details = {
+            ("remediation_status" if key == "status" else key): value
+            for key, value in details.items()
+        }
+        publish_job_event(
+            job_id, "validation_remediation", message, base_percent,
+            agent_node=stage,
+            agent_title=("验证纠错汇总" if terminal else message),
+            agent_kind="result" if terminal else "validation",
+            agent_status="completed" if terminal else "running",
+            viewer={"kind": "operation", "operation_id": operation_id, "mode": "仿真"} if operation_id else None,
+            evidence=[
+                {"label": key, "value": value}
+                for key, value in details.items()
+                if isinstance(value, (str, int, float, bool))
+            ],
+            **event_details,
         )
+        stream_stage = (
+            "remediation_applied" if stage == "replan_local"
+            else "iteration_retry" if stage == "assess_revalidation" and details.get("decision") == "retry"
+            else stage
+        )
+        report(stream_stage, message, base_percent, **details)
 
+    def apply_safe_repairs(_: dict[str, object]) -> dict[str, object]:
+        return _apply_cam_remediation(job_id, auto_approve=True)
+
+    def regenerate_and_validate(iteration: int, max_iterations: int) -> dict[str, object]:
         def forward_cam_progress(event: dict[str, object]) -> None:
             inner_percent = float(event.get("percent", 0) or 0)
             overall = ((iteration - 1) + inner_percent / 100) / max_iterations * 94
@@ -4112,42 +4396,59 @@ def _run_cam_remediation_loop(
                 total=event.get("total"),
             )
 
-        latest_result = _create_cam_artifact(job_id, progress_callback=forward_cam_progress)
-        next_report = latest_result.get("remediation")
-        if not isinstance(next_report, dict):
-            raise HTTPException(status_code=500, detail="复验未生成缺陷报告")
-        defects = next_report.get("defects", [])
-        if not defects:
-            outcome = "passed"
-            message = f"自动纠错在第 {iteration} 轮通过全部复验"
-        elif next_report.get("can_auto_replan"):
-            report(
-                "iteration_retry",
-                f"第 {iteration} 轮仍有可修复问题，准备继续迭代",
-                min(iteration / max_iterations * 94, 94),
-                iteration=iteration,
-                max_iterations=max_iterations,
-                defect_count=len(defects) if isinstance(defects, list) else 0,
-            )
-            continue
-        elif next_report.get("status") == "blocked":
-            outcome = "blocked"
-            message = f"第 {iteration} 轮发现高风险问题，已停止自动纠错"
-        elif int(next_report.get("iteration", iteration)) >= int(next_report.get("max_iterations", max_iterations)):
-            outcome = "max_iterations"
-            message = f"已完成 {iteration} 轮自动纠错，问题尚未收敛"
-        else:
-            outcome = "manual_review"
-            message = f"第 {iteration} 轮仍有需要工程师处理的问题"
-        report(
-            "completed", message, 100,
-            mode="remediation_loop",
-            outcome=outcome,
-            iteration=iteration,
-            max_iterations=max_iterations,
-            defect_count=len(defects) if isinstance(defects, list) else 0,
-        )
-        return {**latest_result, "remediation_loop": {"outcome": outcome, "iteration": iteration}}
+        return _create_cam_artifact(job_id, progress_callback=forward_cam_progress)
+
+    trace = run_validation_remediation_subgraph(
+        job_id=job_id,
+        remediation=current_report,
+        settings=settings,
+        apply_remediation=apply_safe_repairs,
+        regenerate_cam=regenerate_and_validate,
+        progress_callback=graph_report,
+    )
+    latest_result = trace.get("latest_result")
+    if not isinstance(latest_result, dict):
+        raise HTTPException(status_code=500, detail="纠错子图未产生复验结果")
+    summary = trace.get("summary", {})
+    outcome = str(summary.get("outcome", "manual_review"))
+    iteration = int(summary.get("iteration", 0) or 0)
+    payload = {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "mode": settings.mode,
+        "status": trace.get("status"),
+        "summary": summary,
+        "cycles": trace.get("cycles", []),
+        "remaining_report": trace.get("current_report", {}),
+    }
+    write_json(directory / "agent-remediation.json", payload)
+    publish_job_event(
+        job_id, "validation_remediation", "验证纠错记录已归档", 100,
+        agent_node="archive_remediation_trace", agent_title="验证纠错记录",
+        agent_kind="result", agent_status="completed",
+        evidence=[
+            {"label": "结果", "value": outcome},
+            {"label": "迭代次数", "value": iteration},
+        ],
+        artifacts=[{
+            "id": "agent-remediation", "label": "验证纠错记录", "kind": "json",
+            "url": f"/api/v1/jobs/{job_id}/files/agent-remediation.json",
+        }],
+    )
+    messages = {
+        "passed": f"自动纠错在第 {iteration} 轮通过全部复验",
+        "blocked": f"第 {iteration} 轮发现高风险问题，已停止自动纠错",
+        "max_iterations": f"已完成 {iteration} 轮自动纠错，问题尚未收敛",
+        "manual_review": f"第 {iteration} 轮仍有需要工程师处理的问题",
+    }
+    defects = trace.get("current_report", {}).get("defects", [])
+    report(
+        "completed", messages.get(outcome, messages["manual_review"]), 100,
+        mode="remediation_graph", outcome=outcome,
+        iteration=iteration, max_iterations=summary.get("max_iterations"),
+        defect_count=len(defects) if isinstance(defects, list) else 0,
+    )
+    return {**latest_result, "remediation_loop": {"outcome": outcome, "iteration": iteration}}
 
 
 @app.post("/api/v1/jobs/{job_id}/cam")

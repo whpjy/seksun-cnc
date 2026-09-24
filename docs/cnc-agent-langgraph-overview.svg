@@ -1,0 +1,200 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1180" viewBox="0 0 1800 1180" role="img" aria-labelledby="title desc">
+  <title id="title">CNC 工艺智能体主图与子图架构</title>
+  <desc id="desc">展示 LangGraph 主图、特征识别、工艺规划、逐工序执行、诊断重规划四个子图，以及共享状态和工具层。</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="5" stdDeviation="7" flood-color="#1e3a8a" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#4169e1"/>
+    </marker>
+    <style>
+      .base { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; }
+      .title { font-size: 30px; font-weight: 700; fill: #17306b; }
+      .subtitle { font-size: 15px; fill: #64748b; }
+      .section { font-size: 18px; font-weight: 700; fill: #17306b; }
+      .box-title { font-size: 16px; font-weight: 700; fill: #1e293b; }
+      .box-copy { font-size: 13px; fill: #64748b; }
+      .small { font-size: 12px; fill: #64748b; }
+      .white-title { font-size: 16px; font-weight: 700; fill: white; }
+      .white-copy { font-size: 12px; fill: #e6edff; }
+      .arrow { stroke: #64748b; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .blue-arrow { stroke: #4169e1; stroke-width: 2.4; fill: none; marker-end: url(#arrowBlue); }
+      .dash { stroke-dasharray: 7 6; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1180" fill="#f4f7fb"/>
+  <g class="base">
+    <text x="70" y="58" class="title">CNC 工艺智能体：主图、子图、节点与工具</text>
+    <text x="70" y="88" class="subtitle">LangGraph 负责流程、状态、循环和回退；Qwen 负责推理；几何与 CAM 程序负责确定性验证</text>
+
+    <!-- Main graph -->
+    <rect x="55" y="120" width="1690" height="238" rx="20" fill="white" stroke="#b9c7e8" stroke-width="2" filter="url(#shadow)"/>
+    <rect x="55" y="120" width="1690" height="48" rx="20" fill="#4169e1"/>
+    <rect x="55" y="148" width="1690" height="20" fill="#4169e1"/>
+    <text x="82" y="151" class="white-title">主图：串联完整 CNC 制造流程</text>
+
+    <g filter="url(#shadow)">
+      <rect x="85" y="206" width="180" height="92" rx="13" fill="#4169e1"/>
+      <rect x="320" y="206" width="190" height="92" rx="13" fill="#eaf1ff" stroke="#4169e1" stroke-width="2"/>
+      <rect x="565" y="206" width="180" height="92" rx="13" fill="#fff7e8" stroke="#d69a2d" stroke-width="2"/>
+      <rect x="800" y="206" width="190" height="92" rx="13" fill="#eaf1ff" stroke="#4169e1" stroke-width="2"/>
+      <rect x="1045" y="206" width="180" height="92" rx="13" fill="#fff7e8" stroke="#d69a2d" stroke-width="2"/>
+      <rect x="1280" y="206" width="190" height="92" rx="13" fill="#eaf1ff" stroke="#4169e1" stroke-width="2"/>
+      <rect x="1525" y="206" width="180" height="92" rx="13" fill="#4169e1"/>
+    </g>
+    <text x="175" y="241" text-anchor="middle" class="white-title">输入</text>
+    <text x="175" y="268" text-anchor="middle" class="white-copy">STEP · 图纸 · 要求</text>
+    <text x="415" y="241" text-anchor="middle" class="box-title">① 特征识别子图</text>
+    <text x="415" y="268" text-anchor="middle" class="box-copy">输出标准制造特征</text>
+    <text x="655" y="241" text-anchor="middle" class="box-title">特征可信？</text>
+    <text x="655" y="268" text-anchor="middle" class="box-copy">缺失则人工确认</text>
+    <text x="895" y="241" text-anchor="middle" class="box-title">② 工艺规划子图</text>
+    <text x="895" y="268" text-anchor="middle" class="box-copy">装夹 · 基准 · 工序图</text>
+    <text x="1135" y="241" text-anchor="middle" class="box-title">约束通过？</text>
+    <text x="1135" y="268" text-anchor="middle" class="box-copy">设备 · 刀具 · 可达性</text>
+    <text x="1375" y="241" text-anchor="middle" class="box-title">③ 逐工序执行</text>
+    <text x="1375" y="268" text-anchor="middle" class="box-copy">刀路 · 仿真 · 更新毛坯</text>
+    <text x="1615" y="241" text-anchor="middle" class="white-title">最终验证</text>
+    <text x="1615" y="268" text-anchor="middle" class="white-copy">检验 · 批准 · 输出</text>
+
+    <path d="M265 252 H310" class="blue-arrow"/>
+    <path d="M510 252 H555" class="blue-arrow"/>
+    <path d="M745 252 H790" class="blue-arrow"/>
+    <path d="M990 252 H1035" class="blue-arrow"/>
+    <path d="M1225 252 H1270" class="blue-arrow"/>
+    <path d="M1470 252 H1515" class="blue-arrow"/>
+
+    <!-- Subgraph cards -->
+    <text x="70" y="410" class="section">子图：主图中可独立运行、测试、暂停和替换的小流程</text>
+
+    <g filter="url(#shadow)">
+      <rect x="55" y="438" width="400" height="420" rx="18" fill="white" stroke="#b9c7e8" stroke-width="2"/>
+      <rect x="480" y="438" width="400" height="420" rx="18" fill="white" stroke="#b9c7e8" stroke-width="2"/>
+      <rect x="905" y="438" width="400" height="420" rx="18" fill="white" stroke="#b9c7e8" stroke-width="2"/>
+      <rect x="1330" y="438" width="415" height="420" rx="18" fill="white" stroke="#b9c7e8" stroke-width="2"/>
+    </g>
+
+    <!-- Feature subgraph -->
+    <rect x="55" y="438" width="400" height="58" rx="18" fill="#4169e1"/>
+    <rect x="55" y="476" width="400" height="20" fill="#4169e1"/>
+    <text x="78" y="475" class="white-title">① 特征识别子图</text>
+    <rect x="85" y="525" width="340" height="48" rx="10" fill="#e9f8f1" stroke="#2e9d73"/>
+    <text x="255" y="555" text-anchor="middle" class="box-title">提取几何事实</text>
+    <path d="M255 573 V596" class="arrow"/>
+    <rect x="85" y="600" width="158" height="70" rx="10" fill="#eaf1ff" stroke="#4169e1"/>
+    <text x="164" y="629" text-anchor="middle" class="box-title">当前</text>
+    <text x="164" y="651" text-anchor="middle" class="box-copy">现有规则识别</text>
+    <rect x="267" y="600" width="158" height="70" rx="10" fill="#f3eeff" stroke="#7c5ce5" stroke-dasharray="6 4"/>
+    <text x="346" y="629" text-anchor="middle" class="box-title">未来替换</text>
+    <text x="346" y="651" text-anchor="middle" class="box-copy">AI 多模态智能体</text>
+    <path d="M164 670 V704 H245" class="arrow"/>
+    <path d="M346 670 V704 H265" class="arrow dash"/>
+    <rect x="85" y="716" width="340" height="52" rx="10" fill="#e9f8f1" stroke="#2e9d73"/>
+    <text x="255" y="748" text-anchor="middle" class="box-title">合并候选 + 几何验证</text>
+    <path d="M255 768 V790" class="arrow"/>
+    <rect x="85" y="794" width="340" height="42" rx="10" fill="#eef2f6" stroke="#64748b"/>
+    <text x="255" y="821" text-anchor="middle" class="box-title">ManufacturingFeature[]</text>
+
+    <!-- Planning subgraph -->
+    <rect x="480" y="438" width="400" height="58" rx="18" fill="#4169e1"/>
+    <rect x="480" y="476" width="400" height="20" fill="#4169e1"/>
+    <text x="503" y="475" class="white-title">② 全局工艺规划子图</text>
+    <rect x="510" y="525" width="340" height="55" rx="10" fill="#fff3dc" stroke="#d69228"/>
+    <text x="680" y="558" text-anchor="middle" class="box-title">Qwen 理解零件与加工要求</text>
+    <path d="M680 580 V600" class="arrow"/>
+    <rect x="510" y="604" width="340" height="66" rx="10" fill="#fff3dc" stroke="#d69228"/>
+    <text x="680" y="632" text-anchor="middle" class="box-title">毛坯 · 设备 · 装夹 · 基准</text>
+    <text x="680" y="653" text-anchor="middle" class="box-copy">生成候选整体制造策略</text>
+    <path d="M680 670 V692" class="arrow"/>
+    <rect x="510" y="696" width="340" height="55" rx="10" fill="#fff3dc" stroke="#d69228"/>
+    <text x="680" y="729" text-anchor="middle" class="box-title">生成工序依赖图</text>
+    <path d="M680 751 V772" class="arrow"/>
+    <rect x="510" y="776" width="340" height="60" rx="10" fill="#e9f8f1" stroke="#2e9d73"/>
+    <text x="680" y="803" text-anchor="middle" class="box-title">确定性约束检查</text>
+    <text x="680" y="824" text-anchor="middle" class="box-copy">失败则回到规划，而不是继续生成刀路</text>
+
+    <!-- Execution subgraph -->
+    <rect x="905" y="438" width="400" height="58" rx="18" fill="#4169e1"/>
+    <rect x="905" y="476" width="400" height="20" fill="#4169e1"/>
+    <text x="928" y="475" class="white-title">③ 逐工序执行子图</text>
+    <rect x="935" y="525" width="340" height="48" rx="10" fill="#e9f8f1" stroke="#2e9d73"/>
+    <text x="1105" y="555" text-anchor="middle" class="box-title">选择下一道可执行工序</text>
+    <path d="M1105 573 V592" class="arrow"/>
+    <rect x="935" y="596" width="340" height="55" rx="10" fill="#fff3dc" stroke="#d69228"/>
+    <text x="1105" y="629" text-anchor="middle" class="box-title">AI 建议刀具与参数</text>
+    <path d="M1105 651 V670" class="arrow"/>
+    <rect x="935" y="674" width="340" height="55" rx="10" fill="#e9f8f1" stroke="#2e9d73"/>
+    <text x="1105" y="707" text-anchor="middle" class="box-title">刀路生成 + CAM 仿真</text>
+    <path d="M1105 729 V748" class="arrow"/>
+    <rect x="935" y="752" width="340" height="55" rx="10" fill="#e9f8f1" stroke="#2e9d73"/>
+    <text x="1105" y="785" text-anchor="middle" class="box-title">碰撞 · 过切 · 残留验证</text>
+    <path d="M1105 807 V827" class="arrow"/>
+    <text x="1105" y="846" text-anchor="middle" class="box-copy">通过：更新在制毛坯　失败：进入诊断子图</text>
+
+    <!-- Diagnosis subgraph -->
+    <rect x="1330" y="438" width="415" height="58" rx="18" fill="#4169e1"/>
+    <rect x="1330" y="476" width="415" height="20" fill="#4169e1"/>
+    <text x="1353" y="475" class="white-title">④ 诊断与重规划子图</text>
+    <rect x="1360" y="525" width="355" height="52" rx="10" fill="#fff3dc" stroke="#d69228"/>
+    <text x="1538" y="557" text-anchor="middle" class="box-title">规则 + Qwen 分析失败证据</text>
+    <path d="M1538 577 V600" class="arrow"/>
+    <rect x="1360" y="604" width="355" height="52" rx="10" fill="#fff7e8" stroke="#d69a2d"/>
+    <text x="1538" y="636" text-anchor="middle" class="box-title">判断回退范围</text>
+    <path d="M1538 656 V680" class="arrow"/>
+    <rect x="1360" y="684" width="168" height="61" rx="10" fill="#eaf1ff" stroke="#4169e1"/>
+    <text x="1444" y="711" text-anchor="middle" class="box-title">局部问题</text>
+    <text x="1444" y="733" text-anchor="middle" class="box-copy">参数 / 刀具重试</text>
+    <rect x="1547" y="684" width="168" height="61" rx="10" fill="#eaf1ff" stroke="#4169e1"/>
+    <text x="1631" y="711" text-anchor="middle" class="box-title">装夹问题</text>
+    <text x="1631" y="733" text-anchor="middle" class="box-copy">回到装夹规划</text>
+    <rect x="1360" y="760" width="168" height="61" rx="10" fill="#eaf1ff" stroke="#4169e1"/>
+    <text x="1444" y="787" text-anchor="middle" class="box-title">路线问题</text>
+    <text x="1444" y="809" text-anchor="middle" class="box-copy">全局重新规划</text>
+    <rect x="1547" y="760" width="168" height="61" rx="10" fill="#fff0ee" stroke="#cf6256"/>
+    <text x="1631" y="787" text-anchor="middle" class="box-title">高风险问题</text>
+    <text x="1631" y="809" text-anchor="middle" class="box-copy">暂停、人工审核</text>
+
+    <!-- Feedback arrows between cards -->
+    <path d="M1444 858 V890 H1105 V866" class="blue-arrow dash"/>
+    <text x="1240" y="885" text-anchor="middle" class="small">局部重试</text>
+    <path d="M1631 858 V914 H680 V866" class="blue-arrow dash"/>
+    <text x="1010" y="909" text-anchor="middle" class="small">装夹或全局重规划</text>
+
+    <!-- Shared foundation -->
+    <rect x="55" y="944" width="1690" height="184" rx="20" fill="white" stroke="#b9c7e8" stroke-width="2" filter="url(#shadow)"/>
+    <text x="82" y="980" class="section">共享基础层：节点调用工具，所有子图读写同一份结构化状态</text>
+    <rect x="85" y="1005" width="350" height="92" rx="13" fill="#eef2f6" stroke="#64748b" stroke-width="1.5"/>
+    <text x="260" y="1038" text-anchor="middle" class="box-title">LangGraph 统一状态</text>
+    <text x="260" y="1063" text-anchor="middle" class="box-copy">版本 · 当前工序 · 毛坯引用 · 缺陷</text>
+    <text x="260" y="1084" text-anchor="middle" class="box-copy">重试次数 · 决策日志 · 检查点</text>
+
+    <rect x="480" y="1005" width="220" height="92" rx="13" fill="#f8fafc" stroke="#64748b"/>
+    <rect x="720" y="1005" width="220" height="92" rx="13" fill="#f8fafc" stroke="#64748b"/>
+    <rect x="960" y="1005" width="220" height="92" rx="13" fill="#f8fafc" stroke="#64748b"/>
+    <rect x="1200" y="1005" width="220" height="92" rx="13" fill="#f8fafc" stroke="#64748b"/>
+    <rect x="1440" y="1005" width="250" height="92" rx="13" fill="#f8fafc" stroke="#64748b"/>
+    <text x="590" y="1040" text-anchor="middle" class="box-title">几何工具</text>
+    <text x="590" y="1066" text-anchor="middle" class="box-copy">OCCT · 截面 · 拓扑</text>
+    <text x="830" y="1040" text-anchor="middle" class="box-title">AI 与知识工具</text>
+    <text x="830" y="1066" text-anchor="middle" class="box-copy">Qwen · 工艺库</text>
+    <text x="1070" y="1040" text-anchor="middle" class="box-title">资源工具</text>
+    <text x="1070" y="1066" text-anchor="middle" class="box-copy">机床库 · 刀具库</text>
+    <text x="1310" y="1040" text-anchor="middle" class="box-title">CAM 工具</text>
+    <text x="1310" y="1066" text-anchor="middle" class="box-copy">FreeCAD · 刀路</text>
+    <text x="1565" y="1040" text-anchor="middle" class="box-title">验证与持久化</text>
+    <text x="1565" y="1066" text-anchor="middle" class="box-copy">仿真 · 碰撞 · SQLite</text>
+
+    <path d="M435 1051 H470" class="arrow"/>
+    <path d="M700 1051 H710" class="arrow"/>
+    <path d="M940 1051 H950" class="arrow"/>
+    <path d="M1180 1051 H1190" class="arrow"/>
+    <path d="M1420 1051 H1430" class="arrow"/>
+
+    <text x="70" y="1157" class="small">阅读方法：主图决定“走到哪里”；子图决定“这一阶段怎么做”；节点完成一项工作；工具提供可被节点调用的底层能力。</text>
+  </g>
+</svg>
