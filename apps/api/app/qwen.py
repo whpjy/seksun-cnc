@@ -76,6 +76,9 @@ class OperationRecommendation(BaseModel):
     feature_ids: list[str]
     priority: int = Field(ge=1, le=100)
     reason: str
+    name: str | None = None
+    tool_id: str | None = None
+    parameters: dict[str, float | int | str | bool] = Field(default_factory=dict)
 
 
 class RouteProcessRecommendation(BaseModel):
@@ -302,6 +305,7 @@ def _compact_artifacts(artifacts: dict[str, object] | None) -> dict[str, object]
     collision = artifacts.get("collision")
     simulation = artifacts.get("simulation")
     remediation = artifacts.get("remediation")
+    operation_audit = artifacts.get("operation_audit")
     compact: dict[str, object] = {}
     if isinstance(verification, dict):
         compact["verification"] = {
@@ -332,6 +336,25 @@ def _compact_artifacts(artifacts: dict[str, object] | None) -> dict[str, object]
             "summary": remediation.get("summary"),
             "defects": list(remediation.get("defects") or [])[:50],
             "actions": list(remediation.get("actions") or [])[:50],
+        }
+    if isinstance(operation_audit, dict):
+        compact["operation_audit"] = {
+            "status": operation_audit.get("status"),
+            "operation_count": operation_audit.get("operation_count"),
+            "counts": operation_audit.get("counts"),
+            "blocked_operation_ids": operation_audit.get("blocked_operation_ids"),
+            "warning_operation_ids": operation_audit.get("warning_operation_ids"),
+            "records": [
+                {
+                    key: record.get(key)
+                    for key in (
+                        "operation_id", "operation_name", "setup_id", "operation_type",
+                        "status", "blockers", "warnings", "feature_ids", "tool_id",
+                    )
+                }
+                for record in list(operation_audit.get("records") or [])[:100]
+                if isinstance(record, dict)
+            ],
         }
     return compact
 
@@ -478,6 +501,11 @@ def review_process_plan(
                     "CAM 能力和仿真结果进行审查。不得生成 G-code，不得声称未经"
                     "验证的工艺可直接上机。推荐新增工序时，operation_type 必须来自"
                     " cam_operation_capabilities；若能力库无法执行，应明确阻止批准。"
+                    "你同时是工序决策者：必须对 deterministic_plan 中的每一道工序"
+                    "各给出且只给出一条 keep/modify/remove/reorder/review 决策。需要"
+                    "补充工序时使用 add，并填写唯一 operation_id、现有 setup_id、能力"
+                    "库中的 operation_type；可用 tool_id、parameters 和 name 给出可编译"
+                    "的具体方案。"
                     "所有结论必须引用输入中的具体几何或校验依据。"
                 ),
             },

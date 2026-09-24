@@ -9,12 +9,12 @@ from app.agent.config import load_agent_settings
 from app.agent.graph import build_environment_validation_graph, run_environment_validation
 
 
-def test_agent_settings_default_to_safe_shadow_mode() -> None:
+def test_agent_settings_default_to_active_ai_planning_mode() -> None:
     settings = load_agent_settings({})
 
-    assert settings.mode == "shadow"
+    assert settings.mode == "active"
     assert settings.enabled is True
-    assert settings.writes_production_results is False
+    assert settings.writes_production_results is True
     assert settings.max_local_retries == 3
 
 

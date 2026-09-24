@@ -231,6 +231,8 @@ class Setup(BaseModel):
     datum_feature_id: str | None
     fixture: str
     operations: list[Operation]
+    machine_id: str | None = None
+    machine_name: str | None = None
 
 
 class CoverageTarget(BaseModel):

@@ -116,6 +116,11 @@ def test_cumulative_height_field_inherits_stock_across_flipped_setup() -> None:
     assert min(surface["heights"]) == 9
     assert max(surface["lower_heights"]) == 1
     assert result["metrics"]["removed_volume_mm3"] > result["setup_surfaces"][0]["removed_volume_mm3"]
+    snapshots = result["operation_snapshots"]
+    assert [item["operation_id"] for item in snapshots] == [front_operation.id, back_operation.id]
+    assert snapshots[0]["removed_volume_delta_mm3"] > 0
+    assert snapshots[1]["removed_volume_mm3"] > snapshots[0]["removed_volume_mm3"]
+    assert snapshots[1]["remaining_volume_mm3"] < snapshots[0]["remaining_volume_mm3"]
 
 
 def test_height_field_simulates_side_setup_in_its_local_frame() -> None:
@@ -157,6 +162,10 @@ def test_closed_profile_removes_detached_outside_scrap() -> None:
 
     assert result["metrics"]["removed_percent"] > 50
     assert any("轮廓切透" in warning for warning in result["warnings"])
+    snapshot = result["operation_snapshots"][0]
+    assert snapshot["operation_id"] == operation.id
+    assert snapshot["profile_boundary_adjustment_mm3"] > 0
+    assert snapshot["removed_volume_mm3"] == result["metrics"]["removed_volume_mm3"]
 
 
 def test_internal_profile_boundary_removes_detached_slug() -> None:

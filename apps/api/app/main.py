@@ -324,6 +324,7 @@ def invalidate_cam_artifacts(directory: Path) -> None:
         "cam.FCStd", "program.nc", "toolpath.json", "verification.json",
         "simulation.json", "collision.json", "remediation.json", "remediation-history.json", "ai-plan.json",
         "agent-execution.json", "agent-remediation.json",
+        "agent-world-model.json", "agent-orchestrator.json",
         "turning-toolpath-ir.json", "turning-simulation.json", "turning-verification.json", "turning-thread-verification.json", "turning-reachability.json", "turning-draft.json",
         "turning-transfer-ir.json", "turning-transfer-draft.json",
         "turning-backside-ir.json", "turning-backside-draft.json",
@@ -1755,6 +1756,17 @@ def _ai_review_block_reason(directory: Path) -> str | None:
     return str(summary)[:500] if summary else "Qwen 工艺审查识别到未解决的制造风险"
 
 
+def _agent_evaluation_block_reason(directory: Path) -> str | None:
+    payload = _optional_job_json(directory, "agent-evaluation.json")
+    if not payload or payload.get("eligible_for_promotion") is not False:
+        return None
+    reasons = [
+        str(item) for item in payload.get("blocking_reasons", [])
+        if isinstance(item, str) and item.strip()
+    ]
+    return "；".join(reasons)[:500] if reasons else "智能体候选方案未通过制造风险门禁"
+
+
 def provision_default_l32_planning_instance(job: JobResponse, directory: Path) -> None:
     """Attach a deterministic L32 configuration so a new L32 job can compile CAM immediately."""
     if job.device_id != "citizen-cincom-l32" or job.machine_instance_id or not job.plan:
@@ -1946,6 +1958,10 @@ def _process_new_job(
                 "agent_review": 44,
                 "agent_synthesis": 88,
                 "agent_validation": 89,
+                "agent_operation_audit_prepare": 89,
+                "agent_operation_audit": 89,
+                "agent_operation_audit_summary": 90,
+                "agent_replan_from_audit": 90,
                 "agent_decision": 90,
                 "agent_fallback": 90,
             }
@@ -1954,7 +1970,7 @@ def _process_new_job(
             def report_ai_progress(stage: str, message: str, **details: object) -> None:
                 nonlocal ai_progress_percent
                 target_percent = ai_progress_by_phase.get(stage, ai_progress_percent + 1)
-                ai_progress_percent = min(87, max(ai_progress_percent, target_percent))
+                ai_progress_percent = min(90, max(ai_progress_percent, target_percent))
                 report(
                     "ai_planning",
                     "AI 正在判断制造意图、装夹路线与工序策略",
@@ -2024,14 +2040,22 @@ def _process_new_job(
             guidance = agent_result.get("guidance")
             evaluation = agent_result.get("evaluation", {})
             candidate_payload = agent_result.get("candidate_plan")
+            operation_audit = agent_result.get("operation_audit")
             if guidance:
                 write_json(directory / "planning-guidance.json", guidance)
             if candidate_payload:
                 write_json(directory / "agent-plan.json", candidate_payload)
+            if operation_audit:
+                write_json(directory / "operation-audit.json", operation_audit)
             write_json(directory / "agent-evaluation.json", evaluation)
 
             if agent_result.get("status") == "fallback" or not guidance:
                 error_message = str(agent_result.get("error") or "AI 研判未产生有效候选方案")
+                if agent_settings.writes_production_results:
+                    raise ValueError(
+                        "AI 智能体规划失败，主动规划模式不会回退到旧规则方案："
+                        + error_message
+                    )
                 plan.ai_planning = {
                     "status": "fallback", "message": error_message,
                     "agent_mode": agent_settings.mode,
@@ -2052,13 +2076,18 @@ def _process_new_job(
                 confidence = float(review.get("confidence", 0) or 0)
                 candidate = ProcessPlan.model_validate(candidate_payload)
                 promoted = bool(evaluation.get("production_result_changed"))
-                if promoted:
+                selected_as_primary = bool(evaluation.get("primary_plan_selected"))
+                if selected_as_primary or promoted:
                     plan = candidate
                 else:
                     plan.ai_planning = candidate.ai_planning
                 report(
                     "ai_integration",
-                    "智能体候选方案已通过评测并晋级正式方案" if promoted else "智能体候选方案已完成影子评测，正式方案保持不变",
+                    (
+                        "AI 智能体方案已成为当前工作方案，等待确定性校验与工程师审批"
+                        if selected_as_primary
+                        else "智能体候选方案已完成影子评测，正式方案保持不变"
+                    ),
                     90,
                     agent_kind="decision", agent_status="completed",
                     agent_title="候选方案晋级判断",
@@ -2068,17 +2097,23 @@ def _process_new_job(
                     agent_mode=agent_settings.mode,
                     eligible_for_promotion=bool(evaluation.get("eligible_for_promotion")),
                     production_result_changed=promoted,
+                    primary_plan_selected=selected_as_primary,
                     evidence=[
                         {"label": "制造意图", "value": review.get("manufacturing_intent")},
                         {"label": "建议工艺类型", "value": recommended_kind},
                         {"label": "置信度", "value": confidence},
                         {"label": "运行模式", "value": agent_settings.mode},
                         {"label": "是否可晋级", "value": bool(evaluation.get("eligible_for_promotion"))},
+                        {"label": "当前工作方案", "value": "AI 智能体" if selected_as_primary else "确定性基线"},
                     ],
                     artifacts=[
                         {"id": "planning-guidance", "label": "AI 规划建议", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/planning-guidance.json"},
                         {"id": "agent-plan", "label": "智能体候选方案", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/agent-plan.json"},
                         {"id": "agent-evaluation", "label": "候选方案评测", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/agent-evaluation.json"},
+                        *([{
+                            "id": "operation-audit", "label": "逐工序能力校验", "kind": "json",
+                            "url": f"/api/v1/jobs/{job_id}/files/operation-audit.json",
+                        }] if operation_audit else []),
                     ],
                 )
 
@@ -2110,6 +2145,44 @@ def _process_new_job(
         write_json(directory / "plan.json", plan.model_dump(mode="json"))
         persist_rotational_analysis(directory, job, analysis)
         job.model_url = f"/api/v1/jobs/{job_id}/files/model.stl"
+        from .agent.world_model import create_manufacturing_world_model
+        world = create_manufacturing_world_model(
+            job_id=job_id,
+            analysis=analysis,
+            plan=plan,
+            material=job.material,
+            machine=job.machine,
+            filename=job.filename,
+            model_url=job.model_url,
+        )
+        from .agent.config import load_agent_settings as load_world_agent_settings
+        from .agent.orchestrator import OrchestratorTools, run_manufacturing_orchestrator
+        world_agent_settings = load_world_agent_settings()
+        if world_agent_settings.enabled:
+            orchestrator_result = run_manufacturing_orchestrator(
+                world=world,
+                settings=world_agent_settings,
+                tools=OrchestratorTools(),
+                max_steps=8,
+                progress_callback=lambda stage, message, **details: report(
+                    "orchestrator",
+                    message,
+                    98,
+                    agent_kind="decision" if stage == "orchestrator_decide" else "tool_call",
+                    agent_status="completed" if stage == "orchestrator_decide" else "waiting",
+                    agent_title="制造任务协调",
+                    **details,
+                ),
+            )
+            world = type(world).model_validate(orchestrator_result["world"])
+            write_json(directory / "agent-orchestrator.json", {
+                "schema_version": "1.0.0",
+                "job_id": job_id,
+                "status": orchestrator_result.get("status"),
+                "next_action": orchestrator_result.get("action"),
+                "trace": orchestrator_result.get("trace", []),
+            })
+        write_json(directory / "agent-world-model.json", world.model_dump(mode="json"))
         save_job(directory, job)
         report(
             "completed", "工艺方案已生成", 100,
@@ -2300,6 +2373,37 @@ def get_agent_architecture() -> dict[str, object]:
 def get_job_agent_workspace(job_id: str) -> dict[str, object]:
     job = load_job(job_id)
     directory = job_directory(job_id)
+    world_path = directory / "agent-world-model.json"
+    if not world_path.is_file() and job.analysis and job.plan:
+        from .agent.config import load_agent_settings as load_workspace_agent_settings
+        from .agent.orchestrator import OrchestratorTools, run_manufacturing_orchestrator
+        from .agent.world_model import create_manufacturing_world_model
+        world = create_manufacturing_world_model(
+            job_id=job_id,
+            analysis=job.analysis,
+            plan=job.plan,
+            material=job.material,
+            machine=job.machine,
+            filename=job.filename,
+            model_url=job.model_url,
+        )
+        workspace_agent_settings = load_workspace_agent_settings()
+        if workspace_agent_settings.enabled:
+            result = run_manufacturing_orchestrator(
+                world=world,
+                settings=workspace_agent_settings,
+                tools=OrchestratorTools(),
+                max_steps=8,
+            )
+            world = type(world).model_validate(result["world"])
+            write_json(directory / "agent-orchestrator.json", {
+                "schema_version": "1.0.0",
+                "job_id": job_id,
+                "status": result.get("status"),
+                "next_action": result.get("action"),
+                "trace": result.get("trace", []),
+            })
+        write_json(world_path, world.model_dump(mode="json"))
     with JOB_EVENT_CONDITION:
         events = list(JOB_EVENT_LOGS[job_id]) if job_id in JOB_EVENT_LOGS else load_job_events(job_id)
     return build_agent_workspace(
@@ -3479,7 +3583,8 @@ def get_job_file(job_id: str, filename: str) -> FileResponse:
     allowed = {
         "model.stl", "drawing.pdf", "analysis.json", "rotational-features.json", "plan.json",
         "manufacturing-specification.json", "manufacturing-requirements.json", "measurement-link.json",
-        "planning-guidance.json", "agent-plan.json", "agent-evaluation.json", "agent-execution.json",
+        "planning-guidance.json", "agent-plan.json", "agent-evaluation.json", "operation-audit.json",
+        "agent-execution.json", "agent-world-model.json", "agent-orchestrator.json",
         "agent-remediation.json",
         "ai-plan.json", "cam.FCStd", "program.nc", "toolpath.json", "verification.json",
         "simulation.json", "collision.json", "remediation.json", "remediation-history.json",
@@ -3539,10 +3644,30 @@ def approve_plan(job_id: str) -> JobResponse:
                 else "当前零件超出自动 CAM 能力范围，工艺方案不可批准"
             ),
         )
+    if not job.plan.coverage or not job.plan.coverage.production_ready:
+        coverage = job.plan.coverage
+        uncovered = (
+            sum(item.state in {"uncovered", "unresolved"} for item in coverage.targets)
+            if coverage else 0
+        )
+        review = coverage.review_count if coverage else 0
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "工艺覆盖门禁未通过，方案不可批准："
+                f"未覆盖 {uncovered} 项，待复核 {review} 项，"
+                f"自动化状态 {job.plan.automation_status}"
+            ),
+        )
     if ai_block_reason := _ai_review_block_reason(job_directory(job_id)):
         raise HTTPException(
             status_code=409,
             detail=f"AI 工艺审查阻止批准：{ai_block_reason}",
+        )
+    if agent_block_reason := _agent_evaluation_block_reason(job_directory(job_id)):
+        raise HTTPException(
+            status_code=409,
+            detail=f"智能体工艺门禁阻止批准：{agent_block_reason}",
         )
     for setup in job.plan.setups:
         for operation in setup.operations:
@@ -3979,6 +4104,47 @@ def _run_operation_execution_agent(
         "records": trace.get("records", []),
     }
     write_json(job_directory(job_id) / "agent-execution.json", payload)
+    from .agent.world_model import (
+        apply_execution_trace,
+        create_manufacturing_world_model,
+        load_world_model,
+    )
+    world_path = job_directory(job_id) / "agent-world-model.json"
+    world = load_world_model(world_path)
+    if world is None and job.analysis and job.plan:
+        world = create_manufacturing_world_model(
+            job_id=job_id,
+            analysis=job.analysis,
+            plan=job.plan,
+            material=job.material,
+            machine=job.machine,
+            filename=job.filename,
+            model_url=job.model_url,
+        )
+    if world is not None:
+        world = apply_execution_trace(world, payload)
+        write_json(world_path, world.model_dump(mode="json"))
+        orchestrator_path = job_directory(job_id) / "agent-orchestrator.json"
+        orchestrator_payload = (
+            json.loads(orchestrator_path.read_text(encoding="utf-8"))
+            if orchestrator_path.is_file() else {
+                "schema_version": "1.0.0", "job_id": job_id, "trace": [],
+            }
+        )
+        trace = list(orchestrator_payload.get("trace", []))
+        trace.append({
+            "sequence": len(trace) + 1,
+            "at": world.updated_at,
+            "action": "reconcile_execution",
+            "status": "completed",
+            "summary": "已将真实刀路、仿真与安全校验结果写回制造世界模型",
+        })
+        orchestrator_payload.update({
+            "status": world.lifecycle,
+            "next_action": world.next_action,
+            "trace": trace,
+        })
+        write_json(orchestrator_path, orchestrator_payload)
     publish_job_event(
         job_id, "operation_execution", "逐工序执行记录已归档", 100,
         agent_node="archive_execution_trace", agent_title="逐工序执行记录",
@@ -4451,9 +4617,66 @@ def _run_cam_remediation_loop(
     return {**latest_result, "remediation_loop": {"outcome": outcome, "iteration": iteration}}
 
 
+def _create_cam_with_agent_loop(
+    job_id: str,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, object]:
+    """Generate, observe and safely repair CAM without a second user action.
+
+    The initial CAM completion event is held until the bounded remediation graph
+    either converges or reaches a safety gate, so streaming clients see one
+    coherent agent run instead of a misleading early success.
+    """
+    from .agent.config import load_agent_settings
+
+    terminal_event: dict[str, object] | None = None
+
+    def forward_initial(event: dict[str, object]) -> None:
+        nonlocal terminal_event
+        if event.get("stage") == "completed":
+            terminal_event = event
+            return
+        if progress_callback:
+            progress_callback(event)
+
+    result = _create_cam_artifact(
+        job_id,
+        progress_callback=forward_initial if progress_callback else None,
+    )
+    remediation = result.get("remediation")
+    settings = load_agent_settings()
+    can_auto_replan = (
+        settings.mode == "active"
+        and isinstance(remediation, dict)
+        and remediation.get("can_auto_replan") is True
+    )
+    if can_auto_replan:
+        if progress_callback:
+            progress_callback({
+                "stage": "agent_remediation_start",
+                "message": "检测到可安全修复的问题，智能体开始局部调整并重新仿真",
+                "percent": 1,
+                "defect_count": len(remediation.get("defects", [])),
+                "max_iterations": remediation.get("max_iterations", settings.max_local_retries),
+            })
+        return _run_cam_remediation_loop(job_id, progress_callback=progress_callback)
+
+    if progress_callback:
+        progress_callback(terminal_event or {
+            "stage": "completed",
+            "message": "CAM 刀路、逐工序材料状态与安全验证已完成",
+            "percent": 100,
+            "agent_outcome": (
+                "manual_review" if isinstance(remediation, dict) and remediation.get("status") == "blocked"
+                else "passed"
+            ),
+        })
+    return result
+
+
 @app.post("/api/v1/jobs/{job_id}/cam")
 def create_cam_artifact(job_id: str) -> dict[str, object]:
-    return _create_cam_artifact(job_id)
+    return _create_cam_with_agent_loop(job_id)
 
 
 @app.get("/api/v1/jobs/{job_id}/cam/stream")
@@ -4472,7 +4695,7 @@ def stream_cam_artifact(job_id: str) -> StreamingResponse:
 
     def worker() -> None:
         try:
-            _create_cam_artifact(job_id, progress_callback=events.put)
+            _create_cam_with_agent_loop(job_id, progress_callback=events.put)
         except HTTPException as error:
             events.put({"stage": "error", "message": str(error.detail), "percent": 100})
         except Exception as error:

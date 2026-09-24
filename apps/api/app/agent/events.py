@@ -4,6 +4,7 @@ from typing import Any
 
 
 STAGE_METADATA: dict[str, tuple[str, str, str]] = {
+    "orchestrator": ("orchestrator", "decide_next_action", "制造任务协调"),
     "uploading": ("intake", "receive_model", "模型接入"),
     "geometry_analysis": ("feature_recognition", "extract_geometry", "特征识别"),
     "draft_planning": ("process_planning", "build_deterministic_draft", "工艺规划"),

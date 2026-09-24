@@ -101,6 +101,32 @@ def discover_example_cases(
     if selected_manifest is not None:
         return _discover_manifest_cases(resolved_root, selected_manifest)
     cases: list[dict[str, object]] = []
+    root_models = sorted(
+        (
+            item for item in resolved_root.iterdir()
+            if item.is_file() and item.suffix.casefold() in {".step", ".stp"}
+        ),
+        key=lambda item: item.name.casefold(),
+    )
+    for model in root_models:
+        matching_drawings = sorted(
+            item.name for item in resolved_root.iterdir()
+            if item.is_file()
+            and item.suffix.casefold() == ".pdf"
+            and item.stem.casefold() == model.stem.casefold()
+        )
+        cases.append({
+            "id": model.stem,
+            "label": model.stem,
+            "relative_directory": ".",
+            "primary_model": model.name,
+            "model_files": [model.name],
+            "drawing_files": matching_drawings,
+            "native_files": [],
+            "measurement_files": [],
+            "projection_manifests": [],
+            "paired": bool(matching_drawings),
+        })
     directories = sorted(
         (item for item in resolved_root.iterdir() if item.is_dir()),
         key=lambda item: (

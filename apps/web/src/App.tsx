@@ -2657,12 +2657,12 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             </div></>
           </section>}
           {leftWorkbenchPanel === "process" && <section className="feature-tree panel accordion-panel expanded">
-            <div className="panel-heading floating-panel-heading"><Layers3 size={16} /><span>工艺路线</span><small>{job.plan.setups.length} 装夹 · {operations.length} 工序</small><button type="button" aria-label="关闭工艺路线" title="关闭" onClick={() => { setLeftWorkbenchPanel(null); setShowOperationViewSwitch(false); setShowOperationDetails(false); setEditingOperationDetails(false); setStockSelected(false); }}><X size={15} /></button></div>
+            <div className="panel-heading floating-panel-heading"><Layers3 size={16} /><span>工艺路线</span><small>{job.plan.ai_planning?.planner === "langgraph_ai_primary" ? "AI 规划 · " : ""}{job.plan.setups.length} 装夹 · {operations.length} 工序</small><button type="button" aria-label="关闭工艺路线" title="关闭" onClick={() => { setLeftWorkbenchPanel(null); setShowOperationViewSwitch(false); setShowOperationDetails(false); setEditingOperationDetails(false); setStockSelected(false); }}><X size={15} /></button></div>
             <div className="panel-content">
               <button type="button" className={`tree-section stock-tree-row ${stockSelected ? "selected" : ""}`} aria-pressed={stockSelected} onClick={chooseStock}><strong><Box size={15} /> 毛坯</strong><small>{stockDimensionLabel}</small></button>
               {job.plan.setups.map((setup) => (
                 <div key={setup.id} className="setup-tree">
-                  <div className="tree-section"><strong><Rotate3D size={15} /> {setup.name}</strong><small>{setup.fixture}</small></div>
+                  <div className="tree-section"><strong><Rotate3D size={15} /> {setup.name}</strong><small>{setup.machine_name ? `${setup.machine_name} · ` : ""}{setup.fixture}</small></div>
                   {setup.operations.map((operation) => (
                     <div key={operation.id} className={`operation-tree-row ${selectedOperation?.id === operation.id ? "selected" : ""} ${operation.enabled === false ? "suppressed" : ""} ${generatingCam && camProgress?.operation_id === operation.id ? "stream-active" : ""}`}>
                       <button className="operation-tree-main" title={`选择 ${operation.id}`} disabled={operation.enabled === false} onClick={() => openOperationSimulation(operation)}>
@@ -2681,6 +2681,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           {leftWorkbenchPanel === "agent" && <AgentWorkspacePanel
             events={agentWorkspace?.events ?? []}
             artifacts={agentWorkspace?.artifacts ?? []}
+            orchestration={agentWorkspace?.orchestration}
             activeEventId={activeAgentEvent?.event_id}
             progress={agentWorkspace?.events.at(-1)?.percent ?? (job.status === "completed" ? 100 : 0)}
             apiUrl={apiUrl}

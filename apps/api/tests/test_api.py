@@ -20,10 +20,13 @@ def test_agent_architecture_exposes_subgraphs_and_tool_boundaries() -> None:
     payload = response.json()
     assert payload["orchestrator"] == "langgraph"
     assert [item["id"] for item in payload["subgraphs"]] == [
-        "feature_recognition", "process_planning", "operation_execution", "validation_remediation",
+        "manufacturing_orchestrator", "feature_recognition", "process_planning",
+        "operation_execution", "validation_remediation",
     ]
     assert any(tool["id"] == "planning.review_with_qwen" and not tool["deterministic"] for tool in payload["tools"])
     assert any(tool["id"] == "validation.check_result" and tool["deterministic"] for tool in payload["tools"])
+    assert any(tool["id"] == "world.commit" and tool["deterministic"] for tool in payload["tools"])
+    assert any(tool["id"] == "review.simulation_with_ai" and not tool["deterministic"] for tool in payload["tools"])
     remediation = next(item for item in payload["subgraphs"] if item["id"] == "validation_remediation")
     assert remediation["status"] == "implemented"
     assert "regenerate_and_validate" in remediation["nodes"]
@@ -215,6 +218,38 @@ def test_cam_stream_emits_incremental_progress(monkeypatch) -> None:
     assert response.headers["content-type"].startswith("text/event-stream")
     assert '"operation_id": "OP10"' in response.text
     assert '"stage": "completed"' in response.text
+
+
+def test_active_cam_run_automatically_enters_safe_remediation_loop(monkeypatch) -> None:
+    monkeypatch.setenv("CNC_AGENT_MODE", "active")
+
+    def fake_create(_job_id, progress_callback=None):
+        assert progress_callback is not None
+        progress_callback({"stage": "completed", "message": "初次仿真完成", "percent": 100})
+        return {"remediation": {
+            "status": "action_required",
+            "can_auto_replan": True,
+            "max_iterations": 3,
+            "defects": [{"id": "DEF-001"}],
+        }}
+
+    def fake_loop(_job_id, progress_callback=None):
+        assert progress_callback is not None
+        progress_callback({
+            "stage": "completed", "message": "自动纠错通过", "percent": 100,
+            "outcome": "passed",
+        })
+        return {"remediation_loop": {"outcome": "passed", "iteration": 1}}
+
+    monkeypatch.setattr(main, "_create_cam_artifact", fake_create)
+    monkeypatch.setattr(main, "_run_cam_remediation_loop", fake_loop)
+    events = []
+
+    result = main._create_cam_with_agent_loop("a" * 32, progress_callback=events.append)
+
+    assert result["remediation_loop"]["outcome"] == "passed"
+    assert [item["stage"] for item in events] == ["agent_remediation_start", "completed"]
+    assert all(item.get("message") != "初次仿真完成" for item in events)
 
 
 def test_job_history_lists_latest_jobs_first(tmp_path, monkeypatch) -> None:
@@ -742,6 +777,88 @@ def test_unsupported_plan_cannot_be_approved(tmp_path, monkeypatch) -> None:
 
     assert response.status_code == 409
     assert "不可批准" in response.json()["detail"]
+
+
+def test_incomplete_coverage_cannot_be_approved(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "9" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    analysis = GeometryAnalysis.model_validate({
+        "schema_version": "0.8.0", "source_file": "incomplete.step",
+        "topology": {"solids": 1, "faces": 8, "edges": 16},
+        "measurements": {
+            "surface_area": 1000, "volume": 1000,
+            "bounding_box": {
+                "minimum": {"x": 0, "y": 0, "z": 0},
+                "maximum": {"x": 20, "y": 20, "z": 20},
+                "size": {"x": 20, "y": 20, "z": 20},
+            },
+        },
+        "planar_features": [],
+        "cylindrical_features": [{
+            "id": "HF-1", "kind": "hole", "radius": 2, "diameter": 4,
+            "length": 20, "center": {"x": 10, "y": 10, "z": 10},
+            "axis": {"x": 1, "y": 0, "z": 0}, "review_state": "accepted",
+        }],
+    })
+    plan = main.build_process_plan(analysis, "6061-T6", "Citizen Cincom L32")
+    assert plan.coverage is not None and plan.coverage.production_ready is False
+    main.save_job(directory, JobResponse(
+        id=job_id, status="completed", filename="incomplete.step",
+        created_at=main.utc_now(), material="6061-T6", machine="Citizen Cincom L32",
+        device_id="citizen-cincom-l32", analysis=analysis, plan=plan,
+    ))
+
+    response = client.post(f"/api/v1/jobs/{job_id}/approve")
+
+    assert response.status_code == 409
+    assert "工艺覆盖门禁未通过" in response.json()["detail"]
+
+
+def test_agent_evaluation_can_block_otherwise_ready_plan(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "8" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    analysis = GeometryAnalysis.model_validate({
+        "schema_version": "0.8.0", "source_file": "ready.step",
+        "topology": {"solids": 1, "faces": 6, "edges": 12},
+        "measurements": {
+            "surface_area": 100, "volume": 100,
+            "bounding_box": {
+                "minimum": {"x": 0, "y": 0, "z": 0},
+                "maximum": {"x": 20, "y": 20, "z": 10},
+                "size": {"x": 20, "y": 20, "z": 10},
+            },
+        },
+        "planar_features": [{
+            "id": "PF-1", "area": 400, "center": {"x": 10, "y": 10, "z": 10},
+            "normal": {"x": 0, "y": 0, "z": 1},
+        }],
+        "cylindrical_features": [], "prismatic_features": [],
+    })
+    plan = main.build_process_plan(analysis, "6061-T6", "VMC")
+    plan.automation_status = "ready"
+    assert plan.coverage is not None
+    plan.coverage.status = "complete"
+    plan.coverage.score = 1.0
+    plan.coverage.production_ready = True
+    assert plan.coverage is not None and plan.coverage.production_ready is True
+    main.save_job(directory, JobResponse(
+        id=job_id, status="completed", filename="ready.step",
+        created_at=main.utc_now(), material="6061-T6", machine="VMC",
+        analysis=analysis, plan=plan,
+    ))
+    main.write_json(directory / "agent-evaluation.json", {
+        "eligible_for_promotion": False,
+        "blocking_reasons": ["AI 识别到高风险制造问题"],
+    })
+
+    response = client.post(f"/api/v1/jobs/{job_id}/approve")
+
+    assert response.status_code == 409
+    assert "智能体工艺门禁" in response.json()["detail"]
 
 
 def test_cam_without_approval_returns_artifact_links(tmp_path, monkeypatch) -> None:

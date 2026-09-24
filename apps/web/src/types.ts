@@ -894,6 +894,8 @@ export type Setup = {
   datum_feature_id: string | null;
   fixture: string;
   operations: Operation[];
+  machine_id?: string | null;
+  machine_name?: string | null;
 };
 
 export type ManufacturingCoverage = {
@@ -1007,7 +1009,7 @@ export type Job = {
     coverage?: ManufacturingCoverage | null;
     manufacturing_requirements?: ManufacturingRequirements | null;
     ai_planning?: {
-      status?: "fallback";
+      status?: "fallback" | "working_draft";
       provider?: string;
       model?: string;
       created_at?: string;
@@ -1018,6 +1020,10 @@ export type Job = {
       summary?: string;
       message?: string;
       requires_engineer_review?: boolean;
+      agent_mode?: "disabled" | "shadow" | "active";
+      planner?: "langgraph_ai_primary";
+      compiler_issue_count?: number;
+      compiler_issues?: string[];
     } | null;
   } | null;
 };
@@ -1078,6 +1084,16 @@ export type AgentWorkspace = {
   thread_id: string;
   status: Job["status"];
   active_event_id: string | null;
+  orchestration?: {
+    revision?: number;
+    lifecycle?: "initialized" | "planning" | "awaiting_execution" | "validating" | "repairing" | "waiting_human" | "completed" | "blocked";
+    current_objective?: string;
+    next_action?: "perceive" | "plan" | "compile" | "execute" | "review" | "commit" | "repair" | "human_review" | "complete";
+    current_operation_id?: string | null;
+    open_question_count?: number;
+    blocking_question_count?: number;
+    evidence_count?: number;
+  } | null;
   events: AgentTraceEvent[];
   artifacts: AgentArtifact[];
 };

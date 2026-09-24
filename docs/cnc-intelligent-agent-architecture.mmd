@@ -1,0 +1,110 @@
+%%{init: {"theme":"base","flowchart":{"curve":"basis","nodeSpacing":28,"rankSpacing":44},"themeVariables":{"fontFamily":"Microsoft YaHei, PingFang SC, Arial","primaryTextColor":"#17315c","lineColor":"#7890b8","clusterBkg":"#f7f9fd","clusterBorder":"#b8c7e6"}}}%%
+flowchart TB
+  classDef input fill:#f7f9fd,stroke:#9db0d1,color:#263d66,stroke-width:1.2px;
+  classDef ai fill:#e9efff,stroke:#4f6ff0,color:#173d9a,stroke-width:2px;
+  classDef state fill:#fff8e8,stroke:#e0a52b,color:#674600,stroke-width:2px;
+  classDef tool fill:#e8f8f4,stroke:#2aaa83,color:#145b49,stroke-width:1.4px;
+  classDef deterministic fill:#eef3f8,stroke:#66809f,color:#263d57,stroke-width:1.4px;
+  classDef gate fill:#fff0f0,stroke:#df6666,color:#7a2525,stroke-width:1.6px;
+  classDef output fill:#ecf9ee,stroke:#3aaa62,color:#175f31,stroke-width:2px;
+  classDef human fill:#f5edff,stroke:#9865d6,color:#54258a,stroke-width:1.6px;
+
+  subgraph INPUT["A · 制造任务输入"]
+    direction LR
+    I1["STEP / B-Rep / 网格"]:::input
+    I2["图纸、PMI、公差、表面要求"]:::input
+    I3["材料、批量、交期、成本目标"]:::input
+    I4["机床、刀具、夹具与现场能力"]:::input
+    I5["历史案例、工艺规范与专家规则"]:::input
+    I1 ~~~ I2
+    I2 ~~~ I3
+    I3 ~~~ I4
+    I4 ~~~ I5
+  end
+
+  subgraph BRAIN["B · LangGraph CNC 总协调器（单一主控，子图按需调用）"]
+    direction LR
+    A0["目标解释与任务分解<br/>决定当前要解决的问题"]:::ai
+    A1["下一动作决策<br/>观察 / 规划 / 计算 / 仿真 / 审核 / 求助"]:::ai
+    A2["预算与停止条件<br/>时间、算力、重试次数、风险阈值"]:::gate
+    A3["动态路由<br/>不采用固定“识别完再规划”流水线"]:::ai
+    A0 --> A1 --> A3
+    A2 -.约束.-> A1
+  end
+
+  subgraph WORLD["C · 制造世界模型（共享黑板 / 唯一事实源）"]
+    direction LR
+    W1["几何事实<br/>拓扑、尺寸、坐标系、邻接、可达性"]:::state
+    W2["特征假设<br/>编号、类别、证据、置信度、待确认问题"]:::state
+    W3["分层工艺意图<br/>策略、装夹包、滚动工序、依赖关系"]:::state
+    W4["执行状态<br/>当前毛坯、已提交工序、刀路与仿真结果"]:::state
+    W5["风险与追溯<br/>碰撞、公差、残料、来源、版本、决策理由"]:::state
+    W1 ~~~ W2
+    W2 ~~~ W3
+    W3 ~~~ W4
+    W4 ~~~ W5
+  end
+
+  subgraph PERCEPTION["D · 按需感知子图（规划过程中可随时回调）"]
+    direction LR
+    P0["初始全局观察<br/>形成零件族、加工难点和待查问题"]:::ai
+    P1["精确几何查询<br/>B-Rep 拓扑、测量、截面、壁厚、同轴/邻接"]:::deterministic
+    P2["多模态视图生成<br/>六视图、剖切、透明、特征高亮、前后状态"]:::tool
+    P3["AI 视觉理解<br/>识别加工语义、疑难结构与潜在基准"]:::ai
+    P4["可制造性探测<br/>刀具可达、装夹遮挡、加工方向、薄弱区"]:::deterministic
+    P5["证据融合<br/>假设 → 观察确认 → 几何确认"]:::gate
+    P0 --> P2 --> P3 --> P5
+    P1 --> P5
+    P4 --> P5
+  end
+
+  subgraph PLAN["E · 分层滚动规划子图（既非一次性全规划，也非盲目逐刀规划）"]
+    direction LR
+    L1["L1 制造策略层<br/>毛坯/工法、基准链、装夹结构、阶段顺序、检验门"]:::ai
+    L2["L2 装夹工作包<br/>输入毛坯、加工目标、保护结构、目标中间态、完成条件"]:::ai
+    L3["L3 滚动工序窗口<br/>只细化当前与少量后续工序，保留可调整空间"]:::ai
+    C1["形式化编译器<br/>AI 意图 → 可校验 ProcessPlan / OperationSpec"]:::deterministic
+    C2["工艺计算<br/>刀具候选、切削参数、余量、基准与资源绑定"]:::deterministic
+    L1 --> L2 --> L3 --> C1 --> C2
+  end
+
+  subgraph EXEC["F · 真实工具执行与数字验证子图"]
+    direction LR
+    E0["确定性预检<br/>字段、单位、方向、资源、依赖与边界条件"]:::gate
+    E1["真实 CAM 刀路生成<br/>拒绝仅用展示线替代刀路"]:::tool
+    E2["材料去除仿真<br/>保存每道工序后的实体毛坯"]:::tool
+    E3["碰撞与快速移动检查<br/>刀具 / 刀柄 / 夹具 / 工件"]:::tool
+    E4["几何符合性检查<br/>过切、欠切、残料、轮廓偏差、覆盖率"]:::deterministic
+    E5["证据包<br/>结构化指标 + 关键视图 + 前后对比 + 日志"]:::deterministic
+    E0 --> E1 --> E2 --> E3 --> E4 --> E5
+  end
+
+  subgraph REVIEW["G · AI 审核与分级修正子图"]
+    direction LR
+    R1["AI 多模态审核<br/>观察刀路、余料、干涉、异常表面与工艺合理性"]:::ai
+    R2["确定性闸门<br/>安全阈值、公差、完整性与可追溯性不可由 AI 放宽"]:::gate
+    R3{"结果是否可提交？"}:::gate
+    R4["最小充分回滚<br/>参数级 → 工序级 → 装夹级 → 策略级<br/>返回协调器重新决策"]:::ai
+    R5["提交本工序<br/>更新世界模型，固化实体毛坯、结果和证据链"]:::output
+    R1 --> R2 --> R3
+    R3 -- "未通过：定位失败层级" --> R4
+    R3 -- "通过" --> R5
+  end
+
+  subgraph GOV["H · 人机协同与生产治理"]
+    direction LR
+    H1["高风险审批<br/>昂贵毛坯、薄壁、关键公差、低置信度结构"]:::human
+    H2["可解释交付<br/>每项结论关联几何、图片、仿真和规则证据"]:::human
+    H3["版本与审计<br/>计划、模型、工具、提示词、仿真器版本可追溯"]:::human
+    H4["生产放行条件<br/>覆盖完整、有真实刀路、仿真通过、无未决高风险"]:::output
+    H1 --> H2 --> H3 --> H4
+  end
+
+  INPUT --> BRAIN
+  BRAIN -- "读取 / 更新状态" --> WORLD
+  BRAIN -- "信息不足：提出最小必要问题" --> PERCEPTION
+  PERCEPTION -- "事实、视图、证据与置信度" --> WORLD
+  WORLD -- "选择规划层级并形成滚动候选" --> PLAN
+  PLAN -- "形式化工序" --> EXEC
+  EXEC -- "指标、视图与前后实体" --> REVIEW
+  REVIEW -- "完成 / 高风险 / 证据冲突 / 预算耗尽" --> GOV

@@ -30,7 +30,7 @@ def _boolean(value: str, name: str) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class AgentSettings:
-    mode: str = "shadow"
+    mode: str = "active"
     checkpointer: str = "sqlite"
     checkpoint_path: Path = Path(".seksun-cnc/langgraph.sqlite")
     max_local_retries: int = 3
@@ -49,7 +49,7 @@ class AgentSettings:
 
 def load_agent_settings(environment: Mapping[str, str] | None = None) -> AgentSettings:
     env = os.environ if environment is None else environment
-    mode = env.get("CNC_AGENT_MODE", "shadow").strip().lower()
+    mode = env.get("CNC_AGENT_MODE", "active").strip().lower()
     if mode not in _VALID_MODES:
         choices = ", ".join(sorted(_VALID_MODES))
         raise ValueError(f"CNC_AGENT_MODE must be one of: {choices}")

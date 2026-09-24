@@ -71,17 +71,50 @@ def build_operation_execution_subgraph(
     def inspect_simulation(state: OperationExecutionState) -> OperationExecutionState:
         operation_id = str(state["current_operation"]["id"])
         simulation = state["simulation"]
-        metrics = simulation.get("metrics", {}) if isinstance(simulation.get("metrics"), dict) else {}
+        snapshots = simulation.get("operation_snapshots", [])
+        snapshot = next(
+            (
+                item for item in snapshots
+                if isinstance(item, dict) and str(item.get("operation_id", "")) == operation_id
+            ),
+            None,
+        )
         evidence = dict(state.get("current_evidence", {}))
         evidence.update({
-            "simulation_status": simulation.get("status", "unavailable"),
-            "removed_volume_mm3": metrics.get("removed_volume_mm3"),
-            "remaining_volume_mm3": metrics.get("remaining_volume_mm3"),
-            "simulation_scope": "cumulative",
+            "simulation_status": snapshot.get("status", "completed") if snapshot else "unavailable",
+            "removed_volume_mm3": snapshot.get("removed_volume_mm3") if snapshot else None,
+            "removed_volume_delta_mm3": snapshot.get("removed_volume_delta_mm3") if snapshot else None,
+            "remaining_volume_mm3": snapshot.get("remaining_volume_mm3") if snapshot else None,
+            "simulation_cut_segment_count": snapshot.get("cut_segment_count") if snapshot else 0,
+            "simulation_scope": "cumulative_after_operation",
+            "material_state_sequence": snapshot.get("sequence") if snapshot else None,
         })
         report(
-            "inspect_simulation", "累计材料仿真证据已关联到当前工序",
+            "inspect_simulation", "已读取当前工序后的真实累计余料状态",
             operation_id=operation_id, simulation_status=evidence["simulation_status"],
+            removed_volume_delta_mm3=evidence["removed_volume_delta_mm3"],
+            remaining_volume_mm3=evidence["remaining_volume_mm3"],
+        )
+        return {"current_evidence": evidence}
+
+    def inspect_collision(state: OperationExecutionState) -> OperationExecutionState:
+        operation_id = str(state["current_operation"]["id"])
+        collisions = _operation_collisions(state["collision"], operation_id)
+        low_rapids = [
+            item for item in state["collision"].get("low_rapids", [])
+            if isinstance(item, dict) and str(item.get("operation_id", "")) == operation_id
+        ]
+        evidence = dict(state.get("current_evidence", {}))
+        evidence.update({
+            "collision_count": len(collisions),
+            "low_rapid_count": len(low_rapids),
+            "collision_status": "failed" if collisions or low_rapids else "passed",
+        })
+        report(
+            "inspect_collision", "已完成当前工序刀具、刀柄、夹具与快移安全检查",
+            operation_id=operation_id,
+            collision_count=len(collisions),
+            low_rapid_count=len(low_rapids),
         )
         return {"current_evidence": evidence}
 
@@ -91,8 +124,18 @@ def build_operation_execution_subgraph(
         evidence = dict(state.get("current_evidence", {}))
         defects = _operation_defects(state["remediation"], operation_id)
         collisions = _operation_collisions(state["collision"], operation_id)
+        low_rapids = [
+            item for item in state["collision"].get("low_rapids", [])
+            if isinstance(item, dict) and str(item.get("operation_id", "")) == operation_id
+        ]
         critical = any(str(item.get("severity")) == "critical" for item in defects)
-        if not evidence.get("toolpath_generated") or collisions or critical:
+        if (
+            not evidence.get("toolpath_generated")
+            or evidence.get("simulation_status") != "completed"
+            or collisions
+            or low_rapids
+            or critical
+        ):
             status = "blocked"
         elif defects:
             status = "action_required"
@@ -111,7 +154,13 @@ def build_operation_execution_subgraph(
             "evidence": evidence,
             "defects": defects,
             "collisions": collisions,
+            "low_rapids": low_rapids,
             "recommended_actions": actions,
+            "tool_calls": [
+                {"tool": "cam.generate_toolpath", "status": "passed" if evidence.get("toolpath_generated") else "failed"},
+                {"tool": "simulation.remove_material", "status": evidence.get("simulation_status")},
+                {"tool": "validation.detect_collision", "status": evidence.get("collision_status")},
+            ],
             "viewer": {
                 "kind": "operation", "operation_id": operation_id,
                 "feature_ids": operation.get("feature_ids", []), "mode": "仿真",
@@ -121,6 +170,7 @@ def build_operation_execution_subgraph(
             "verify_operation", f"{operation_id} 工序验证{('通过' if status == 'passed' else '需要处理')}",
             operation_id=operation_id, operation_status=status,
             defect_count=len(defects), collision_count=len(collisions),
+            low_rapid_count=len(low_rapids),
             feature_ids=operation.get("feature_ids", []),
         )
         return {
@@ -129,6 +179,9 @@ def build_operation_execution_subgraph(
         }
 
     def route_next(state: OperationExecutionState) -> str:
+        records = state.get("records", [])
+        if records and records[-1].get("status") == "blocked":
+            return "summarize"
         return "next" if int(state.get("cursor", 0)) < len(state["operations"]) else "summarize"
 
     def summarize(state: OperationExecutionState) -> OperationExecutionState:
@@ -154,6 +207,11 @@ def build_operation_execution_subgraph(
             "mode": settings.mode,
             "status": status,
             "operation_count": len(records),
+            "expected_operation_count": len(state["operations"]),
+            "skipped_operation_count": max(len(state["operations"]) - len(records), 0),
+            "skipped_operation_ids": [
+                str(item.get("id")) for item in state["operations"][len(records):]
+            ],
             "counts": counts,
             "verification_status": state["verification"].get("status"),
             "collision_status": state["collision"].get("status"),
@@ -182,12 +240,14 @@ def build_operation_execution_subgraph(
     workflow.add_node("select_operation", select_operation)
     workflow.add_node("inspect_toolpath", inspect_toolpath)
     workflow.add_node("inspect_simulation", inspect_simulation)
+    workflow.add_node("inspect_collision", inspect_collision)
     workflow.add_node("verify_operation", verify_operation)
     workflow.add_node("summarize_execution", summarize)
     workflow.add_edge(START, "select_operation")
     workflow.add_edge("select_operation", "inspect_toolpath")
     workflow.add_edge("inspect_toolpath", "inspect_simulation")
-    workflow.add_edge("inspect_simulation", "verify_operation")
+    workflow.add_edge("inspect_simulation", "inspect_collision")
+    workflow.add_edge("inspect_collision", "verify_operation")
     workflow.add_conditional_edges(
         "verify_operation", route_next,
         {"next": "select_operation", "summarize": "summarize_execution"},

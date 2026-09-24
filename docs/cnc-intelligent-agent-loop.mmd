@@ -1,0 +1,66 @@
+%%{init: {"theme":"base","sequence":{"diagramMarginX":35,"diagramMarginY":22,"actorMargin":42,"width":190,"height":70,"boxMargin":10,"messageMargin":30,"mirrorActors":false},"themeVariables":{"fontFamily":"Microsoft YaHei, PingFang SC, Arial","primaryTextColor":"#17315c","lineColor":"#7890b8","actorBkg":"#e9efff","actorBorder":"#4f6ff0","actorTextColor":"#173d9a","signalColor":"#526b91","signalTextColor":"#263d66","labelBoxBkgColor":"#fff8e8","labelBoxBorderColor":"#e0a52b","labelTextColor":"#674600","noteBkgColor":"#e8f8f4","noteBorderColor":"#2aaa83","noteTextColor":"#145b49","activationBkgColor":"#eef3ff","activationBorderColor":"#4f6ff0"}}}%%
+sequenceDiagram
+  autonumber
+  actor H as 工艺人员
+  participant O as LangGraph 总协调器
+  participant W as 制造世界模型
+  participant P as 按需感知子图
+  participant L as 分层规划子图
+  participant G as 确定性校验闸门
+  participant C as CAM / 仿真工具
+  participant R as AI 多模态审核
+
+  H->>O: 提交制造目标、模型、图纸、资源与约束
+  O->>W: 建立任务版本、初始状态与风险预算
+
+  loop 直到满足生产放行条件
+    O->>W: 读取当前毛坯、已提交工序、未决风险与证据
+    O->>O: 明确本轮目标并选择下一动作
+    Note over O,W: 每轮只解决当前最有价值的问题，不把固定“全识别→全规划”当作唯一流程
+
+    alt 当前证据不足
+      O->>P: 提出最小必要问题
+      Note over O,P: 示例：该面能否作为基准？背面区域是否可达？当前残料来自哪一步？
+      P->>P: 调用 B-Rep 测量、截面、壁厚、邻接、可达性分析
+      P->>P: 生成六视图、剖切、透明、特征高亮或前后状态图
+      P-->>W: 写入几何事实、视觉证据、特征假设、置信度与来源
+      W-->>O: 返回更新后的制造状态
+    else 当前证据足够
+      O->>L: 选择 L1 策略 / L2 装夹包 / L3 滚动工序层级
+      L->>W: 写入候选策略、依赖、目标中间态和验收条件
+      L->>G: 编译并提交形式化 OperationSpec
+
+      alt 形式化预检失败
+        G-->>O: 返回字段、单位、方向、资源、依赖或边界错误
+        O->>O: 做参数级或工序级最小修正
+      else 形式化预检通过
+        G->>C: 请求真实刀路与数字验证
+        C->>C: 生成 CAM 刀路并执行材料去除仿真
+        C->>C: 检查碰撞、快速移动、过切、欠切、残料与覆盖率
+        C-->>W: 保存工序后实体毛坯、指标、日志与关键帧
+        C-->>R: 发送结构化指标 + 多模态证据包
+        W-->>R: 提供目标、历史状态、风险与工艺上下文
+        R->>R: 审核刀路、余料、干涉、异常表面与工艺合理性
+        R->>G: 提交审核结论、证据引用与建议修正层级
+
+        alt AI 审核与硬约束均通过
+          G-->>O: 允许提交本工序
+          O->>W: 固化工序结果并推进实体毛坯状态
+          alt 全部制造目标满足
+            O-->>H: 请求最终确认并交付可追溯工艺包
+          else 尚有未完成目标
+            O->>O: 进入下一滚动窗口，可再次观察或调整后续计划
+          end
+        else 未通过
+          G-->>O: 返回失败位置、违反约束与可信证据
+          O->>O: 选择最小充分回滚：参数 → 工序 → 装夹 → 策略
+        end
+      end
+    end
+
+    opt 高风险、证据冲突或预算耗尽
+      O-->>H: 展示问题、方案、风险和证据，请求人工裁决
+      H->>O: 补充约束、批准候选或终止任务
+    end
+  end
+

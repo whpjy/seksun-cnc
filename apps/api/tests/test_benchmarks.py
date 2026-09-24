@@ -29,6 +29,21 @@ def test_discovers_all_related_2d_and_3d_case_files(tmp_path: Path) -> None:
     assert example_catalog_payload(tmp_path)["paired_case_count"] == 1
 
 
+def test_discovers_step_files_stored_directly_in_example_root(tmp_path: Path) -> None:
+    (tmp_path / "valve-a.STEP").touch()
+    (tmp_path / "valve-b.stp").touch()
+    (tmp_path / "valve-a.pdf").touch()
+
+    cases = discover_example_cases(tmp_path)
+
+    assert [item["id"] for item in cases] == ["valve-a", "valve-b"]
+    assert cases[0]["relative_directory"] == "."
+    assert cases[0]["primary_model"] == "valve-a.STEP"
+    assert cases[0]["drawing_files"] == ["valve-a.pdf"]
+    assert cases[0]["paired"] is True
+    assert cases[1]["paired"] is False
+
+
 def test_discovers_flat_dataset_from_versioned_manifest(tmp_path: Path) -> None:
     dataset = tmp_path / "liquid"
     dataset.mkdir()

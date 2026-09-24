@@ -48,6 +48,18 @@ def run_execution(
         simulation={
             "status": "completed",
             "metrics": {"removed_volume_mm3": 18.5, "remaining_volume_mm3": 81.5},
+            "operation_snapshots": [
+                {
+                    "operation_id": operation_id,
+                    "status": "completed",
+                    "sequence": index,
+                    "cut_segment_count": 1,
+                    "removed_volume_mm3": 10.0 * index,
+                    "removed_volume_delta_mm3": 10.0,
+                    "remaining_volume_mm3": 100.0 - 10.0 * index,
+                }
+                for index, operation_id in enumerate(generated_operations, 1)
+            ],
         },
         verification={"status": "passed"},
         collision={"status": "failed" if collisions else "passed", "collisions": collisions or []},
@@ -88,6 +100,11 @@ def test_execution_graph_verifies_each_operation_from_real_evidence(tmp_path: Pa
     }
     assert result["records"][0]["evidence"]["segment_count"] == 2
     assert result["records"][0]["evidence"]["cut_segment_count"] == 1
+    assert result["records"][0]["evidence"]["removed_volume_delta_mm3"] == 10.0
+    assert result["records"][0]["evidence"]["simulation_scope"] == "cumulative_after_operation"
+    assert result["records"][0]["tool_calls"][1] == {
+        "tool": "simulation.remove_material", "status": "completed",
+    }
     assert result["records"][1]["viewer"]["operation_id"] == "OP20"
     assert [stage for stage, _, _ in events].count("verify_operation") == 2
     assert events[-1][0] == "summarize_execution"
@@ -108,9 +125,23 @@ def test_execution_graph_blocks_missing_toolpath_or_collision(tmp_path: Path) ->
 
     assert result["status"] == "blocked"
     assert result["summary"]["next_action"] == "manual_review"
-    assert result["summary"]["counts"]["blocked"] == 2
+    assert result["summary"]["counts"]["blocked"] == 1
+    assert result["summary"]["skipped_operation_ids"] == ["OP20"]
     assert result["records"][0]["collisions"][0]["kind"] == "holder_stock"
-    assert result["records"][1]["evidence"]["toolpath_generated"] is False
+
+
+def test_execution_graph_stops_when_operation_has_no_real_simulation_state(tmp_path: Path) -> None:
+    result = run_execution(
+        tmp_path,
+        job_id="job-missing-toolpath",
+        operations=sample_operations(),
+        generated_operations=[],
+    )
+
+    assert result["status"] == "blocked"
+    assert result["records"][0]["evidence"]["toolpath_generated"] is False
+    assert result["records"][0]["evidence"]["simulation_status"] == "unavailable"
+    assert result["summary"]["skipped_operation_ids"] == ["OP20"]
 
 
 def test_execution_graph_routes_recoverable_defect_to_local_remediation(tmp_path: Path) -> None:

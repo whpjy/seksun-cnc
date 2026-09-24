@@ -184,6 +184,25 @@ def _cumulative_surface(
     upper = [top] * (columns * rows)
     lower = [bottom] * (columns * rows)
     cut_count = 0
+    operation_cut_counts: dict[str, int] = {}
+    operation_snapshots: list[dict[str, object]] = []
+    operation_order = {
+        operation.id: index
+        for index, operation in enumerate(
+            (
+                operation
+                for setup in plan.setups
+                for operation in setup.operations
+                if operation.enabled
+            ),
+            1,
+        )
+    }
+    last_segment_index = {
+        str(segment.get("operation_id")): index
+        for index, segment in enumerate(segments, 1)
+        if segment.get("operation_id") and segment.get("motion") == "cut"
+    }
     unsupported_tools: set[str] = set()
     unsupported_setups: set[str] = set()
     previous_cut_end: tuple[float, float, float] | None = None
@@ -223,6 +242,35 @@ def _cumulative_surface(
     supported_tools = {"face_mill", "end_mill", "drill", "ball_end_mill", "bull_end_mill"}
     segment_total = len(segments)
     progress_interval = max(1000, segment_total // 24)
+
+    # Snapshot only scalar material state.  Copying the complete height field
+    # after every operation would make dense production jobs prohibitively
+    # large, while these metrics are sufficient for the agent's execution gate.
+    cell_area = width * height / max(columns * rows, 1)
+    stock_volume = width * height * (top - bottom)
+    previous_snapshot_removed = 0.0
+
+    def capture_operation_snapshot(operation_id: str, setup_id: str) -> None:
+        nonlocal previous_snapshot_removed
+        remaining = min(
+            sum(max(0.0, upper[index] - lower[index]) * cell_area for index in range(len(upper))),
+            stock_volume,
+        )
+        removed = max(stock_volume - remaining, 0.0)
+        operation_snapshots.append({
+            "operation_id": operation_id,
+            "setup_id": setup_id,
+            "sequence": operation_order.get(operation_id),
+            "status": "completed",
+            "cut_segment_count": operation_cut_counts.get(operation_id, 0),
+            "cumulative_cut_segment_count": cut_count,
+            "removed_volume_mm3": round(removed, 2),
+            "removed_volume_delta_mm3": round(max(removed - previous_snapshot_removed, 0.0), 2),
+            "remaining_volume_mm3": round(remaining, 2),
+            "resolution_mm": round(resolution, 4),
+        })
+        previous_snapshot_removed = removed
+
     for segment_index, segment in enumerate(segments, 1):
         if progress_callback and (segment_index == 1 or segment_index % progress_interval == 0):
             progress_callback(segment_index, segment_total)
@@ -273,8 +321,11 @@ def _cumulative_surface(
                 operation.tool.kind,
             )
         cut_count += 1
+        operation_cut_counts[operation_id] = operation_cut_counts.get(operation_id, 0) + 1
         previous_cut_end = end
         previous_cut_key = cut_key
+        if segment_index == last_segment_index.get(operation_id):
+            capture_operation_snapshot(operation_id, setup_id)
     if progress_callback:
         progress_callback(segment_total, segment_total)
 
@@ -320,10 +371,60 @@ def _cumulative_surface(
 
     # Heights are samples at grid vertices.  Using resolution² for every vertex
     # over-counts the outer row and column and can hide small removal volumes.
-    cell_area = width * height / max(columns * rows, 1)
     remaining_volume = sum(max(0.0, upper[index] - lower[index]) * cell_area for index in range(len(upper)))
-    stock_volume = width * height * (top - bottom)
     remaining_volume = min(remaining_volume, stock_volume)
+    final_removed_volume = max(stock_volume - remaining_volume, 0.0)
+
+    # Closed-profile scrap is detached after its cutting move.  The height-field
+    # applies that topology change after all sweeps, so propagate the measured
+    # adjustment from the first responsible boundary operation onward.
+    boundary_operation_ids = {
+        str(boundary.get("operation_id"))
+        for boundary in boundaries
+        if boundary.get("operation_id")
+    }
+    boundary_start = min(
+        (operation_order[item] for item in boundary_operation_ids if item in operation_order),
+        default=None,
+    )
+    boundary_adjustment = max(final_removed_volume - previous_snapshot_removed, 0.0)
+    if boundary_start is not None and boundary_adjustment > 1e-9:
+        first_adjusted = True
+        for snapshot in operation_snapshots:
+            sequence = snapshot.get("sequence")
+            if not isinstance(sequence, int) or sequence < boundary_start:
+                continue
+            snapshot["removed_volume_mm3"] = round(
+                float(snapshot["removed_volume_mm3"]) + boundary_adjustment, 2,
+            )
+            snapshot["remaining_volume_mm3"] = round(
+                max(float(snapshot["remaining_volume_mm3"]) - boundary_adjustment, 0.0), 2,
+            )
+            snapshot["profile_boundary_adjustment_mm3"] = round(boundary_adjustment, 2)
+            if first_adjusted:
+                snapshot["removed_volume_delta_mm3"] = round(
+                    float(snapshot["removed_volume_delta_mm3"]) + boundary_adjustment, 2,
+                )
+                first_adjusted = False
+        snapshotted_ids = {str(item.get("operation_id")) for item in operation_snapshots}
+        for operation_id in sorted(
+            boundary_operation_ids - snapshotted_ids,
+            key=lambda item: operation_order.get(item, 10**9),
+        ):
+            operation_snapshots.append({
+                "operation_id": operation_id,
+                "setup_id": operation_setup.get(operation_id, ""),
+                "sequence": operation_order.get(operation_id),
+                "status": "completed",
+                "cut_segment_count": 0,
+                "cumulative_cut_segment_count": cut_count,
+                "removed_volume_mm3": round(final_removed_volume, 2),
+                "removed_volume_delta_mm3": round(boundary_adjustment, 2),
+                "remaining_volume_mm3": round(remaining_volume, 2),
+                "resolution_mm": round(resolution, 4),
+                "profile_boundary_adjustment_mm3": round(boundary_adjustment, 2),
+            })
+        operation_snapshots.sort(key=lambda item: int(item.get("sequence") or 10**9))
     return {
         "setup_id": "CUMULATIVE",
         "is_cumulative": True,
@@ -336,11 +437,12 @@ def _cumulative_surface(
         "heights": [round(value, 3) for value in upper],
         "lower_heights": [round(value, 3) for value in lower],
         "cut_segment_count": cut_count,
-        "removed_volume_mm3": round(max(stock_volume - remaining_volume, 0), 2),
+        "removed_volume_mm3": round(final_removed_volume, 2),
         "remaining_volume_mm3": round(remaining_volume, 2),
         "stock_volume_mm3": round(stock_volume, 2),
         "unsupported_tools": sorted(unsupported_tools),
         "unsupported_setups": sorted(item for item in unsupported_setups if item),
+        "operation_snapshots": operation_snapshots,
     }
 
 
@@ -434,5 +536,7 @@ def simulate_material_removal(
         "schema_version": "1.0.0", "engine": "Seksun CNC cumulative double-sided height-field simulator",
         "status": "completed" if cut_count else "warning", "method": "cumulative_double_sided_height_field",
         "metrics": {"initial_stock_volume_mm3": round(stock_volume, 2), "removed_volume_mm3": round(removed_volume, 2), "remaining_volume_mm3": round(max(stock_volume - removed_volume, 0), 2), "removed_percent": round(removed_volume / stock_volume * 100, 2) if stock_volume else 0, "cut_segment_count": cut_count, "resolution_mm": float(cumulative["resolution_mm"]), "requested_grid_size": maximum_grid_size, "effective_grid_size": effective_grid_size},
-        "surface": cumulative, "setup_surfaces": setup_surfaces, "warnings": warnings,
+        "surface": cumulative,
+        "operation_snapshots": cumulative.get("operation_snapshots", []),
+        "setup_surfaces": setup_surfaces, "warnings": warnings,
     }

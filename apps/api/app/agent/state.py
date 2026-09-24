@@ -22,6 +22,12 @@ class ProcessPlanningState(TypedDict, total=False):
     guidance: dict[str, Any]
     candidate_plan: dict[str, Any]
     evaluation: dict[str, Any]
+    operation_queue: list[dict[str, Any]]
+    operation_cursor: int
+    operation_records: list[dict[str, Any]]
+    operation_audit: dict[str, Any]
+    operation_audit_history: list[dict[str, Any]]
+    planning_iteration: int
     status: Literal["reviewing", "candidate_ready", "fallback", "eligible", "blocked"]
     error: str
 
@@ -58,3 +64,19 @@ class ValidationRemediationState(TypedDict, total=False):
     outcome: Literal["passed", "blocked", "max_iterations", "manual_review"]
     summary: dict[str, Any]
     status: Literal["running", "passed", "blocked", "waiting"]
+
+
+class ManufacturingOrchestratorState(TypedDict, total=False):
+    job_id: str
+    mode: Literal["disabled", "shadow", "active"]
+    world: dict[str, Any]
+    action: Literal[
+        "perceive", "plan", "compile", "execute", "review", "commit",
+        "repair", "human_review", "complete",
+    ]
+    status: Literal["running", "waiting", "completed", "blocked"]
+    halt: bool
+    step_count: int
+    max_steps: int
+    trace: list[dict[str, Any]]
+    error: str
