@@ -106,6 +106,57 @@ def test_start_job_accepts_step_without_drawing(tmp_path, monkeypatch) -> None:
     assert not (directory / "drawing.pdf").exists()
 
 
+def test_planning_waits_for_archived_cam_validation_before_completion(tmp_path, monkeypatch) -> None:
+    from app.agent import config as agent_config
+
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    monkeypatch.setattr(agent_config, "load_agent_settings", lambda: agent_config.AgentSettings(mode="disabled"))
+    monkeypatch.setattr(main, "persist_rotational_analysis", lambda *_args: None)
+    monkeypatch.setattr(main, "resolve_executable", lambda _command: "/usr/bin/FreeCADCmd")
+    monkeypatch.setattr(main, "review_process_plan", lambda *_args, **_kwargs: (_ for _ in ()).throw(main.QwenPlanningError("offline")))
+    analysis = GeometryAnalysis.model_validate({
+        "schema_version": "0.5.0", "source_file": "part.step",
+        "topology": {"solids": 1, "faces": 6, "edges": 12},
+        "measurements": {"volume": 100, "surface_area": 160, "bounding_box": {
+            "minimum": {"x": 0, "y": 0, "z": 0},
+            "maximum": {"x": 10, "y": 10, "z": 10},
+            "size": {"x": 10, "y": 10, "z": 10},
+        }},
+        "planar_features": [{"id": "PF-1", "area": 100, "center": {"x": 5, "y": 5, "z": 10}, "normal": {"x": 0, "y": 0, "z": 1}}],
+        "cylindrical_features": [], "prismatic_features": [],
+    })
+    monkeypatch.setattr(main, "run_geometry_analyzer", lambda *_args: analysis)
+    plan = main.build_process_plan(analysis, "6061-T6", "VMC")
+    plan.automation_status = "ready"
+    monkeypatch.setattr(main, "build_process_plan", lambda *_args, **_kwargs: plan.model_copy(deep=True))
+    job_id = "c" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    (directory / "part.step").write_text("STEP", encoding="utf-8")
+    main.save_job(directory, JobResponse(
+        id=job_id, status="processing", filename="part.step", created_at=main.utc_now(),
+        material="6061-T6", machine="VMC",
+    ))
+    observed_status = []
+
+    def fake_cam(_job_id, progress_callback=None):
+        observed_status.append(main.load_job(_job_id).status)
+        for filename in ("toolpath.json", "simulation.json", "verification.json", "collision.json"):
+            main.write_json(directory / filename, {})
+        progress_callback({"stage": "completed", "message": "CAM complete", "percent": 100})
+        return {"verification": {"status": "passed"}, "collision": {"status": "passed"}}
+
+    monkeypatch.setattr(main, "_create_cam_with_agent_loop", fake_cam)
+    events = []
+    result = main._process_new_job(job_id, ai_assisted=True, progress_callback=lambda stage, message, percent, **details: events.append((stage, details)))
+
+    assert observed_status == ["processing"]
+    assert result.status == "completed"
+    assert (directory / "simulation.json").is_file()
+    assert any(stage == "cam_validation" and details.get("agent_status") == "completed" for stage, details in events)
+    assert events[-1][0] == "completed"
+
+
 def test_device_names_resolve_to_matching_machine_profiles() -> None:
     assert main.resolve_machine("SEKSUN FreeCAD CAM 标准虚拟设备").id == "vmc-850"
     l32 = main.resolve_machine("Citizen Cincom L32")
@@ -958,3 +1009,10 @@ def test_cam_without_approval_returns_artifact_links(tmp_path, monkeypatch) -> N
     assert restored.json()["simulation"] == payload["simulation"]
     assert restored.json()["remediation"] is not None
     assert (directory / "remediation.json").is_file()
+    assert (directory / "cam-manifest.json").is_file()
+
+    changed_job = main.load_job(job_id)
+    changed_job.plan.assumptions.append("Test plan changed after CAM generation")
+    main.save_job(directory, changed_job)
+    stale_response = client.get(f"/api/v1/jobs/{job_id}/cam")
+    assert stale_response.status_code == 409

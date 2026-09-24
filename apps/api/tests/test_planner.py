@@ -1,7 +1,7 @@
 import pytest
 
 from app.models import Bounds, GeometryAnalysis, InternalProfileFeature, PrismaticFeature, Vec3
-from app.planner import _extent_along_axis, build_process_plan
+from app.planner import _extent_along_axis, _tool_for_facing, build_process_plan
 from app.recognizer import normalize_manufacturing_features
 
 
@@ -12,6 +12,15 @@ def test_setup_thickness_uses_active_tool_axis() -> None:
     )
     assert _extent_along_axis(bounds, (0, 1, 0)) == 7.8
     assert _extent_along_axis(bounds, (0, 0, -1)) == 118.5
+
+
+def test_facing_tool_tracks_transverse_size_and_setup_axis() -> None:
+    bounds = Bounds(
+        minimum=Vec3(x=0, y=0, z=0), maximum=Vec3(x=30, y=20, z=8),
+        size=Vec3(x=30, y=20, z=8),
+    )
+    assert _tool_for_facing(bounds, (0, 0, -1)).id == "EM-10"
+    assert _tool_for_facing(bounds, (1, 0, 0)).id == "EM-4"
 
 
 def sample_analysis() -> GeometryAnalysis:

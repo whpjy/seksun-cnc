@@ -94,6 +94,10 @@ BENCHMARK_REPORT_PATH = Path(os.getenv(
 CAM_STREAM_LOCK = threading.Lock()
 CAM_STREAMING_JOBS: set[str] = set()
 AI_REVIEW_LOCK = threading.Lock()
+AGENT_PERCEPTION_LOCK = threading.Lock()
+AGENT_PERCEIVING_JOBS: set[str] = set()
+AGENT_TRIAL_LOCK = threading.Lock()
+AGENT_TRIALING_JOBS: set[str] = set()
 L32_MATERIAL_SNAPSHOT_LOCK = threading.Lock()
 AI_REVIEWING_JOBS: set[str] = set()
 JOB_EVENT_CONDITION = threading.Condition()
@@ -319,11 +323,33 @@ def save_job(directory: Path, job: JobResponse) -> None:
     write_json(directory / "job.json", job.model_dump(mode="json"))
 
 
+def cam_plan_fingerprint(job: JobResponse) -> str:
+    """Bind archived CAM evidence to the exact plan and model selection."""
+    payload = {
+        "plan": job.plan.model_dump(mode="json") if job.plan else None,
+        "material": job.material,
+        "machine": job.machine,
+        "device_id": job.device_id,
+        "machine_configuration_hash": job.machine_configuration_hash,
+        "selected_solid_index": job.analysis.topology.get("selected_solid_index") if job.analysis else None,
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def archive_cam_plan_fingerprint(directory: Path, job: JobResponse) -> None:
+    write_json(directory / "cam-manifest.json", {
+        "schema_version": "1.0.0",
+        "plan_sha256": cam_plan_fingerprint(job),
+        "created_at": utc_now(),
+    })
+
+
 def invalidate_cam_artifacts(directory: Path) -> None:
     for filename in (
         "cam.FCStd", "program.nc", "toolpath.json", "verification.json",
-        "simulation.json", "collision.json", "remediation.json", "remediation-history.json", "ai-plan.json",
+        "simulation.json", "collision.json", "remediation.json", "remediation-history.json", "ai-plan.json", "cam-manifest.json",
         "agent-execution.json", "agent-remediation.json",
+        "agent-operation-trial.json",
         "agent-world-model.json", "agent-orchestrator.json",
         "turning-toolpath-ir.json", "turning-simulation.json", "turning-verification.json", "turning-thread-verification.json", "turning-reachability.json", "turning-draft.json",
         "turning-transfer-ir.json", "turning-transfer-draft.json",
@@ -2138,7 +2164,9 @@ def _process_new_job(
             ],
         )
 
-        job.status = "completed"
+        # Keep the planning stream open until the supported CAM/stock validation
+        # finishes. A plan is not the same thing as a verified simulation.
+        job.status = "processing" if ai_assisted else "completed"
         job.analysis = analysis
         job.plan = plan
         provision_default_l32_planning_instance(job, directory)
@@ -2154,6 +2182,7 @@ def _process_new_job(
             machine=job.machine,
             filename=job.filename,
             model_url=job.model_url,
+            require_initial_perception=True,
         )
         from .agent.config import load_agent_settings as load_world_agent_settings
         from .agent.orchestrator import OrchestratorTools, run_manufacturing_orchestrator
@@ -2184,9 +2213,70 @@ def _process_new_job(
             })
         write_json(directory / "agent-world-model.json", world.model_dump(mode="json"))
         save_job(directory, job)
+        cam_validation_outcome = "not_requested"
+        if ai_assisted:
+            if plan.process_kind == "subtractive" and job.device_id != "citizen-cincom-l32" and plan.automation_status != "unsupported" and resolve_executable(FREECAD_CMD):
+                report(
+                    "cam_validation", "工艺草案已保存，正在生成真实刀路并验证累计余料", 97,
+                    agent_kind="tool_call", agent_status="running", agent_title="逐工序刀路与仿真",
+                )
+
+                def report_cam(event: dict[str, object]) -> None:
+                    stage = str(event.get("stage", "cam"))
+                    operation_id = event.get("operation_id")
+                    report(
+                        "cam_validation", str(event.get("message", "正在验证刀路与材料状态")),
+                        min(99, 97 + float(event.get("percent", 0) or 0) * 0.02),
+                        agent_kind="validation" if stage == "completed" else "tool_result" if stage in {"simulation", "collision", "preflight"} else "tool_call",
+                        agent_status="completed" if stage == "completed" else "running",
+                        agent_title="逐工序刀路与仿真", agent_node=stage,
+                        operation_id=operation_id,
+                        viewer={"kind": "operation", "operation_id": operation_id, "mode": "仿真"} if operation_id else {"kind": "model", "url": job.model_url},
+                        current=event.get("current"), total=event.get("total"),
+                    )
+
+                try:
+                    cam_validation = _create_cam_with_agent_loop(job_id, progress_callback=report_cam)
+                    execution_status = (cam_validation.get("agent_execution") or {}).get("status")
+                    cam_validation_outcome = (
+                        "failed" if cam_validation["verification"]["status"] == "failed" or cam_validation["collision"]["status"] == "failed" or execution_status == "blocked"
+                        else "warning" if cam_validation["verification"]["status"] == "warning" or execution_status == "action_required"
+                        else "passed"
+                    )
+                    report(
+                        "cam_validation", "刀路与仿真证据已归档；部分检查未通过，请复核" if cam_validation_outcome == "failed" else "刀路、累计余料与校验结果已归档；请检查各工序结论", 99,
+                        agent_kind="validation", agent_status="blocked" if cam_validation_outcome == "failed" else "completed", agent_title="仿真证据已归档",
+                        evidence=[{"label": "验证", "value": cam_validation["verification"]["status"]}, {"label": "碰撞", "value": cam_validation["collision"]["status"]}],
+                        artifacts=[
+                            {"id": "toolpath", "label": "刀路", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/toolpath.json"},
+                            {"id": "simulation", "label": "材料仿真", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/simulation.json"},
+                            {"id": "verification", "label": "验证结论", "kind": "json", "url": f"/api/v1/jobs/{job_id}/files/verification.json"},
+                        ],
+                    )
+                except Exception as cam_error:
+                    cam_validation_outcome = "failed"
+                    for partial_name in ("toolpath.json", "simulation.json", "verification.json", "collision.json", "cam-manifest.json"):
+                        (directory / partial_name).unlink(missing_ok=True)
+                    report(
+                        "cam_validation", f"刀路或仿真未完成：{cam_error}", 99,
+                        agent_kind="error", agent_status="failed", agent_title="仿真需要人工复核",
+                        evidence=[{"label": "原因", "value": str(cam_error)[:500]}],
+                    )
+            else:
+                cam_validation_outcome = "unavailable"
+                report(
+                    "cam_validation", "当前工艺或运行环境不支持自动仿真，已保留待验证状态", 99,
+                    agent_kind="warning", agent_status="waiting", agent_title="仿真待验证",
+                )
+            # CAM/remediation may have updated the plan. Do not overwrite it with
+            # the pre-validation in-memory JobResponse.
+            job = load_job(job_id)
+            job.status = "completed"
+            save_job(directory, job)
         report(
-            "completed", "工艺方案已生成", 100,
+            "completed", "工艺方案已生成，仿真未通过或未完成，请复核" if cam_validation_outcome == "failed" else "工艺方案已生成，仿真待验证" if cam_validation_outcome == "unavailable" else "工艺方案与仿真证据已生成" if cam_validation_outcome in {"passed", "warning"} else "工艺方案已生成", 100,
             agent_kind="result", agent_status="completed",
+            validation_outcome=cam_validation_outcome,
             setup_count=len(plan.setups), operation_count=operation_count,
             coverage_score=plan.coverage.score if plan.coverage else None,
             artifacts=[
@@ -2386,6 +2476,7 @@ def get_job_agent_workspace(job_id: str) -> dict[str, object]:
             machine=job.machine,
             filename=job.filename,
             model_url=job.model_url,
+            require_initial_perception=True,
         )
         workspace_agent_settings = load_workspace_agent_settings()
         if workspace_agent_settings.enabled:
@@ -2412,6 +2503,175 @@ def get_job_agent_workspace(job_id: str) -> dict[str, object]:
         directory=directory,
         events=events,
     )
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/perceive")
+def perceive_job_model(job_id: str) -> dict[str, object]:
+    """Run one evidence-backed perception question, then persist the graph state."""
+    job = load_job(job_id)
+    if job.status != "completed" or not job.analysis or not job.plan:
+        raise HTTPException(status_code=409, detail="A completed geometry analysis and plan are required")
+    directory = job_directory(job_id)
+    from .agent.world_model import ManufacturingWorldModel, OpenQuestion, load_world_model
+    world_path = directory / "agent-world-model.json"
+    world = load_world_model(world_path)
+    if world is None:
+        get_job_agent_workspace(job_id)
+        world = load_world_model(world_path)
+    if world is None:
+        raise HTTPException(status_code=409, detail="Manufacturing world model is unavailable")
+    if not any(item.status == "open" and item.blocking for item in world.open_questions):
+        if not world.current_operation_id:
+            raise HTTPException(status_code=409, detail="No operation needs perception")
+        operation = next((item for item in world.operations if item.id == world.current_operation_id), None)
+        world.open_questions.append(OpenQuestion(
+            id=f"operation:{world.current_operation_id}:perception:{world.revision}",
+            question=f"当前模型几何与装夹证据是否支持 {world.current_operation_id} {operation.name if operation else ''}？",
+            reason="工序执行前按需核对几何与可达性",
+            priority="high",
+            blocking=True,
+        ))
+        world.next_action = "perceive"
+    with AGENT_PERCEPTION_LOCK:
+        if job_id in AGENT_PERCEIVING_JOBS:
+            raise HTTPException(status_code=409, detail="Multimodal perception is already running for this job")
+        AGENT_PERCEIVING_JOBS.add(job_id)
+    try:
+        from .agent.config import load_agent_settings
+        from .agent.orchestrator import OrchestratorTools, run_manufacturing_orchestrator
+        from .agent.perception import build_perception_tool
+        settings = load_agent_settings()
+        if not settings.enabled:
+            raise HTTPException(status_code=409, detail="Manufacturing agent is disabled")
+        if not qwen_config_payload().get("configured"):
+            raise HTTPException(status_code=503, detail="Qwen API key is not configured")
+        result = run_manufacturing_orchestrator(
+            world=world,
+            settings=settings,
+            tools=OrchestratorTools(perceive=build_perception_tool(directory)),
+            max_steps=8,
+        )
+        updated = ManufacturingWorldModel.model_validate(result["world"])
+        if result.get("status") == "blocked" and result.get("error"):
+            raise HTTPException(status_code=502, detail=str(result["error"]))
+        write_json(world_path, updated.model_dump(mode="json"))
+        write_json(directory / "agent-orchestrator.json", {
+            "schema_version": "1.0.0", "job_id": job_id,
+            "status": result.get("status"), "next_action": updated.next_action,
+            "trace": result.get("trace", []),
+        })
+        publish_job_event(
+            job_id, "orchestrator_perceive",
+            "多模态模型观察完成" if not any(q.status == "open" and q.blocking for q in updated.open_questions)
+            else "多模态模型观察完成，仍有待确认问题",
+            100,
+            agent_kind="tool_result", agent_status="completed",
+            agent_title="按需几何感知",
+            evidence=[{"label": "证据图", "value": "agent-perception-contact-sheet.png"}],
+        )
+        return build_agent_workspace(
+            job_id=job_id, job_status=job.status, directory=directory,
+            events=load_job_events(job_id),
+        )
+    finally:
+        with AGENT_PERCEPTION_LOCK:
+            AGENT_PERCEIVING_JOBS.discard(job_id)
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/trial")
+def trial_first_operation(job_id: str) -> dict[str, object]:
+    """Run the first operation in isolation; never publish its NC as production code."""
+    job = load_job(job_id)
+    if job.status != "completed" or not job.analysis or not job.plan:
+        raise HTTPException(status_code=409, detail="需要已完成的模型分析与工艺方案")
+    if job.plan.process_kind != "subtractive" or job.device_id == "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="当前试跑仅支持 FreeCAD 减材工序，L32 请使用专用车削工作台")
+    if job.plan.automation_status == "unsupported":
+        raise HTTPException(status_code=409, detail="工艺方案已被判定超出自动 CAM 能力，不能试跑")
+    first = next((operation for setup in job.plan.setups for operation in setup.operations if operation.enabled), None)
+    if first is None:
+        raise HTTPException(status_code=409, detail="没有可试跑的工序")
+    if not resolve_executable(FREECAD_CMD):
+        raise HTTPException(status_code=503, detail="FreeCAD CAM 运行环境不可用")
+    from .agent.config import load_agent_settings
+    from .agent.world_model import EvidenceReference, load_world_model, utc_now as world_utc_now
+    from .agent.operation_trial import run_operation_trial
+
+    if not load_agent_settings().enabled:
+        raise HTTPException(status_code=409, detail="制造智能体未启用")
+    directory = job_directory(job_id)
+    world_path = directory / "agent-world-model.json"
+    world = load_world_model(world_path)
+    if world is None:
+        get_job_agent_workspace(job_id)
+        world = load_world_model(world_path)
+    questions = [item.question for item in world.open_questions if item.status == "open" and item.blocking] if world else []
+    with AGENT_TRIAL_LOCK:
+        if job_id in AGENT_TRIALING_JOBS:
+            raise HTTPException(status_code=409, detail="当前任务已有工序试跑在执行")
+        AGENT_TRIALING_JOBS.add(job_id)
+    publish_job_event(job_id, "operation_trial", f"正在独立生成 {first.id} 的刀路与余料仿真", 5,
+                      agent_kind="tool_call", agent_status="running", agent_title="首道工序试跑")
+    try:
+        result = run_operation_trial(
+            directory=directory, source_filename=job.filename, analysis=job.analysis,
+            plan=job.plan, operation_id=first.id, freecad_command=FREECAD_CMD,
+            adapter_script=CAM_ADAPTER_SCRIPT, open_questions=questions,
+        )
+        result["files"] = {name: url.replace("{job_id}", job_id) for name, url in result["files"].items()}
+        write_json(directory / "agent-operation-trial.json", result)
+        write_json(directory / "agent-trials" / result["trial_id"] / "result.json", result)
+        if world is not None:
+            trial_evidence_id = f"trial:{result['trial_id']}"
+            world.evidence.append(EvidenceReference(
+                id=trial_evidence_id, kind="simulation", source="agent-operation-trial.json",
+                summary=f"{first.id} 独立刀路及高度场试跑：{result['status']}（非生产验证）",
+                operation_id=first.id,
+            ))
+            operation = next((item for item in world.operations if item.id == first.id), None)
+            if operation is not None:
+                operation.evidence_ids.append(trial_evidence_id)
+            world.decisions.append({
+                "at": world_utc_now(), "kind": "single_operation_trial",
+                "operation_id": first.id, "trial_id": result["trial_id"],
+                "status": result["status"], "production_ready": False,
+            })
+            world.revision += 1
+            world.updated_at = world_utc_now()
+            write_json(world_path, world.model_dump(mode="json"))
+        publish_job_event(
+            job_id, "operation_trial", f"{first.id} 独立试跑完成：{result['status']}", 100,
+            agent_kind="validation", agent_status="failed" if result["status"] == "blocked" else "completed",
+            agent_title="首道工序试跑",
+            evidence=[
+                {"label": "状态", "value": result["status"]},
+                {"label": "切削段", "value": result["evidence"]["cut_segment_count"]},
+                {"label": "未决装夹问题", "value": len(questions)},
+            ],
+            artifacts=[{"id": "agent-operation-trial", "label": "首道工序试跑证据", "kind": "json",
+                        "url": f"/api/v1/jobs/{job_id}/files/agent-operation-trial.json"}],
+        )
+        return result
+    except (RuntimeError, ValueError, OSError) as error:
+        publish_job_event(job_id, "operation_trial", str(error), 100,
+                          agent_kind="error", agent_status="failed", agent_title="首道工序试跑")
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    finally:
+        with AGENT_TRIAL_LOCK:
+            AGENT_TRIALING_JOBS.discard(job_id)
+
+
+@app.get("/api/v1/jobs/{job_id}/agent/trials/{trial_id}/{filename}")
+def get_operation_trial_file(job_id: str, trial_id: str, filename: str) -> FileResponse:
+    load_job(job_id)
+    if not trial_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in trial_id):
+        raise HTTPException(status_code=404, detail="试跑文件不存在")
+    if filename not in {"result.json", "plan.json", "toolpath.json", "verification.json", "simulation.json", "collision.json", "remaining-stock.png"}:
+        raise HTTPException(status_code=404, detail="试跑文件不存在；试跑 NC 不对外发布")
+    path = job_directory(job_id) / "agent-trials" / trial_id / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="试跑文件不存在")
+    return FileResponse(path)
 
 
 @app.get("/api/v1/jobs/{job_id}", response_model=JobResponse)
@@ -3585,8 +3845,10 @@ def get_job_file(job_id: str, filename: str) -> FileResponse:
         "manufacturing-specification.json", "manufacturing-requirements.json", "measurement-link.json",
         "planning-guidance.json", "agent-plan.json", "agent-evaluation.json", "operation-audit.json",
         "agent-execution.json", "agent-world-model.json", "agent-orchestrator.json",
+        "agent-perception.json", "agent-perception-contact-sheet.png", "agent-operation-trial.json",
+        "agent-view-isometric.png", "agent-view-front.png", "agent-view-right.png", "agent-view-top.png",
         "agent-remediation.json",
-        "ai-plan.json", "cam.FCStd", "program.nc", "toolpath.json", "verification.json",
+        "ai-plan.json", "cam.FCStd", "program.nc", "toolpath.json", "cam-manifest.json", "verification.json",
         "simulation.json", "collision.json", "remediation.json", "remediation-history.json",
         "turning-toolpath-ir.json", "turning-simulation.json", "turning-verification.json", "turning-reachability.json", "turning-draft.json",
         "turning-transfer-ir.json", "turning-transfer-draft.json",
@@ -3599,7 +3861,8 @@ def get_job_file(job_id: str, filename: str) -> FileResponse:
         Path(filename).name == filename
         and ((filename.startswith("program-") and filename.endswith(".nc"))
              or (filename.startswith("camotics-") and filename.endswith(".stl"))
-             or (filename.startswith("l32-material-") and filename.endswith(".stl")))
+             or (filename.startswith("l32-material-") and filename.endswith(".stl"))
+             or (filename.startswith("agent-perception-") and filename.endswith(".json")))
     )
     if filename not in allowed and not generated_artifact:
         raise HTTPException(status_code=404, detail="File not found")
@@ -3622,6 +3885,7 @@ def get_job_file(job_id: str, filename: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="File not found")
     media_types = {
         ".stl": "model/stl",
+        ".png": "image/png",
         ".json": "application/json",
         ".nc": "text/plain",
         ".FCStd": "application/octet-stream",
@@ -3936,6 +4200,11 @@ def get_cam_artifact(job_id: str) -> dict[str, object]:
     }
     if not all(path.is_file() for path in paths.values()):
         raise HTTPException(status_code=404, detail="CAM artifacts are not available for this job")
+    manifest_path = directory / "cam-manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("plan_sha256") != cam_plan_fingerprint(load_job(job_id)):
+            raise HTTPException(status_code=409, detail="CAM artifacts belong to an older process plan")
     result = json.loads(paths["result"].read_text(encoding="utf-8"))
     verification = json.loads(paths["verification"].read_text(encoding="utf-8"))
     simulation = json.loads(paths["simulation"].read_text(encoding="utf-8"))
@@ -4038,6 +4307,8 @@ def _run_operation_execution_agent(
 ) -> dict[str, object] | None:
     from .agent.config import load_agent_settings
     from .agent.execution_graph import run_operation_execution_subgraph
+    from .agent.operation_review import review_operation_evidence
+    from .qwen import load_qwen_settings
 
     settings = load_agent_settings()
     if not settings.enabled or not job.plan:
@@ -4051,11 +4322,35 @@ def _run_operation_execution_agent(
         for operation in setup.operations
         if operation.enabled
     ]
+    ai_review_enabled = (
+        settings.writes_production_results
+        and isinstance(job.plan.ai_planning, dict)
+        and job.plan.ai_planning.get("planner") == "langgraph_ai_primary"
+    )
+    qwen_settings = load_qwen_settings() if ai_review_enabled else None
+    model_view = job_directory(job_id) / "agent-perception-contact-sheet.png"
+
+    def review_record(record: dict[str, object]) -> dict[str, object]:
+        return review_operation_evidence(
+            str(record["operation_id"]),
+            {
+                "operation": record.get("operation"),
+                "evidence": record.get("evidence"),
+                "defects": record.get("defects"),
+                "collisions": record.get("collisions"),
+                "low_rapids": record.get("low_rapids"),
+                "verification_status": verification.get("status"),
+                "stock": job.plan.stock.model_dump(mode="json") if hasattr(job.plan.stock, "model_dump") else job.plan.stock,
+                "geometry_measurements": job.analysis.measurements if job.analysis else None,
+            },
+            model_view=model_view if model_view.is_file() else None,
+            settings=qwen_settings,
+        )
 
     def report(stage: str, message: str, **details: object) -> None:
         operation_id = details.get("operation_id")
         feature_ids = details.get("feature_ids")
-        terminal = stage in {"verify_operation", "summarize_execution"}
+        terminal = stage in {"review_operation", "summarize_execution"}
         viewer: dict[str, object] | None = None
         if operation_id:
             viewer = {
@@ -4094,11 +4389,13 @@ def _run_operation_execution_agent(
         remediation=remediation,
         settings=settings,
         progress_callback=report,
+        review_callback=review_record if ai_review_enabled else None,
     )
     payload = {
         "schema_version": "1.0.0",
         "job_id": job_id,
         "mode": settings.mode,
+        "review_mode": "multimodal_ai" if ai_review_enabled and model_view.is_file() else "structured_ai" if ai_review_enabled else "deterministic_rules",
         "status": trace.get("status"),
         "summary": trace.get("summary", {}),
         "records": trace.get("records", []),
@@ -4221,6 +4518,7 @@ def _create_cam_artifact(
         )
         save_job(directory, job)
         write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+        archive_cam_plan_fingerprint(directory, job)
         report(
             "completed", "薄板成形工序与分阶段仿真已生成", 100,
             generated=len(operations), verification=verification["status"], collision=collision["status"],
@@ -4459,6 +4757,7 @@ def _create_cam_artifact(
         job.plan.estimated_minutes = float(verified_minutes)
     save_job(directory, job)
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+    archive_cam_plan_fingerprint(directory, job)
     response = cam_response(
         job_id, result, verification, simulation, collision, remediation,
         stdout=completed.stdout[-1000:],
@@ -4662,14 +4961,17 @@ def _create_cam_with_agent_loop(
         return _run_cam_remediation_loop(job_id, progress_callback=progress_callback)
 
     if progress_callback:
-        progress_callback(terminal_event or {
-            "stage": "completed",
-            "message": "CAM 刀路、逐工序材料状态与安全验证已完成",
-            "percent": 100,
+        execution_status = (result.get("agent_execution") or {}).get("status")
+        remediation_status = remediation.get("status") if isinstance(remediation, dict) else None
+        review_required = execution_status in {"blocked", "action_required"} or remediation_status in {"blocked", "action_required"}
+        progress_callback({
+            **(terminal_event or {"stage": "completed", "percent": 100}),
+            "message": "逐工序审核未通过，需要复核" if review_required else "CAM 刀路、逐工序材料状态与安全验证已归档",
             "agent_outcome": (
-                "manual_review" if isinstance(remediation, dict) and remediation.get("status") == "blocked"
-                else "passed"
+                "manual_review" if execution_status == "blocked" or remediation_status == "blocked"
+                else "engineering_review" if execution_status == "action_required" or remediation_status == "action_required" else "passed"
             ),
+            "execution_status": execution_status,
         })
     return result
 

@@ -12,6 +12,7 @@ from .state import OperationExecutionState
 
 
 ProgressCallback = Callable[..., None]
+ReviewCallback = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 def _operation_defects(remediation: dict[str, Any], operation_id: str) -> list[dict[str, Any]]:
@@ -33,6 +34,7 @@ def build_operation_execution_subgraph(
     checkpointer: BaseCheckpointSaver,
     *,
     progress_callback: ProgressCallback | None = None,
+    review_callback: ReviewCallback | None = None,
 ):
     def report(stage: str, message: str, **details: object) -> None:
         if progress_callback:
@@ -131,13 +133,18 @@ def build_operation_execution_subgraph(
         critical = any(str(item.get("severity")) == "critical" for item in defects)
         if (
             not evidence.get("toolpath_generated")
+            or int(evidence.get("cut_segment_count") or 0) <= 0
             or evidence.get("simulation_status") != "completed"
+            or int(evidence.get("simulation_cut_segment_count") or 0) <= 0
+            or evidence.get("remaining_volume_mm3") is None
             or collisions
             or low_rapids
             or critical
         ):
             status = "blocked"
         elif defects:
+            status = "action_required"
+        elif float(evidence.get("removed_volume_delta_mm3") or 0) <= 0:
             status = "action_required"
         else:
             status = "passed"
@@ -148,6 +155,7 @@ def build_operation_execution_subgraph(
         record = {
             "operation_id": operation_id,
             "operation_name": operation.get("name"),
+            "operation": operation,
             "setup_id": operation.get("setup_id"),
             "feature_ids": operation.get("feature_ids", []),
             "status": status,
@@ -175,12 +183,42 @@ def build_operation_execution_subgraph(
         )
         return {
             "records": [*state.get("records", []), record],
-            "cursor": int(state.get("cursor", 0)) + 1,
         }
+
+    def review_operation(state: OperationExecutionState) -> OperationExecutionState:
+        records = list(state.get("records", []))
+        record = dict(records[-1])
+        operation_id = str(record["operation_id"])
+        deterministic_status = str(record["status"])
+        if deterministic_status != "passed":
+            review = {"status": "skipped", "reason": "deterministic_gate_not_passed"}
+        elif review_callback is None:
+            review = {"status": "not_configured", "reason": "rules_only_review"}
+        else:
+            try:
+                review = review_callback(record)
+            except Exception as error:
+                review = {"status": "unavailable", "reason": str(error)[:500]}
+            result = review.get("review") if isinstance(review, dict) else None
+            verdict = str(result.get("verdict")) if isinstance(result, dict) else "insufficient_evidence"
+            confidence = float(result.get("confidence") or 0) if isinstance(result, dict) else 0.0
+            if verdict == "blocked":
+                record["status"] = "blocked"
+            elif verdict != "passed" or confidence < 0.65 or result.get("missing_evidence"):
+                record["status"] = "action_required"
+        record["ai_review"] = review
+        records[-1] = record
+        report(
+            "review_operation", f"{operation_id} 审核结论：{record['status']}",
+            operation_id=operation_id, operation_status=record["status"],
+            ai_verdict=(review.get("review") or {}).get("verdict") if isinstance(review, dict) else None,
+            review_status=review.get("status") if isinstance(review, dict) else "unavailable",
+        )
+        return {"records": records, "cursor": int(state.get("cursor", 0)) + 1}
 
     def route_next(state: OperationExecutionState) -> str:
         records = state.get("records", [])
-        if records and records[-1].get("status") == "blocked":
+        if records and records[-1].get("status") in {"blocked", "action_required"}:
             return "summarize"
         return "next" if int(state.get("cursor", 0)) < len(state["operations"]) else "summarize"
 
@@ -192,13 +230,15 @@ def build_operation_execution_subgraph(
         }
         remediation = state["remediation"]
         remediation_status = str(remediation.get("status", "clear"))
+        verification_status = str(state["verification"].get("status", "failed"))
+        collision_status = str(state["collision"].get("status", "failed"))
         global_defects = [
             item for item in remediation.get("defects", [])
             if isinstance(item, dict) and not item.get("operation_ids")
         ]
-        if counts["blocked"] or remediation_status == "blocked":
+        if counts["blocked"] or remediation_status == "blocked" or verification_status == "failed" or collision_status == "failed":
             status = "blocked"
-        elif counts["action_required"] or remediation_status == "action_required":
+        elif counts["action_required"] or remediation_status == "action_required" or verification_status == "warning" or collision_status == "warning" or global_defects:
             status = "action_required"
         else:
             status = "passed"
@@ -213,8 +253,8 @@ def build_operation_execution_subgraph(
                 str(item.get("id")) for item in state["operations"][len(records):]
             ],
             "counts": counts,
-            "verification_status": state["verification"].get("status"),
-            "collision_status": state["collision"].get("status"),
+            "verification_status": verification_status,
+            "collision_status": collision_status,
             "remediation_status": remediation_status,
             "global_defect_count": len(global_defects),
             "global_defect_ids": [str(item.get("id", "")) for item in global_defects],
@@ -242,14 +282,16 @@ def build_operation_execution_subgraph(
     workflow.add_node("inspect_simulation", inspect_simulation)
     workflow.add_node("inspect_collision", inspect_collision)
     workflow.add_node("verify_operation", verify_operation)
+    workflow.add_node("review_operation", review_operation)
     workflow.add_node("summarize_execution", summarize)
     workflow.add_edge(START, "select_operation")
     workflow.add_edge("select_operation", "inspect_toolpath")
     workflow.add_edge("inspect_toolpath", "inspect_simulation")
     workflow.add_edge("inspect_simulation", "inspect_collision")
     workflow.add_edge("inspect_collision", "verify_operation")
+    workflow.add_edge("verify_operation", "review_operation")
     workflow.add_conditional_edges(
-        "verify_operation", route_next,
+        "review_operation", route_next,
         {"next": "select_operation", "summarize": "summarize_execution"},
     )
     workflow.add_edge("summarize_execution", END)
@@ -267,6 +309,7 @@ def run_operation_execution_subgraph(
     remediation: dict[str, Any],
     settings: AgentSettings,
     progress_callback: ProgressCallback | None = None,
+    review_callback: ReviewCallback | None = None,
 ) -> OperationExecutionState:
     if not operations:
         return {
@@ -279,6 +322,7 @@ def run_operation_execution_subgraph(
     with open_sqlite_checkpointer(settings.checkpoint_path) as checkpointer:
         graph = build_operation_execution_subgraph(
             settings, checkpointer, progress_callback=progress_callback,
+            review_callback=review_callback,
         )
         return graph.invoke({
             "job_id": job_id,

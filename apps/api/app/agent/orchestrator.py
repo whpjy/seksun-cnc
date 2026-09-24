@@ -173,6 +173,17 @@ def build_manufacturing_orchestrator(
                 question.status = "resolved"
                 question.answer = str(result.get("answer") or "已由工具证据确认")
                 question.evidence_ids.extend(str(item) for item in result.get("evidence_ids", []))
+            for finding in result.get("findings", []) or []:
+                if isinstance(finding, dict):
+                    world.decisions.append({
+                        "at": utc_now(), "kind": "perception_finding",
+                        "question_id": question.id, **finding,
+                    })
+            for risk in result.get("risks", []) or []:
+                world.risks.append({
+                    "source": "multimodal_perception", "question_id": question.id,
+                    "description": str(risk),
+                })
         elif action == "plan":
             for payload in result.get("operations", []) or []:
                 candidate = WorldOperation.model_validate(payload)
@@ -200,6 +211,8 @@ def build_manufacturing_orchestrator(
             operation.status = "compiled" if result.get("applied", False) else "blocked"
         world.revision += 1
         world.updated_at = utc_now()
+        if result.get("halt"):
+            world.next_action = decide_next_action(world, max_attempts=settings.max_local_retries)  # type: ignore[assignment]
         world.decisions.append({
             "at": world.updated_at,
             "kind": f"orchestrator_{action}",
@@ -212,8 +225,8 @@ def build_manufacturing_orchestrator(
         )
         return {
             "world": world.model_dump(mode="json"),
-            "status": "running",
-            "halt": False,
+            "status": "waiting" if result.get("halt") else "running",
+            "halt": bool(result.get("halt")),
             "trace": _record(
                 state, action, "completed", str(result.get("summary", f"{action} 已完成")),
                 operation_id=operation.id if operation else None,

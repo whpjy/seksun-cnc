@@ -73,6 +73,7 @@ def run_freecad_adapter(
     arguments: Sequence[Path],
     timeout_seconds: int = 600,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
+    trial_mode: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     executable = resolve_executable(command)
     if not executable:
@@ -81,6 +82,7 @@ def run_freecad_adapter(
         **os.environ,
         "QT_QPA_PLATFORM": "offscreen",
         "CNC_CAM_ARGUMENTS_JSON": json.dumps([str(argument) for argument in arguments]),
+        "CNC_CAM_TRIAL_MODE": "1" if trial_mode else "0",
     }
     script = str(adapter_script)
     python_command = f"exec(compile(open({script!r}, encoding='utf-8').read(), {script!r}, 'exec'))"

@@ -53,6 +53,19 @@ def _tool_for_prismatic(width: float) -> Tool:
     return Tool(id=f"EM-{diameter}", name=f"Ø{diameter} 平底立铣刀", kind="end_mill", diameter_mm=diameter)
 
 
+def _tool_for_facing(bounds, axis_key: tuple[int, int, int]) -> Tool:
+    transverse = [
+        span for span, component in zip((bounds.size.x, bounds.size.y, bounds.size.z), axis_key)
+        if component == 0
+    ]
+    narrow_span = min(transverse)
+    if narrow_span >= 75:
+        return Tool(id="FM-50", name="Ø50 面铣刀", kind="face_mill", diameter_mm=50)
+    candidates = (1, 2, 3, 4, 6, 8, 10, 12, 16)
+    diameter = max((value for value in candidates if value <= narrow_span * 0.5), default=1)
+    return Tool(id=f"EM-{diameter}", name=f"Ø{diameter} 平底立铣刀", kind="end_mill", diameter_mm=diameter)
+
+
 def _surface_operations(sequence: int, axis_key: tuple[int, int, int], nonplanar_faces: int) -> tuple[int, list[Operation]]:
     """Plan roughing plus shallow- and steep-surface finishing for one side."""
     # OCL cost rises sharply with both face count and sampling density.  Dense
@@ -433,7 +446,7 @@ def build_process_plan(
                     type="face_milling",
                     name="建立装夹基准面" if setup_index == 1 else "复核并精加工定位面",
                     feature_ids=[datum.id] if datum else [],
-                    tool=Tool(id="FM-50", name="Ø50 面铣刀", kind="face_mill", diameter_mm=50),
+                    tool=_tool_for_facing(bounds, axis_key),
                     parameters={"stock_allowance_mm": 0.2, "step_down_mm": 0.5},
                     rationale=[f"选择与 {_axis_label(axis_key)} 加工方向平行的最大平面作为定位候选"],
                     confidence=0.9 if datum else 0.5,

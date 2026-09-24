@@ -153,6 +153,12 @@ def test_orchestrator_repairs_failed_review_at_smallest_scope(tmp_path: Path) ->
 def test_execution_trace_updates_material_state_and_next_action() -> None:
     updated = apply_execution_trace(sample_world(), {
         "status": "passed",
+        "summary": {
+            "verification_status": "passed",
+            "collision_status": "passed",
+            "remediation_status": "passed",
+            "global_defect_count": 0,
+        },
         "records": [{
             "operation_id": "OP10",
             "status": "passed",
@@ -171,6 +177,33 @@ def test_execution_trace_updates_material_state_and_next_action() -> None:
     assert updated.lifecycle == "completed"
     assert updated.next_action == "complete"
     assert updated.stop_conditions["all_operations_committed"] is True
+
+
+def test_world_model_holds_local_pass_when_global_verification_fails() -> None:
+    updated = apply_execution_trace(sample_world(), {
+        "status": "blocked",
+        "summary": {
+            "verification_status": "failed",
+            "collision_status": "passed",
+            "remediation_status": "passed",
+            "global_defect_count": 0,
+        },
+        "records": [{
+            "operation_id": "OP10",
+            "status": "passed",
+            "evidence": {
+                "toolpath_generated": True,
+                "simulation_status": "completed",
+                "remaining_volume_mm3": 82.5,
+            },
+        }],
+    })
+
+    assert updated.operations[0].status == "verified"
+    assert updated.lifecycle == "waiting_human"
+    assert updated.next_action == "human_review"
+    assert len(updated.material_states) == 1
+    assert updated.stop_conditions["all_operations_committed"] is False
 
 
 def test_workspace_exposes_world_summary_and_artifact(tmp_path: Path) -> None:

@@ -17,6 +17,7 @@ STAGE_METADATA: dict[str, tuple[str, str, str]] = {
     "ai_integration": ("process_planning", "integrate_ai_guidance", "融合规划建议"),
     "process_generation": ("process_planning", "compile_process_plan", "生成工艺方案"),
     "coverage_validation": ("validation", "validate_process_coverage", "确定性校验"),
+    "cam_validation": ("operation_execution", "generate_and_validate_cam", "刀路与仿真验证"),
     "operation_execution": ("operation_execution", "verify_operation", "逐工序执行与验证"),
     "validation_remediation": ("validation_remediation", "attribute_defect", "验证与纠错"),
     "completed": ("delivery", "finalize_plan", "规划完成"),

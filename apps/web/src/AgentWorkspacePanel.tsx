@@ -27,6 +27,13 @@ type Props = {
   apiUrl: (path: string) => string;
   onSelectEvent?: (event: AgentTraceEvent) => void;
   onSelectArtifact?: (artifact: AgentArtifact) => void;
+  onPerceive?: () => void;
+  perceptionPending?: boolean;
+  perceptionError?: string | null;
+  onTrial?: () => void;
+  trialAvailable?: boolean;
+  trialPending?: boolean;
+  trialError?: string | null;
   onClose?: () => void;
 };
 
@@ -65,7 +72,7 @@ type AgentPhase = {
   description: string;
   events: Array<{ event: AgentTraceEvent; index: number }>;
   latest?: AgentTraceEvent;
-  status: "pending" | "running" | "completed" | "failed";
+  status: "pending" | "running" | "completed" | "failed" | "waiting";
 };
 
 const AGENT_PHASES: Array<Omit<AgentPhase, "events" | "latest" | "status">> = [
@@ -78,7 +85,7 @@ const AGENT_PHASES: Array<Omit<AgentPhase, "events" | "latest" | "status">> = [
 function phaseForEvent(event: AgentTraceEvent): AgentPhaseKey {
   if (event.stage === "uploading" || event.stage === "geometry_analysis" || event.subgraph === "intake" || event.subgraph === "feature_recognition") return "model";
   if (event.stage === "completed" || event.subgraph === "delivery") return "delivery";
-  if (["ai_integration", "process_generation", "coverage_validation"].includes(event.stage) || event.subgraph === "validation") return "validation";
+  if (["ai_integration", "process_generation", "coverage_validation", "cam_validation", "operation_trial", "operation_execution", "validation_remediation"].includes(event.stage) || event.subgraph === "validation" || event.subgraph === "operation_execution") return "validation";
   return "planning";
 }
 
@@ -98,8 +105,8 @@ function buildAgentPhases(events: AgentTraceEvent[]): AgentPhase[] {
     const phaseEvents = groups.get(phase.key) ?? [];
     const latest = phaseEvents.at(-1)?.event;
     let status: AgentPhase["status"] = "pending";
-    if (index < currentIndex) status = "completed";
-    else if (index === currentIndex) status = failed ? "failed" : phase.key === "delivery" && latest?.status === "completed" ? "completed" : "running";
+    if (index < currentIndex) status = latest?.status === "failed" || latest?.status === "blocked" ? "failed" : latest?.status === "waiting" ? "waiting" : "completed";
+    else if (index === currentIndex) status = failed ? "failed" : latest?.status === "waiting" ? "waiting" : phase.key === "delivery" && latest?.status === "completed" ? "completed" : "running";
     return { ...phase, events: phaseEvents, latest, status };
   });
 }
@@ -121,6 +128,13 @@ export function AgentWorkspacePanel({
   apiUrl,
   onSelectEvent,
   onSelectArtifact,
+  onPerceive,
+  perceptionPending = false,
+  perceptionError,
+  onTrial,
+  trialAvailable = false,
+  trialPending = false,
+  trialError,
   onClose,
 }: Props) {
   const [tab, setTab] = useState<"trace" | "artifacts">("trace");
@@ -130,9 +144,15 @@ export function AgentWorkspacePanel({
   const [artifactContent, setArtifactContent] = useState<Record<string, string>>({});
   const [artifactError, setArtifactError] = useState<Record<string, string>>({});
   const phases = buildAgentPhases(events);
-  const activePhase = phases.find((phase) => phase.status === "running" || phase.status === "failed")
+  const activePhase = phases.find((phase) => phase.status === "running" || phase.status === "failed" || phase.status === "waiting")
     ?? [...phases].reverse().find((phase) => phase.status === "completed")
     ?? phases[0];
+  const currentEvent = events.at(-1);
+  const completedPhases = phases.filter((phase) => phase.status === "completed").length;
+  const recentEvents = showTechnicalDetails ? events.map((event, index) => ({ event, index }))
+    : events.map((event, index) => ({ event, index })).filter(({ event }) =>
+      event.stage !== "ai_planning" || !event.phase || ["ai_context", "ai_response", "ai_review_completed"].includes(event.phase)
+    ).slice(-10);
 
   const toggleEvent = (event: AgentTraceEvent, index: number) => {
     const key = event.event_id ?? `${event.stage}-${index}`;
@@ -153,6 +173,7 @@ export function AgentWorkspacePanel({
       return;
     }
     setExpandedArtifact(artifact.id);
+    if (artifact.kind === "image") return;
     if (artifactContent[artifact.id] || artifactError[artifact.id]) return;
     try {
       const response = await fetch(apiUrl(artifact.url), { cache: "no-store" });
@@ -176,6 +197,12 @@ export function AgentWorkspacePanel({
       <div><b>{Math.round(progress)}%</b>{onClose && <button aria-label="关闭智能体工作台" onClick={onClose}><X size={15} /></button>}</div>
     </header>
     <div className="agent-progress-track"><i style={{ width: `${Math.max(0, Math.min(progress, 100))}%` }} /></div>
+    {live && <div className="agent-live-focus">
+      <div className="agent-live-focus-label"><span><i />当前工作</span><small>{completedPhases}/{phases.length} 阶段完成</small></div>
+      <strong>{orchestration?.current_objective ?? currentEvent?.title ?? currentEvent?.message ?? "正在接收任务并分析零件"}</strong>
+      <p>{currentEvent?.summary ?? currentEvent?.detail ?? "每个阶段以实际模型、工具和校验结果为依据。"}</p>
+      <div className="agent-live-focus-meta"><span><Bot size={13} />{activePhase.title}</span><span><Database size={13} />{artifacts.length} 份证据文件</span></div>
+    </div>}
     {orchestration && <section className={`agent-current-objective ${orchestration.lifecycle ?? ""}`}>
       <div>
         <small>当前目标{orchestration.current_operation_id ? ` · ${orchestration.current_operation_id}` : ""}</small>
@@ -186,6 +213,39 @@ export function AgentWorkspacePanel({
         <div><dt>证据</dt><dd>{orchestration.evidence_count ?? 0}</dd></div>
         <div><dt>未决问题</dt><dd>{orchestration.open_question_count ?? 0}</dd></div>
       </dl>
+      {orchestration.perception && <details className="agent-perception-review">
+        <summary>最近一次模型观察 · 置信度 {Math.round((orchestration.perception.confidence ?? 0) * 100)}%
+          {(orchestration.perception.missing_evidence?.length ?? 0) > 0 && ` · 待补 ${orchestration.perception.missing_evidence?.length} 项证据`}</summary>
+        <div><p>{orchestration.perception.answer}</p>
+          {(orchestration.perception.missing_evidence?.length ?? 0) > 0 && <section>
+            <small>仍需补充</small>
+            <ul>{orchestration.perception.missing_evidence?.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul>
+          </section>}
+        </div>
+      </details>}
+      {!orchestration.perception && (orchestration.open_questions?.length ?? 0) > 0 && <p className="agent-open-question">待回答：{orchestration.open_questions?.[0]}</p>}
+      {onPerceive && orchestration.current_operation_id && <button
+        className="agent-perception-action"
+        disabled={perceptionPending}
+        onClick={onPerceive}
+      >{perceptionPending ? <LoaderCircle className="spin" size={13} /> : <Eye size={13} />}
+        {perceptionPending ? "正在观察模型…" : orchestration.next_action === "perceive" ? "回答当前几何问题" : "按需观察当前模型"}
+      </button>}
+      {perceptionError && <small className="agent-perception-error">{perceptionError}</small>}
+      {onTrial && orchestration.current_operation_id && <button
+        className="agent-perception-action"
+        disabled={!trialAvailable || trialPending || perceptionPending}
+        onClick={onTrial}
+      >{trialPending ? <LoaderCircle className="spin" size={13} /> : <Wrench size={13} />}
+        {trialPending ? "正在独立生成刀路与仿真…" : trialAvailable ? "首道工序独立试跑" : "当前机床暂不支持独立试跑"}
+      </button>}
+      {trialError && <small className="agent-perception-error">{trialError}</small>}
+      {orchestration.trial && <p className="agent-open-question">
+        {orchestration.trial.operation_id} 试跑：{orchestration.trial.status === "candidate" ? "候选" : orchestration.trial.status === "blocked" ? "阻断" : "待复核"} · {orchestration.trial.cut_segment_count ?? 0} 条切削段
+        {orchestration.trial.removed_volume_mm3 != null && ` · 去除 ${orchestration.trial.removed_volume_mm3} mm³`}
+        {orchestration.trial.ai_verdict && ` · AI ${orchestration.trial.ai_verdict}`}
+        <br />仅供工艺评估，不可直接上机；详情见“数据文件”。
+      </p>}
     </section>}
     <nav className="agent-workspace-tabs" aria-label="智能体工作区">
       <button className={tab === "trace" ? "active" : ""} onClick={() => setTab("trace")}><BrainCircuit size={14} />执行进度 <span>{phases.length}</span></button>
@@ -200,7 +260,7 @@ export function AgentWorkspacePanel({
             <span>
               <small>阶段 {index + 1}</small>
               <strong>{phase.title}</strong>
-              <em>{phase.status === "running" || phase.status === "failed"
+              <em>{phase.status === "running" || phase.status === "failed" || phase.status === "waiting"
                 ? phase.latest?.summary ?? phase.latest?.detail ?? phase.latest?.message ?? phase.description
                 : phase.status === "completed" ? `已完成 · ${phase.events.length} 条执行记录` : phase.description}</em>
             </span>
@@ -209,21 +269,21 @@ export function AgentWorkspacePanel({
         </article>)}
       </div>
 
-      {events.length > 0 && <section className={`agent-technical-details ${showTechnicalDetails ? "expanded" : ""}`}>
+      {events.length > 0 && <section className="agent-technical-details expanded">
         <button className="agent-technical-toggle" onClick={() => setShowTechnicalDetails((current) => !current)}>
-          <span><Wrench size={13} /><strong>技术详情</strong><small>{events.length} 条底层记录</small></span>
+          <span><Wrench size={13} /><strong>实时执行轨迹</strong><small>{events.length} 条真实事件</small></span>
           {showTechnicalDetails ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </button>
-        {showTechnicalDetails && <div className="agent-technical-list">
-          {events.map((event, index) => {
+        <div className="agent-technical-list">
+          {recentEvents.map(({ event, index }) => {
             const key = event.event_id ?? `${event.stage}-${index}`;
             const expanded = expandedEvents.has(key);
             const active = activeEventId === event.event_id || (!activeEventId && index === events.length - 1);
             const hasDetails = Boolean(event.evidence?.length || Object.keys(event.metrics ?? {}).length || event.artifacts?.length || event.detail);
-            const visualEvent = index < events.length - 1 && event.status === "running" ? { ...event, status: "completed" as const } : event;
-            return <article key={key} className={`agent-trace-event compact ${visualEvent.status ?? ""} ${active ? "active" : ""}`}>
+            const superseded = index < events.length - 1 && event.status === "running";
+            return <article key={key} className={`agent-trace-event compact ${superseded ? "historical" : event.status ?? ""} ${active ? "active" : ""}`}>
               <button className="agent-trace-summary" onClick={() => toggleEvent(event, index)}>
-                <i>{eventIcon(visualEvent)}</i>
+                <i>{superseded ? <Circle size={14} /> : eventIcon(event)}</i>
                 <span><small>{event.subgraph ?? "agent"} · {event.node_id ?? event.stage}</small><strong>{event.title ?? event.message}</strong><em>{event.summary ?? event.detail ?? event.message}</em></span>
                 {event.viewer && <Eye size={13} />}
                 {hasDetails ? expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} /> : null}
@@ -236,7 +296,7 @@ export function AgentWorkspacePanel({
               </div>}
             </article>;
           })}
-        </div>}
+        </div>
       </section>}
       {events.length === 0 && <div className="agent-empty"><LoaderCircle className="spin" size={20} /><strong>等待智能体开始执行</strong><small>节点状态与工具结果将在这里实时出现</small></div>}
     </div>}
@@ -244,11 +304,12 @@ export function AgentWorkspacePanel({
     {tab === "artifacts" && <div className="agent-artifact-list">
       {artifacts.map((artifact) => <article key={artifact.id} className={expandedArtifact === artifact.id ? "expanded" : ""}>
         <button onClick={() => void openArtifact(artifact)}>
-          <i>{artifact.kind === "model" ? <Box size={16} /> : <FileJson2 size={16} />}</i>
+          <i>{artifact.kind === "model" ? <Box size={16} /> : artifact.kind === "image" ? <Eye size={16} /> : <FileJson2 size={16} />}</i>
           <span><strong>{artifact.label}</strong><small>{artifact.filename ?? artifact.id}{formatSize(artifact.size_bytes) ? ` · ${formatSize(artifact.size_bytes)}` : ""}</small></span>
           {artifact.kind === "model" ? <Eye size={14} /> : expandedArtifact === artifact.id ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </button>
-        {expandedArtifact === artifact.id && artifact.kind !== "model" && <pre>{artifactError[artifact.id] ?? artifactContent[artifact.id] ?? "正在读取…"}</pre>}
+        {expandedArtifact === artifact.id && artifact.kind === "image" && <img className="agent-artifact-image" src={apiUrl(artifact.url)} alt={artifact.label} />}
+        {expandedArtifact === artifact.id && artifact.kind !== "model" && artifact.kind !== "image" && <pre>{artifactError[artifact.id] ?? artifactContent[artifact.id] ?? "正在读取…"}</pre>}
       </article>)}
       {artifacts.length === 0 && <div className="agent-empty"><Database size={20} /><strong>暂时没有数据文件</strong><small>工具产物生成后会自动归档到这里</small></div>}
     </div>}

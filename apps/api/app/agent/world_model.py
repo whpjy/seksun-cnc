@@ -137,6 +137,7 @@ def create_manufacturing_world_model(
     machine: str,
     filename: str,
     model_url: str | None,
+    require_initial_perception: bool = False,
 ) -> ManufacturingWorldModel:
     analysis_data = _payload(analysis)
     plan_data = _payload(plan)
@@ -179,6 +180,14 @@ def create_manufacturing_world_model(
                 priority="high" if target.get("state") == "uncovered" else "medium",
                 blocking=target.get("state") in {"uncovered", "unresolved"},
             ))
+    if require_initial_perception and current and model_url:
+        unresolved.insert(0, OpenQuestion(
+            id="initial-model-understanding",
+            question=f"几何和装夹证据是否足以支持首道工序 {current.id} {current.name}？",
+            reason="首道工序前需要建立有图像证据的制造认知基线",
+            priority="high",
+            blocking=True,
+        ))
     return ManufacturingWorldModel(
         job_id=job_id,
         lifecycle="awaiting_execution" if operations else "waiting_human",
@@ -186,7 +195,7 @@ def create_manufacturing_world_model(
             f"编译、执行并验证 {current.id} {current.name}" if current
             else "补充信息并形成首个可执行工序"
         ),
-        next_action="compile" if current else "human_review",
+        next_action="perceive" if any(item.blocking for item in unresolved) else "compile" if current else "human_review",
         current_operation_id=current.id if current else None,
         source={"filename": filename, "model_url": model_url, "analysis_schema": analysis_data.get("schema_version")},
         resources={"material": material, "machine": machine},
@@ -248,6 +257,14 @@ def apply_execution_trace(
     execution: dict[str, Any],
 ) -> ManufacturingWorldModel:
     updated = world.model_copy(deep=True)
+    summary = dict(execution.get("summary") or {})
+    global_gate_passed = (
+        str(execution.get("status")) == "passed"
+        and str(summary.get("verification_status", "unknown")) == "passed"
+        and str(summary.get("collision_status", "unknown")) == "passed"
+        and str(summary.get("remediation_status", "unknown")) in {"passed", "clear"}
+        and int(summary.get("global_defect_count", 0) or 0) == 0
+    )
     records = {
         str(item.get("operation_id")): item
         for item in execution.get("records", [])
@@ -273,9 +290,11 @@ def apply_execution_trace(
             "evidence": evidence,
             "defects": record.get("defects", []),
             "collisions": record.get("collisions", []),
+            "ai_review": record.get("ai_review"),
         }
         if record.get("status") == "passed":
-            operation.status = "committed"
+            operation.status = "committed" if global_gate_passed else "verified"
+        if operation.status == "committed":
             for state in updated.material_states:
                 state.status = "historical"
             updated.material_states.append(MaterialState(
@@ -287,7 +306,7 @@ def apply_execution_trace(
             ))
         elif record.get("status") == "action_required":
             operation.status = "action_required"
-        else:
+        elif record.get("status") != "passed":
             operation.status = "blocked"
         updated.decisions.append({
             "at": utc_now(),
@@ -299,6 +318,8 @@ def apply_execution_trace(
 
     remaining = next((item for item in updated.operations if item.status != "committed"), None)
     summary_status = str(execution.get("status", "blocked"))
+    if summary_status == "passed" and not global_gate_passed:
+        summary_status = "blocked"
     if remaining is None and updated.operations:
         updated.lifecycle = "completed"
         updated.next_action = "complete"
@@ -321,13 +342,13 @@ def apply_execution_trace(
         updated.current_objective = f"继续验证 {remaining.id if remaining else '下一工序'}"
     updated.stop_conditions.update({
         "all_operations_committed": bool(updated.operations) and remaining is None,
-        "real_toolpaths_available": all(
+        "real_toolpaths_available": bool(updated.operations) and all(
             item.review and item.review.get("evidence", {}).get("toolpath_generated")
-            for item in updated.operations if item.status == "committed"
+            for item in updated.operations
         ),
-        "simulation_passed": all(
+        "simulation_passed": bool(updated.operations) and all(
             item.review and item.review.get("evidence", {}).get("simulation_status") == "completed"
-            for item in updated.operations if item.status == "committed"
+            for item in updated.operations
         ),
     })
     updated.revision += 1

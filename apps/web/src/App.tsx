@@ -40,8 +40,6 @@ const APP_LOGO_TEXT = (import.meta.env.VITE_APP_LOGO_TEXT ?? "N").trim().slice(0
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
 const EMPTY_PROFILE_BOUNDARIES: { operation_id: string; setup_id: string; work_axis: Vec3; points: Vec3[] }[] = [];
 const EMPTY_MATERIAL_SNAPSHOTS: { urls: string[]; stages: { operationId: string; start: number; count: number }[] } = { urls: [], stages: [] };
-const EMPTY_MANUFACTURING_FEATURES: ManufacturingFeature[] = [];
-const EMPTY_SELECTED_FEATURE_IDS: string[] = [];
 const IGNORE_FEATURE_SELECTION = () => undefined;
 function apiUrl(path: string) {
   return `${API_BASE}${path}`;
@@ -289,10 +287,6 @@ function l32GroovePreviewToSegments(preview: L32GroovePreview, sourceAxis: Rotat
   return segments;
 }
 
-const PLANNING_STAGE_ORDER = [
-  "uploading", "geometry_analysis", "draft_planning", "ai_planning", "ai_integration",
-  "process_generation", "coverage_validation", "completed",
-];
 const DEVICE_OPERATION_GROUP_ALIASES: Record<string, string[]> = {
   "钻孔": ["孔加工"],
   "倒角": ["边加工"],
@@ -575,12 +569,20 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
     { stage: "uploading", message: "三维模型上传完成", title: "模型接入", status: "completed", percent: 6 },
   ]);
   const [artifacts, setArtifacts] = useState<AgentArtifact[]>([]);
+  const [orchestration, setOrchestration] = useState<AgentWorkspace["orchestration"]>();
+  const [previewCam, setPreviewCam] = useState<CamResult | null>(null);
+  const [liveToolpath, setLiveToolpath] = useState<ToolpathSegment[]>(EMPTY_TOOLPATH_SEGMENTS);
   const [activeAgentEvent, setActiveAgentEvent] = useState<PlanningProgressEvent | null>(null);
+  const [pinnedEventId, setPinnedEventId] = useState<string | null>(null);
+  const pinnedEventIdRef = useRef<string | null>(null);
+  const planLoadedRef = useRef(Boolean(initialJob.plan));
   const [error, setError] = useState(initialJob.error ?? "");
   const latestProgress = progressEvents.at(-1);
 
   useEffect(() => {
     let disposed = false;
+    let camPreviewLoading = false;
+    let lastToolpathEventId = "";
 
     const refreshWorkspace = async () => {
       try {
@@ -590,10 +592,36 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
         if (disposed) return;
         if (workspace.events.length) {
           setProgressEvents(workspace.events);
-          const active = workspace.events.find((item) => item.event_id === workspace.active_event_id) ?? workspace.events.at(-1) ?? null;
+          const active = workspace.events.find((item) => item.event_id === pinnedEventIdRef.current)
+            ?? workspace.events.find((item) => item.event_id === workspace.active_event_id)
+            ?? workspace.events.at(-1) ?? null;
           setActiveAgentEvent(active);
         }
         setArtifacts(workspace.artifacts);
+        setOrchestration(workspace.orchestration);
+        const latestEventId = workspace.events.at(-1)?.event_id ?? "";
+        if (workspace.artifacts.some((artifact) => artifact.filename === "toolpath.json") && latestEventId !== lastToolpathEventId) {
+          lastToolpathEventId = latestEventId;
+          try {
+            const toolpathResponse = await fetch(apiUrl(`/api/v1/jobs/${initialJob.id}/files/toolpath.json`), { cache: "no-store" });
+            if (toolpathResponse.ok && !disposed) {
+              const toolpath = await toolpathResponse.json() as { preview_segments?: ToolpathSegment[] };
+              if (Array.isArray(toolpath.preview_segments)) setLiveToolpath(toolpath.preview_segments);
+            }
+          } catch {
+            // A provisional toolpath can be replaced during remediation; the next event retries it.
+          }
+        }
+        if (!camPreviewLoading && workspace.artifacts.some((artifact) => artifact.filename === "cam-manifest.json")) {
+          camPreviewLoading = true;
+          try {
+            const camResponse = await fetch(apiUrl(`/api/v1/jobs/${initialJob.id}/cam`), { cache: "no-store" });
+            if (camResponse.ok && !disposed) setPreviewCam(await camResponse.json() as CamResult);
+            else camPreviewLoading = false;
+          } catch {
+            camPreviewLoading = false;
+          }
+        }
       } catch {
         // SSE remains the primary live channel; the next event retries artifact discovery.
       }
@@ -606,6 +634,7 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
         if (!response.ok) throw new Error(payload.detail || "无法加载任务状态");
         if (disposed) return;
         const refreshed = payload as Job;
+        planLoadedRef.current = Boolean(refreshed.plan);
         setPreviewJob(refreshed);
         if (expectCompleted || refreshed.status === "completed") onCompleted(refreshed);
         else if (refreshed.status === "failed") setError(refreshed.error || "工艺规划失败");
@@ -615,12 +644,15 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
     };
 
     const presentUpdate = (update: PlanningProgressEvent) => {
-      setActiveAgentEvent(update);
+      if (!pinnedEventIdRef.current) setActiveAgentEvent(update);
       setProgressEvents((current) => {
         if (update.event_id && current.some((item) => item.event_id === update.event_id)) return current;
         return [...current, update];
       });
       void refreshWorkspace();
+      if ((update.stage === "geometry_analysis" && update.status === "completed")
+        || update.stage === "process_generation"
+        || (update.stage === "cam_validation" && (!planLoadedRef.current || ["completed", "blocked", "failed"].includes(update.status ?? "")))) void refreshJob();
       if (update.stage === "error") {
         setError(update.message);
         return;
@@ -658,7 +690,37 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
     };
   }, [initialJob.id, onCompleted]);
 
-  return <main className="workbench processing-workbench">
+  const previewFeatures: ManufacturingFeature[] = previewJob.analysis
+    ? [
+      ...previewJob.analysis.cylindrical_features.filter((feature) => feature.kind === "hole" && feature.review_state !== "excluded"),
+      ...(previewJob.analysis.prismatic_features ?? []).filter((feature) => feature.review_state !== "excluded"),
+      ...(previewJob.analysis.planar_machining_features ?? []).filter((feature) => feature.review_state !== "excluded"),
+      ...(previewJob.analysis.internal_profile_features ?? []).filter((feature) => feature.review_state !== "excluded"),
+    ] : [];
+  const focusedOperationId = activeAgentEvent?.viewer?.kind === "operation" ? activeAgentEvent.viewer.operation_id : undefined;
+  const focusedOperation = previewJob.plan?.setups.flatMap((setup) => setup.operations).find((operation) => operation.id === focusedOperationId);
+  const focusedFeatureIds = activeAgentEvent?.viewer?.feature_ids ?? focusedOperation?.feature_ids ?? [];
+  const availableToolpath = previewCam?.preview_segments ?? liveToolpath;
+  const focusedToolpath = activeAgentEvent?.stage === "cam_validation" || focusedOperationId
+    ? availableToolpath.filter((segment) => !focusedOperationId || segment.operation_id === focusedOperationId)
+    : EMPTY_TOOLPATH_SEGMENTS;
+  const plannedOperations = previewJob.plan?.setups.flatMap((setup) => setup.operations) ?? [];
+  const sceneMode = focusedToolpath.length ? "刀路" : focusedOperationId ? "工序" : focusedFeatureIds.length ? "特征" : "模型";
+  const sceneStages = [
+    { label: "模型理解", hint: previewJob.analysis ? "几何已解析" : "等待解析", icon: Box, ready: Boolean(previewJob.analysis), matches: (event: PlanningProgressEvent) => event.stage === "geometry_analysis" || event.subgraph === "feature_recognition" },
+    { label: "工艺决策", hint: plannedOperations.length ? `${plannedOperations.length} 道候选工序` : "等待规划", icon: Bot, ready: plannedOperations.length > 0, matches: (event: PlanningProgressEvent) => event.stage === "ai_planning" || event.stage === "process_generation" || event.subgraph === "process_planning" },
+    { label: "刀路生成", hint: previewCam ? `${previewCam.preview_segments.length} 段已归档` : liveToolpath.length ? `${liveToolpath.length} 段草稿待校验` : "等待真实刀路", icon: Wrench, ready: Boolean(previewCam), matches: (event: PlanningProgressEvent) => event.stage === "cam_validation" || event.subgraph === "operation_execution" },
+    { label: "仿真校验", hint: previewCam?.simulation ? "查看校验证据" : "尚无仿真结论", icon: ShieldCheck, ready: Boolean(previewCam?.simulation), matches: (event: PlanningProgressEvent) => event.stage === "cam_validation" && ["completed", "blocked", "failed"].includes(event.status ?? "") },
+  ];
+  const sceneStageIndex = sceneMode === "刀路" ? 2 : sceneMode === "工序" ? 1 : sceneMode === "特征" ? 0 :
+    activeAgentEvent?.stage === "cam_validation" ? 2 : activeAgentEvent?.stage === "process_generation" || activeAgentEvent?.stage === "ai_planning" ? 1 : 0;
+  const focusEvent = (event: PlanningProgressEvent) => {
+    pinnedEventIdRef.current = event.event_id ?? null;
+    setPinnedEventId(event.event_id ?? null);
+    setActiveAgentEvent(event);
+  };
+
+  return <main className="workbench processing-workbench agent-studio">
     <header className="topbar app-header">
       <div className="brand compact"><span>{APP_LOGO_TEXT}</span>{APP_NAME}</div>
       <div className="project-title"><strong>{initialJob.filename}</strong></div>
@@ -671,15 +733,31 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
     </header>
     <section className="workspace processing-workspace workbench-workspace left-panel-open">
       <aside className="workbench-sidebar processing-sidebar">
-        <AgentWorkspacePanel events={progressEvents} artifacts={artifacts} activeEventId={activeAgentEvent?.event_id} progress={latestProgress?.percent ?? 6} live apiUrl={apiUrl} onSelectEvent={setActiveAgentEvent} onSelectArtifact={(artifact) => { if (artifact.kind === "model") setPreviewJob((current) => ({ ...current, model_url: artifact.url })); }} />
+        <AgentWorkspacePanel events={progressEvents} artifacts={artifacts} orchestration={orchestration} activeEventId={activeAgentEvent?.event_id} progress={latestProgress?.percent ?? 6} live apiUrl={apiUrl} onSelectEvent={focusEvent} onSelectArtifact={(artifact) => { if (artifact.kind === "model") setPreviewJob((current) => ({ ...current, model_url: artifact.url })); }} />
         {error && <div className="planning-workbench-error floating"><AlertTriangle size={15} /><span>{error}</span><button onClick={onNew}>新建任务</button></div>}
       </aside>
       <section className="viewport panel processing-viewport">
+        <div className="agent-scene-rail" aria-label="智能体工作阶段">
+          <div className="agent-scene-rail-title"><span>智能体工作现场</span><small>实时证据 · 点击回看</small></div>
+          <div className="agent-scene-stage-list">{sceneStages.map((stage, index) => {
+            const StageIcon = stage.icon;
+            const event = [...progressEvents].reverse().find(stage.matches);
+            return <button key={stage.label} className={`${sceneStageIndex === index ? "active" : ""} ${stage.ready ? "ready" : "pending"}`} disabled={!event && index !== 0} onClick={() => event && focusEvent(event)}>
+              <i><StageIcon size={17} /></i><span><strong>{stage.label}</strong><small>{stage.hint}</small></span>{stage.ready ? <Check size={14} /> : event?.status === "running" ? <LoaderCircle className="spin" size={14} /> : <CircleDot size={12} />}
+            </button>;
+          })}</div>
+        </div>
+        {pinnedEventId && <button className="agent-follow-live" onClick={() => { pinnedEventIdRef.current = null; setPinnedEventId(null); setActiveAgentEvent(progressEvents.at(-1) ?? null); }}>返回实时进度</button>}
         {previewJob.model_url
-          ? <ModelViewer modelUrl={apiUrl(previewJob.model_url)} features={EMPTY_MANUFACTURING_FEATURES} selectedFeatureIds={EMPTY_SELECTED_FEATURE_IDS} onSelectFeature={IGNORE_FEATURE_SELECTION} viewMode="特征" showFeatureSummary={false} />
+          ? <ModelViewer modelUrl={apiUrl(previewJob.model_url)} features={previewFeatures} selectedFeatureIds={focusedFeatureIds} onSelectFeature={IGNORE_FEATURE_SELECTION} viewMode={focusedToolpath.length ? "刀路" : "特征"} toolpathSegments={focusedToolpath} activeOperationId={focusedToolpath.length ? focusedOperationId : undefined} showFeatureAnnotations={focusedFeatureIds.length === 1} showFeatureSummary={false} compositionInsetLeftRatio={0.18} />
           : <div className="processing-model-placeholder"><LoaderCircle className="spin" size={28} /><strong>正在构建三维预览</strong><small>完成 STEP 拓扑解析后将在这里显示原始模型</small></div>}
         {!previewJob.model_url && <div className="processing-model-badge"><Box size={14} /><span>模型解析中</span></div>}
-        {activeAgentEvent && <div className="agent-viewport-context"><i>{activeAgentEvent.status === "running" ? <LoaderCircle className="spin" size={15} /> : <Bot size={15} />}</i><span><small>{activeAgentEvent.subgraph ?? "agent"} · {activeAgentEvent.node_id ?? activeAgentEvent.stage}</small><strong>{activeAgentEvent.title ?? activeAgentEvent.message}</strong><em>{activeAgentEvent.summary ?? activeAgentEvent.detail ?? activeAgentEvent.message}</em></span></div>}
+        <div className="agent-scene-headline"><span className="agent-scene-live-dot" /><div><small>{pinnedEventId ? "历史步骤 · 正在回看" : "实时执行 · 自动跟随"}</small><strong>{activeAgentEvent?.title ?? activeAgentEvent?.message ?? "正在接收制造任务"}</strong><p>{activeAgentEvent?.summary ?? activeAgentEvent?.detail ?? "智能体会按实际工具结果更新视图与证据。"}</p></div></div>
+        <div className="agent-scene-console">
+          <div className="agent-scene-console-head"><span>场景证据</span><strong>{sceneMode}</strong></div>
+          <div className="agent-scene-console-main"><strong>{focusedOperationId ? `${focusedOperationId} · ${focusedOperation?.name ?? "候选工序"}` : sceneMode === "特征" ? `聚焦 ${focusedFeatureIds.length} 个制造特征` : "三维零件视图"}</strong><p>{focusedToolpath.length ? previewCam ? `已归档 ${focusedToolpath.length} 段刀路；可在工序详情中回放仿真。` : `真实刀路草稿 ${focusedToolpath.length} 段；材料仿真和安全校验仍在进行。` : focusedOperationId ? "当前仅显示工序关联几何；刀路和仿真尚无可用归档。" : "右侧显示真实模型；选择执行步骤可查看对应的几何、工序或刀路。"}</p></div>
+          <div className="agent-scene-console-metrics"><span><b>{previewFeatures.length}</b>制造特征</span><span><b>{plannedOperations.length}</b>候选工序</span><span><b>{previewCam?.simulation.operation_snapshots?.length ?? 0}</b>仿真记录</span></div>
+        </div>
       </section>
     </section>
   </main>;
@@ -695,6 +773,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [generatingCam, setGeneratingCam] = useState(false);
   const [loadingCam, setLoadingCam] = useState(readOnly);
   const [camResult, setCamResult] = useState<CamResult | null>(null);
+  const [camArtifactState, setCamArtifactState] = useState<"checking" | "ready" | "unavailable">("checking");
   const [, setCamError] = useState("");
   const [camProgress, setCamProgress] = useState<{
     stage: string;
@@ -725,6 +804,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
   const [leftWorkbenchPanel, setLeftWorkbenchPanel] = useState<"features" | "process" | "agent" | null>("process");
   const [agentWorkspace, setAgentWorkspace] = useState<AgentWorkspace | null>(null);
+  const [perceptionPending, setPerceptionPending] = useState(false);
+  const [perceptionError, setPerceptionError] = useState<string | null>(null);
+  const [trialPending, setTrialPending] = useState(false);
+  const [trialError, setTrialError] = useState<string | null>(null);
   const [activeAgentEvent, setActiveAgentEvent] = useState<AgentTraceEvent | null>(null);
   const [showOperationViewSwitch, setShowOperationViewSwitch] = useState(false);
   const [stockSelected, setStockSelected] = useState(false);
@@ -835,8 +918,44 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     }
   }, [initialJob.id]);
 
+  const observeCurrentModel = useCallback(async () => {
+    setPerceptionPending(true);
+    setPerceptionError(null);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/jobs/${initialJob.id}/agent/perceive`), { method: "POST" });
+      if (!response.ok) {
+        const failure = await response.json().catch(() => null) as { detail?: string } | null;
+        throw new Error(failure?.detail ?? `模型观察失败（${response.status}）`);
+      }
+      await refreshAgentWorkspace();
+    } catch (reason) {
+      setPerceptionError(reason instanceof Error ? reason.message : "模型观察失败");
+    } finally {
+      setPerceptionPending(false);
+    }
+  }, [initialJob.id, refreshAgentWorkspace]);
+
+  const trialCurrentOperation = useCallback(async () => {
+    setTrialPending(true);
+    setTrialError(null);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/jobs/${initialJob.id}/agent/trial`), { method: "POST" });
+      if (!response.ok) {
+        const failure = await response.json().catch(() => null) as { detail?: string } | null;
+        throw new Error(failure?.detail ?? `工序试跑失败（${response.status}）`);
+      }
+      await refreshAgentWorkspace();
+    } catch (reason) {
+      setTrialError(reason instanceof Error ? reason.message : "工序试跑失败");
+      await refreshAgentWorkspace();
+    } finally {
+      setTrialPending(false);
+    }
+  }, [initialJob.id, refreshAgentWorkspace]);
+
   useEffect(() => {
-    void refreshAgentWorkspace();
+    const handle = window.setTimeout(() => { void refreshAgentWorkspace(); }, 0);
+    return () => window.clearTimeout(handle);
   }, [refreshAgentWorkspace]);
 
   const operations = useMemo(
@@ -991,12 +1110,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       : camResult.verification.status === "warning"
         ? "warning"
         : "passed";
-  const cutOperationIds = useMemo(
-    () => new Set(isSheetForming
-      ? camResult?.generated_operations ?? []
-      : camResult?.preview_segments.filter((segment) => segment.motion === "cut").map((segment) => segment.operation_id) ?? []),
-    [camResult?.generated_operations, camResult?.preview_segments, isSheetForming],
-  );
   useEffect(() => {
     if (!showOperationDetails) return undefined;
     const closeOnOutsideClick = (event: PointerEvent) => {
@@ -1036,6 +1149,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const selectedFeatures = useMemo(
     () => manufacturingFeatures.filter((feature) => selectedFeatureIds.includes(feature.id)),
     [manufacturingFeatures, selectedFeatureIds],
+  );
+  const simulatedOperationIds = useMemo(
+    () => new Set(camResult?.simulation.operation_snapshots?.filter((snapshot) => snapshot.status === "completed" && snapshot.cut_segment_count > 0).map((snapshot) => snapshot.operation_id) ?? []),
+    [camResult?.simulation.operation_snapshots],
   );
   const selectedOperationIsMilling = Boolean(selectedOperation && (selectedOperation.type.includes("mill") || selectedOperation.type.includes("pocket") || selectedOperation.type.includes("contour") || selectedOperation.type.includes("surface")));
   const viewerFeatures = useMemo(
@@ -1591,19 +1708,19 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     if (!selectedOperation) return null;
     if (!isL32) {
       if (!camResult) return null;
-      const removedPercent = camResult.simulation.metrics.removed_percent;
-      const removedVolume = camResult.simulation.metrics.removed_volume_mm3;
-      const collisionCount = camResult.collision.metrics.collision_count;
+      const snapshot = camResult.simulation.operation_snapshots?.find((item) => item.operation_id === selectedOperation.id && item.status === "completed" && item.cut_segment_count > 0);
+      if (!snapshot) return null;
+      const collisionCount = camResult.collision.collisions.filter((item) => item.operation_id === selectedOperation.id).length;
       const status = validationStatus ?? "warning";
       return {
         status,
-        statusLabel: status === "passed" ? "材料与安全校核通过" : status === "failed" ? "加工校核失败" : "加工结果存在警告",
+        statusLabel: status === "passed" ? "材料与安全校核通过" : status === "failed" ? "全方案校核失败，当前工序需复核" : "加工结果存在警告",
         engineLabel: `仿真引擎 ${camResult.engine}`,
         metrics: [
-          { label: "材料去除", value: `${removedPercent}%`, detail: `${removedVolume.toFixed(2)} mm³` },
-          { label: "碰撞记录", value: `${collisionCount}`, detail: collisionCount ? "需要检查" : "未发现碰撞" },
+          { label: "本工序去除", value: `${(snapshot.removed_volume_delta_mm3 ?? 0).toFixed(2)} mm³`, detail: `${snapshot.cut_segment_count} 条切削段` },
+          { label: "工序后余料", value: `${(snapshot.remaining_volume_mm3 ?? 0).toFixed(2)} mm³`, detail: collisionCount ? `${collisionCount} 项碰撞待检查` : "未记录本工序碰撞" },
         ],
-        note: `网格精度 ${camResult.simulation.metrics.resolution_mm} mm。`,
+        note: `累计余料快照 · 网格精度 ${camResult.simulation.metrics.resolution_mm} mm；全方案校核结论不等于单工序放行。`,
       };
     }
 
@@ -1647,6 +1764,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }, [camResult, isL32, l32OperationPreview, l32Program, l32SimulationSummaries, l32TurningPreviews, selectedOperation, validationStatus]);
 
   const visibleToolpathSegments = useMemo(() => {
+    if (!isL32 && activeMode === "仿真" && selectedOperation && !simulatedOperationIds.has(selectedOperation.id)) return EMPTY_TOOLPATH_SEGMENTS;
     if (isL32 && (activeMode === "刀路" || activeMode === "仿真") && playbackMode === "single" && l32OperationPreviewSegments.some((segment) => segment.motion === "cut")) return l32OperationPreviewSegments;
     if (isL32 && l32WholePartBlocked && activeMode !== "仿真") return EMPTY_TOOLPATH_SEGMENTS;
     if (activeMode === "刀路") return isL32 ? l32ToolpathSegments : camResult?.preview_segments ?? [];
@@ -1665,7 +1783,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     ).sort((left, right) => (operationOrder.get(left.operation_id) ?? 0) - (operationOrder.get(right.operation_id) ?? 0));
     return visibleSegments.some((segment) => segment.motion === "cut") ? visibleSegments : EMPTY_TOOLPATH_SEGMENTS;
   },
-    [activeMode, camResult?.preview_segments, isL32, l32AvailableToolpathSegments, l32OperationPreviewSegments, l32ToolpathSegments, l32WholePartBlocked, operations, playbackMode, selectedOperation],
+    [activeMode, camResult?.preview_segments, isL32, l32AvailableToolpathSegments, l32OperationPreviewSegments, l32ToolpathSegments, l32WholePartBlocked, operations, playbackMode, selectedOperation, simulatedOperationIds],
   );
   const l32MaterialRequestKey = `${job.id}:${job.machine_configuration_hash ?? "unbound"}:${JSON.stringify(job.plan?.setups ?? [])}`;
   const visibleMaterialSnapshots = useMemo(() => {
@@ -1699,7 +1817,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const simulationGenerating = activeMode === "仿真" && selectedOperation != null && (
     isL32
       ? previewingL32OperationId === selectedOperation.id || loadingL32Program || l32MaterialGenerationPending
-      : loadingCam || generatingCam || applyingRemediation
+      : generatingCam || applyingRemediation
   );
   const simulationGenerationMessage = isL32
     ? previewingL32OperationId === selectedOperation?.id || loadingL32Program
@@ -1759,7 +1877,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     return surface ? { url: apiUrl(`/api/v1/jobs/${job.id}/files/${surface.file}`), frame: surface.frame } : null;
   }, [activeMode, camResult?.camotics_surfaces, job.id, selectedSetupId, usesCumulativeStock]);
   const visibleSimulation = useMemo(() => {
-    if (activeMode !== "仿真" || !simulationResult || isSheetForming) return null;
+    if (activeMode !== "仿真" || !simulationResult || isSheetForming || (selectedOperation && !isL32 && !simulatedOperationIds.has(selectedOperation.id))) return null;
     const surface = usesCumulativeStock
       ? simulationResult.surface
       : simulationResult.setup_surfaces?.find((item) => item.setup_id === selectedSetupId) ?? simulationResult.surface;
@@ -1776,7 +1894,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         removed_percent: stockVolume ? Math.round(removedVolume / stockVolume * 10000) / 100 : 0,
       },
     };
-  }, [activeMode, isSheetForming, selectedSetupId, simulationResult, usesCumulativeStock]);
+  }, [activeMode, isL32, isSheetForming, selectedOperation, selectedSetupId, simulatedOperationIds, simulationResult, usesCumulativeStock]);
   const visibleFixtureComponents = useMemo(
     () => activeMode === "仿真" ? job.plan?.safety?.fixture_components ?? [] : [],
     [activeMode, job.plan?.safety?.fixture_components],
@@ -1787,7 +1905,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   );
 
   useEffect(() => {
-    const needsCam = readOnly || activeMode === "刀路" || activeMode === "仿真";
+    const needsCam = !isL32 || readOnly || activeMode === "刀路" || activeMode === "仿真";
     if (!needsCam || camResult || isL32) return;
     let cancelled = false;
     fetch(apiUrl(`/api/v1/jobs/${job.id}/cam`))
@@ -1795,6 +1913,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       .then((payload: CamResult | null) => {
         if (payload && !cancelled) {
           setCamResult(payload);
+          setCamArtifactState("ready");
           if (readOnly) {
             const ids = new Set(payload.preview_segments.filter((segment) => segment.motion === "cut").map((segment) => segment.operation_id));
             const playable = operations.find((operation) => ids.has(operation.id));
@@ -1804,9 +1923,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             }
             setActiveMode("仿真");
           }
-        }
+        } else if (!cancelled) setCamArtifactState("unavailable");
       })
-      .catch(() => undefined)
+      .catch(() => { if (!cancelled) setCamArtifactState("unavailable"); })
       .finally(() => {
         if (!cancelled) setLoadingCam(false);
       });
@@ -1873,7 +1992,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     setShowOperationDetails(false);
     setPlaybackResetToken((current) => current + 1);
     setLoadingCam(false);
-    setActiveMode("工艺");
+    setActiveMode(!isL32 && (simulatedOperationIds.has(operation.id) || isSheetForming && camResult) ? "仿真" : "工艺");
     setIsolatedFeatureId(null);
     setShowOperationViewSwitch(true);
   };
@@ -1889,14 +2008,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   };
 
   const chooseMode = (mode: string) => {
-    if (mode === "仿真" && camResult && selectedOperation && !cutOperationIds.has(selectedOperation.id)) {
-      const playable = operations.find((operation) => cutOperationIds.has(operation.id));
-      if (playable) {
-        setSelectedOperation(playable);
-        setSelectedFeatureIds(playable.feature_ids);
-      }
-    }
-    setLoadingCam((mode === "刀路" || mode === "仿真") && !camResult && !isL32);
+    setLoadingCam((mode === "刀路" || mode === "仿真") && !camResult && !isL32 && camArtifactState === "checking");
     setActiveMode(mode);
     if (mode !== "特征") setIsolatedFeatureId(null);
     if (mode === "特征") {
@@ -1984,6 +2096,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             if (!response.ok) throw new Error(payload.detail || "刀路结果加载失败");
             const generated = payload as CamResult;
             setCamResult(generated);
+            setCamArtifactState("ready");
             await refreshAgentWorkspace();
             if (isSheetForming) {
               setShowSimulationChecks(true);
@@ -2020,6 +2133,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     const preferred = updatedOperations.find((operation) => operation.id === preferredOperationId) ?? updatedOperations[0] ?? null;
     setJob(updatedJob);
     setCamResult(null);
+    setCamArtifactState("unavailable");
     setLoadingCam(activeMode === "刀路" || activeMode === "仿真");
     setSelectedOperation(preferred);
     setSelectedFeatureIds(preferred?.feature_ids ?? []);
@@ -2636,7 +2750,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         </section>
       </div>}
 
-      <section className={`workspace workbench-workspace ${leftWorkbenchPanel ? "left-panel-open" : ""}`}>
+      <section className={`workspace workbench-workspace ${leftWorkbenchPanel ? "left-panel-open" : ""} ${leftWorkbenchPanel === "agent" ? "agent-review-mode" : ""}`}>
         <nav className="workbench-panel-switcher" aria-label="工作区面板">
           <button type="button" className={leftWorkbenchPanel === "features" ? "active" : ""} aria-pressed={leftWorkbenchPanel === "features"} onClick={() => { const opening = leftWorkbenchPanel !== "features"; setLeftWorkbenchPanel(opening ? "features" : null); setShowOperationViewSwitch(false); setShowOperationDetails(false); setEditingOperationDetails(false); setStockSelected(false); if (opening) { setActiveMode("特征"); setIsolatedFeatureId(null); setSelectedFeatureIds([]); } }}><CircleDot size={15} /><span>制造特征</span></button>
           <button type="button" className={leftWorkbenchPanel === "process" ? "active" : ""} aria-pressed={leftWorkbenchPanel === "process"} onClick={() => { const closing = leftWorkbenchPanel === "process"; setLeftWorkbenchPanel(closing ? null : "process"); setShowOperationDetails(false); setEditingOperationDetails(false); if (closing) { setShowOperationViewSwitch(false); setStockSelected(false); } }}><Layers3 size={15} /><span>工艺路线</span></button>
@@ -2660,13 +2774,13 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             <div className="panel-heading floating-panel-heading"><Layers3 size={16} /><span>工艺路线</span><small>{job.plan.ai_planning?.planner === "langgraph_ai_primary" ? "AI 规划 · " : ""}{job.plan.setups.length} 装夹 · {operations.length} 工序</small><button type="button" aria-label="关闭工艺路线" title="关闭" onClick={() => { setLeftWorkbenchPanel(null); setShowOperationViewSwitch(false); setShowOperationDetails(false); setEditingOperationDetails(false); setStockSelected(false); }}><X size={15} /></button></div>
             <div className="panel-content">
               <button type="button" className={`tree-section stock-tree-row ${stockSelected ? "selected" : ""}`} aria-pressed={stockSelected} onClick={chooseStock}><strong><Box size={15} /> 毛坯</strong><small>{stockDimensionLabel}</small></button>
-              {job.plan.setups.map((setup) => (
+                  {job.plan.setups.map((setup) => (
                 <div key={setup.id} className="setup-tree">
                   <div className="tree-section"><strong><Rotate3D size={15} /> {setup.name}</strong><small>{setup.machine_name ? `${setup.machine_name} · ` : ""}{setup.fixture}</small></div>
                   {setup.operations.map((operation) => (
                     <div key={operation.id} className={`operation-tree-row ${selectedOperation?.id === operation.id ? "selected" : ""} ${operation.enabled === false ? "suppressed" : ""} ${generatingCam && camProgress?.operation_id === operation.id ? "stream-active" : ""}`}>
                       <button className="operation-tree-main" title={`选择 ${operation.id}`} disabled={operation.enabled === false} onClick={() => openOperationSimulation(operation)}>
-                        <span>{operation.id}</span><div><strong>{operation.name}</strong><small>{operation.tool.name}</small></div>
+                        <span>{operation.id}</span><div><strong>{operation.name}</strong><small>{operation.tool.name} · {isL32 ? "专用预览" : isSheetForming && camResult ? "成形概念预览" : simulatedOperationIds.has(operation.id) ? "仿真可回放" : camArtifactState === "checking" ? "正在读取验证记录" : operation.generation_state === "failed" ? "刀路生成失败" : "仿真待验证"}</small></div>
                       </button>
                       <div className="operation-tree-actions">
                         <button aria-label={`查看 ${operation.id} 工序详情`} title="查看工序详情" onClick={(event) => openOperationDetails(operation, event.currentTarget)}><Info size={15} /></button>
@@ -2682,6 +2796,13 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             events={agentWorkspace?.events ?? []}
             artifacts={agentWorkspace?.artifacts ?? []}
             orchestration={agentWorkspace?.orchestration}
+            onPerceive={() => void observeCurrentModel()}
+            perceptionPending={perceptionPending}
+            perceptionError={perceptionError}
+            onTrial={() => void trialCurrentOperation()}
+            trialAvailable={job.plan?.process_kind === "subtractive" && job.plan.automation_status !== "unsupported" && job.device_id !== "citizen-cincom-l32"}
+            trialPending={trialPending}
+            trialError={trialError}
             activeEventId={activeAgentEvent?.event_id}
             progress={agentWorkspace?.events.at(-1)?.percent ?? (job.status === "completed" ? 100 : 0)}
             apiUrl={apiUrl}
@@ -2825,7 +2946,11 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             compositionInsetRightRatio={leftWorkbenchPanel ? 0.04 : 0}
             showFeatureAnnotations={leftWorkbenchPanel === "features" && isolatedFeatureId !== null}
           />}
-          {leftWorkbenchPanel === "agent" && activeAgentEvent && <div className="agent-viewport-context"><i>{activeAgentEvent.status === "running" ? <LoaderCircle className="spin" size={15} /> : <Bot size={15} />}</i><span><small>{activeAgentEvent.subgraph ?? "agent"} · {activeAgentEvent.node_id ?? activeAgentEvent.stage}</small><strong>{activeAgentEvent.title ?? activeAgentEvent.message}</strong><em>{activeAgentEvent.summary ?? activeAgentEvent.detail ?? activeAgentEvent.message}</em></span></div>}
+          {leftWorkbenchPanel === "agent" && <>
+            <div className="agent-review-heading"><Bot size={18} /><div><small>智能体执行回看</small><strong>{activeAgentEvent?.title ?? activeAgentEvent?.message ?? "选择左侧步骤查看执行依据"}</strong><p>{activeAgentEvent?.summary ?? activeAgentEvent?.detail ?? "模型、工序、刀路和仿真按实际归档证据展示。"}</p></div></div>
+            <div className="agent-review-evidence"><div><small>本任务证据</small><strong>{agentWorkspace?.events.length ?? 0} 条执行记录</strong></div><div><span>{agentWorkspace?.artifacts.length ?? 0}<small>文件</small></span><span>{camResult?.simulation.operation_snapshots?.length ?? 0}<small>仿真</small></span></div><p>{activeAgentEvent?.viewer?.kind === "operation" ? `当前步骤关联工序 ${activeAgentEvent.viewer.operation_id ?? "—"}；请核对左侧记录与模型。` : "点击左侧执行步骤，可回看当时的观察、规划判断与工具证据。"}</p></div>
+          </>}
+          {!isL32 && selectedOperation && (activeMode === "仿真" || activeMode === "刀路") && camArtifactState === "unavailable" && !generatingCam && !applyingRemediation && <div className="agent-scene-evidence unavailable"><AlertTriangle size={15} /><span>当前工序没有已归档的刀路与仿真，模型仅供查看；不会自动重新计算。</span></div>}
           {stockSelected && <section className="operation-context-card stock-context-card" aria-label="毛坯视图">
             <header><span>加工起点</span><div><button type="button" aria-label="关闭毛坯窗口" title="关闭" onClick={() => setStockSelected(false)}><X size={15} /></button></div></header>
             <strong>毛坯</strong>
@@ -2837,6 +2962,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             <header><span>当前工序</span><div><em>{selectedOperation.id}</em><button type="button" aria-label="关闭工序窗口" title="关闭" onClick={() => { setShowOperationViewSwitch(false); setShowOperationDetails(false); setEditingOperationDetails(false); }}><X size={15} /></button></div></header>
             <strong>{selectedOperation.name}</strong>
             <div className="operation-context-meta"><span>{selectedOperation.tool.name}</span>{selectedSetup?.work_axis && <span>方向 X{selectedSetup.work_axis.x.toFixed(0)} Y{selectedSetup.work_axis.y.toFixed(0)} Z{selectedSetup.work_axis.z.toFixed(0)}</span>}</div>
+            {!isL32 && <div className={`operation-evidence-status ${simulatedOperationIds.has(selectedOperation.id) || isSheetForming && camResult ? "ready" : "pending"}`}>{isSheetForming && camResult ? "已有成形概念预览 · 不代表物理仿真或生产放行" : simulatedOperationIds.has(selectedOperation.id) ? "已有规划阶段仿真记录 · 点击仿真直接回放" : camArtifactState === "checking" ? "正在读取规划阶段的验证记录" : "尚无可回放仿真 · 等待生成或人工复核"}</div>}
             <nav className="operation-view-tabs" aria-label="工序视图切换">
               <button type="button" className={activeMode === "工艺" ? "active" : ""} aria-current={activeMode === "工艺" ? "page" : undefined} onClick={() => chooseMode("工艺")}><span>工艺意图</span><small>加工什么</small></button>
               <button type="button" className={activeMode === "刀路" ? "active" : ""} aria-current={activeMode === "刀路" ? "page" : undefined} onClick={() => chooseMode("刀路")}><span>{isSheetForming ? "成形路径" : "刀路轨迹"}</span><small>如何运动</small></button>

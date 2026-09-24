@@ -775,7 +775,13 @@ def main():
     source, analysis_path, plan_path, fcstd_path, nc_path, result_path = arguments
     analysis, plan = load_json(analysis_path), load_json(plan_path)
     operations = [item for setup in plan["setups"] for item in setup["operations"] if item.get("enabled", True)]
-    if not operations or any(item.get("status") != "approved" for item in operations):
+    trial_mode = os.getenv("CNC_CAM_TRIAL_MODE") == "1"
+    if trial_mode:
+        trial_dir = FilePath(result_path).resolve().parent
+        output_paths = (FilePath(plan_path), FilePath(analysis_path), FilePath(fcstd_path), FilePath(nc_path), FilePath(result_path))
+        if len(operations) != 1 or trial_dir.parent.name != "agent-trials" or any(path.resolve().parent != trial_dir for path in output_paths):
+            raise RuntimeError("Trial mode requires one operation and isolated agent-trials output directory")
+    elif not operations or any(item.get("status") != "approved" for item in operations):
         raise RuntimeError("CAM generation requires every process operation to be approved")
 
     document = App.newDocument("SeksunCNC_CAM")
@@ -920,6 +926,7 @@ def main():
                 emit_progress(
                     "operation_skipped", "%s 没有有效切削运动" % operation["id"],
                     setup_id=setup["id"], operation_id=operation["id"],
+                    path_commands=[item.Name for item in native.Path.Commands[:20]],
                     current=completed_operation_count, total=len(operations),
                 )
                 continue
@@ -988,6 +995,7 @@ def main():
     document.saveAs(fcstd_path)
     postprocessor.export(post_outputs, nc_path, postprocessor_args)
     result = {"engine": "FreeCAD Path (native operations)", "engine_version": ".".join(App.Version()[:3]),
+        "trial_only": trial_mode,
         "operation_backend": "native", "postprocessor": postprocessor_name, "generated_operations": generated,
         "native_operation_types": native_types, "setups": setup_results, "skipped": skipped,
         "path_command_count": sum(len(item.Path.Commands) for item in outputs), "preview_segments": preview,

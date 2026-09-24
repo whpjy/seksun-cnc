@@ -258,6 +258,16 @@ export type SimulationResult = {
   };
   surface: SimulationSurface;
   setup_surfaces?: SimulationSurface[];
+  operation_snapshots?: Array<{
+    operation_id: string;
+    setup_id?: string;
+    sequence?: number;
+    status: string;
+    cut_segment_count: number;
+    removed_volume_mm3?: number;
+    removed_volume_delta_mm3?: number;
+    remaining_volume_mm3?: number;
+  }>;
   warnings: string[];
 };
 
@@ -1093,6 +1103,21 @@ export type AgentWorkspace = {
     open_question_count?: number;
     blocking_question_count?: number;
     evidence_count?: number;
+    open_questions?: string[];
+    perception?: {
+      answer?: string;
+      confidence?: number;
+      resolved?: boolean;
+      missing_evidence?: string[];
+    };
+    trial?: {
+      operation_id?: string;
+      status?: "candidate" | "needs_review" | "blocked";
+      cut_segment_count?: number;
+      removed_volume_mm3?: number;
+      ai_verdict?: string;
+      production_ready?: false;
+    };
   } | null;
   events: AgentTraceEvent[];
   artifacts: AgentArtifact[];

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections.abc import Callable
 
 from app.agent.config import load_agent_settings
 from app.agent.execution_graph import run_operation_execution_subgraph
@@ -16,6 +17,10 @@ def run_execution(
     defects: list[dict] | None = None,
     actions: list[dict] | None = None,
     can_auto_replan: bool = False,
+    verification_status: str = "passed",
+    simulation_cut_segments: int = 1,
+    removed_volume_delta_mm3: float = 10.0,
+    review_callback: Callable[[dict], dict] | None = None,
     events: list[tuple[str, str, dict]] | None = None,
 ):
     settings = load_agent_settings({
@@ -53,15 +58,15 @@ def run_execution(
                     "operation_id": operation_id,
                     "status": "completed",
                     "sequence": index,
-                    "cut_segment_count": 1,
+                    "cut_segment_count": simulation_cut_segments,
                     "removed_volume_mm3": 10.0 * index,
-                    "removed_volume_delta_mm3": 10.0,
+                    "removed_volume_delta_mm3": removed_volume_delta_mm3,
                     "remaining_volume_mm3": 100.0 - 10.0 * index,
                 }
                 for index, operation_id in enumerate(generated_operations, 1)
             ],
         },
-        verification={"status": "passed"},
+        verification={"status": verification_status},
         collision={"status": "failed" if collisions else "passed", "collisions": collisions or []},
         remediation={
             "status": "action_required" if defects else "passed",
@@ -73,6 +78,7 @@ def run_execution(
         },
         settings=settings,
         progress_callback=report,
+        review_callback=review_callback,
     )
 
 
@@ -190,3 +196,57 @@ def test_execution_graph_does_not_release_unassigned_global_defect(tmp_path: Pat
     assert result["status"] == "action_required"
     assert result["summary"]["next_action"] == "engineering_review"
     assert result["summary"]["global_defect_ids"] == ["DEF-GLOBAL"]
+
+
+def test_execution_graph_blocks_simulation_without_real_cut_segments(tmp_path: Path) -> None:
+    result = run_execution(
+        tmp_path, job_id="job-no-cut", operations=sample_operations(),
+        generated_operations=["OP10", "OP20"], simulation_cut_segments=0,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["records"][0]["status"] == "blocked"
+    assert result["summary"]["skipped_operation_ids"] == ["OP20"]
+
+
+def test_execution_graph_requires_review_when_cut_has_no_measured_removal(tmp_path: Path) -> None:
+    result = run_execution(
+        tmp_path, job_id="job-zero-removal", operations=sample_operations(),
+        generated_operations=["OP10", "OP20"], removed_volume_delta_mm3=0.0,
+    )
+
+    assert result["status"] == "action_required"
+    assert result["records"][0]["status"] == "action_required"
+    assert result["summary"]["skipped_operation_ids"] == ["OP20"]
+
+
+def test_execution_graph_does_not_release_failed_global_verification(tmp_path: Path) -> None:
+    result = run_execution(
+        tmp_path, job_id="job-global-failure", operations=sample_operations(),
+        generated_operations=["OP10", "OP20"], verification_status="failed",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["summary"]["verification_status"] == "failed"
+    assert result["summary"]["next_action"] == "manual_review"
+
+
+def test_execution_graph_stops_before_next_operation_when_ai_requests_repair(tmp_path: Path) -> None:
+    reviewed: list[str] = []
+
+    def review(record: dict) -> dict:
+        reviewed.append(record["operation_id"])
+        return {"status": "completed", "review": {
+            "verdict": "repair", "confidence": 0.91,
+            "missing_evidence": [], "suggested_changes": ["adjust allowance"],
+        }}
+
+    result = run_execution(
+        tmp_path, job_id="job-ai-repair", operations=sample_operations(),
+        generated_operations=["OP10", "OP20"], review_callback=review,
+    )
+
+    assert reviewed == ["OP10"]
+    assert result["records"][0]["status"] == "action_required"
+    assert result["summary"]["skipped_operation_ids"] == ["OP20"]
+    assert result["summary"]["next_action"] == "engineering_review"
