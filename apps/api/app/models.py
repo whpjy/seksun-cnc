@@ -479,6 +479,12 @@ class FeatureReviewRequest(BaseModel):
     review_state: Literal["accepted", "review", "excluded"]
 
 
+class L32ProfileDecisionRequest(BaseModel):
+    profile_id: str
+    review_state: Literal["accepted", "excluded"]
+    retry_validation: bool = True
+
+
 class SolidSelectionRequest(BaseModel):
     solid_index: int = Field(ge=1)
 

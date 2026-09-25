@@ -354,3 +354,95 @@ def apply_execution_trace(
     updated.revision += 1
     updated.updated_at = utc_now()
     return updated
+
+
+def apply_l32_draft_execution_trace(
+    world: ManufacturingWorldModel,
+    execution: dict[str, Any],
+) -> ManufacturingWorldModel:
+    """Record L32 rolling material evidence without claiming production release."""
+    updated = world.model_copy(deep=True)
+    records = {
+        str(item.get("operation_id")): item
+        for item in execution.get("records", [])
+        if isinstance(item, dict) and item.get("operation_id")
+    }
+    for operation in updated.operations:
+        record = records.get(operation.id)
+        if record is None:
+            continue
+        evidence = dict(record.get("evidence") or {})
+        evidence_id = f"l32-draft:{operation.id}:attempt:{operation.attempts + 1}"
+        updated.evidence.append(EvidenceReference(
+            id=evidence_id,
+            kind="simulation",
+            source="agent-l32-execution.json",
+            summary=f"{operation.id} L32 DRAFT 刀路、连续材料状态与审核：{record.get('status')}",
+            operation_id=operation.id,
+        ))
+        operation.evidence_ids.append(evidence_id)
+        operation.attempts += 1
+        operation.review = {
+            "verdict": record.get("status"),
+            "release_status": "DRAFT",
+            "production_ready": False,
+            "evidence": evidence,
+            "blocking_reasons": record.get("blocking_reasons", []),
+            "ai_review": record.get("ai_review"),
+        }
+        operation.status = (
+            "verified" if record.get("status") == "passed"
+            else "action_required" if record.get("status") == "action_required"
+            else "blocked"
+        )
+        if record.get("status") == "passed":
+            updated.material_states.append(MaterialState(
+                sequence=len(updated.material_states),
+                kind="after_operation",
+                operation_id=operation.id,
+                status="candidate",
+                remaining_volume_mm3=evidence.get("remaining_volume_mm3"),
+                artifact=f"turning-continuous-simulation.json#operation={operation.id}",
+            ))
+        updated.decisions.append({
+            "at": utc_now(),
+            "kind": "l32_draft_operation_gate",
+            "operation_id": operation.id,
+            "decision": operation.status,
+            "release_status": "DRAFT",
+            "evidence_ids": [evidence_id],
+        })
+
+    failed = next((item for item in updated.operations if item.status in {"blocked", "action_required"}), None)
+    unreviewed = next((item for item in updated.operations if item.status in {"proposed", "compiled", "executed"}), None)
+    summary_status = str(execution.get("status", "blocked"))
+    if failed is not None:
+        updated.lifecycle = "waiting_human" if failed.status == "blocked" else "repairing"
+        updated.next_action = "human_review" if failed.status == "blocked" else "repair"
+        updated.current_operation_id = failed.id
+        updated.current_objective = f"处理 {failed.id} 的 L32 DRAFT 审核问题"
+    elif unreviewed is not None:
+        updated.lifecycle = "awaiting_execution"
+        updated.next_action = "compile"
+        updated.current_operation_id = unreviewed.id
+        updated.current_objective = f"生成并验证 {unreviewed.id} 的专用刀路与材料状态"
+    else:
+        updated.lifecycle = "waiting_human"
+        updated.next_action = "human_review"
+        updated.current_operation_id = None
+        updated.current_objective = (
+            "L32 DRAFT 逐工序材料验证完成；等待三维机床碰撞、后处理器和工程师放行"
+            if summary_status == "passed" else "复核 L32 DRAFT 执行结果"
+        )
+    updated.stop_conditions.update({
+        "all_operations_committed": False,
+        "real_toolpaths_available": bool(records) and all(
+            bool((item.get("evidence") or {}).get("toolpath_generated")) for item in records.values()
+        ),
+        "simulation_passed": summary_status == "passed",
+        "machine_level_collision_verified": False,
+        "production_release_ready": False,
+    })
+    updated.revision += 1
+    updated.updated_at = utc_now()
+    return updated

@@ -23,7 +23,7 @@ from .models import (
     AxialDrillingOperationReviewRequest, BoringOperationReviewRequest, FeatureReviewRequest, GeometryAnalysis, GroovingOperationReviewRequest, JobHistoryItem, JobResponse, OperationCreateRequest,
     GrooveBindingConfirmRequest, ManufacturingRequirement, ManufacturingRequirements,
     ManufacturingRequirementsImportRequest, OperationReorderRequest, OperationUpdateRequest,
-    ProcessPlan, SafetyConfigurationRequest, ThreadBindingConfirmRequest,
+    L32ProfileDecisionRequest, ProcessPlan, SafetyConfigurationRequest, ThreadBindingConfirmRequest,
     ThreadOperationReviewRequest,
     SolidSelectionRequest,
 )
@@ -98,6 +98,8 @@ AGENT_PERCEPTION_LOCK = threading.Lock()
 AGENT_PERCEIVING_JOBS: set[str] = set()
 AGENT_TRIAL_LOCK = threading.Lock()
 AGENT_TRIALING_JOBS: set[str] = set()
+L32_PROFILE_REVIEW_LOCK = threading.Lock()
+L32_PROFILE_REVIEWING_JOBS: set[str] = set()
 L32_MATERIAL_SNAPSHOT_LOCK = threading.Lock()
 AI_REVIEWING_JOBS: set[str] = set()
 JOB_EVENT_CONDITION = threading.Condition()
@@ -1209,10 +1211,6 @@ def apply_l32_machine_configuration(
         back_module_available
         and job.plan.stock.get("nonrotational_turning_limit_z_mm") is None
     )
-    regional_backside = any(
-        item.id == "OP58-BACK"
-        for setup in job.plan.setups for item in setup.operations
-    )
     for setup in job.plan.setups:
         for operation in setup.operations:
             if operation.workpiece_side != "back":
@@ -1220,9 +1218,7 @@ def apply_l32_machine_configuration(
             if operation.type in {"pocket_roughing", "pocket_finishing"}:
                 operation.enabled = back_live_tool_available
             else:
-                operation.enabled = back_turning_enabled and not (
-                    regional_backside and operation.id == "OP60"
-                )
+                operation.enabled = back_turning_enabled and operation.id != "OP60"
             operation.generation_state = "dirty"
     warning = (
         "当前零件背面含非回转结构，原背轴车削工序会误切成品，已保持禁用。"
@@ -1235,8 +1231,8 @@ def apply_l32_machine_configuration(
         job.plan.warnings = [item for item in job.plan.warnings if item != warning]
     elif warning not in job.plan.warnings:
         job.plan.warnings.append(warning)
-    redundant_cleanup_warning = "背面区域精车 OP58-BACK 已覆盖切断邻域；旧版 OP60 清根工序保持禁用以防重复过切。"
-    if regional_backside and any(
+    redundant_cleanup_warning = "旧版 OP60 清根与前序轮廓加工重复，已保持禁用以防空走刀或重复过切。"
+    if any(
         item.id == "OP60" for setup in job.plan.setups for item in setup.operations
     ):
         if redundant_cleanup_warning not in job.plan.warnings:
@@ -1647,6 +1643,129 @@ def generate_inner_bore_chain_draft(
     return result
 
 
+def _run_l32_operation_execution_agent(
+    job_id: str,
+    job: JobResponse,
+    result: WholePartDraftResult,
+) -> dict[str, object] | None:
+    from .agent.config import load_agent_settings
+    from .agent.l32_execution_graph import run_l32_operation_execution_graph
+    from .agent.operation_review import review_operation_evidence
+    from .agent.world_model import (
+        apply_l32_draft_execution_trace,
+        create_manufacturing_world_model,
+        load_world_model,
+    )
+    from .qwen import load_qwen_settings
+
+    settings = load_agent_settings()
+    if not settings.enabled or not job.plan:
+        return None
+    directory = job_directory(job_id)
+    operations = {
+        operation.id: operation.model_dump(mode="json")
+        for setup in job.plan.setups for operation in setup.operations
+        if operation.enabled
+    }
+    ai_review_enabled = (
+        settings.writes_production_results
+        and isinstance(job.plan.ai_planning, dict)
+        and job.plan.ai_planning.get("planner") == "langgraph_ai_primary"
+    )
+    qwen_settings = load_qwen_settings() if ai_review_enabled else None
+    model_view = directory / "agent-perception-contact-sheet.png"
+
+    def review_record(record: dict[str, object]) -> dict[str, object]:
+        return review_operation_evidence(
+            str(record["operation_id"]),
+            {
+                "machine": "Citizen Cincom L32",
+                "release_status": "DRAFT",
+                "machine_configuration_hash": result.machine_configuration_hash,
+                "operation": record.get("operation"),
+                "channel_id": record.get("channel_id"),
+                "phase": record.get("phase"),
+                "verification_status": record.get("verification_status"),
+                "evidence": record.get("evidence"),
+                "blocking_reasons": record.get("blocking_reasons"),
+                "known_limitations": [
+                    "轴对称 Z-R 连续材料仿真",
+                    "尚未完成三维整机、刀杆、夹头和导套碰撞验证",
+                    "尚未认证 MELDAS/CINCOM 后处理器",
+                ],
+            },
+            model_view=model_view if model_view.is_file() else None,
+            settings=qwen_settings,
+        )
+
+    def report(stage: str, message: str, **details: object) -> None:
+        operation_id = details.get("operation_id")
+        terminal = stage in {"review_operation", "summarize_execution"}
+        publish_job_event(
+            job_id, "l32_operation_execution", message, 99,
+            agent_node=stage,
+            agent_title=("L32 逐工序审核汇总" if stage == "summarize_execution" else f"L32 工序审核 · {operation_id or stage}"),
+            agent_kind="validation" if terminal else "tool_result",
+            agent_status="completed" if terminal else "running",
+            viewer={"kind": "operation", "operation_id": operation_id, "mode": "仿真"} if operation_id else None,
+            evidence=[
+                {"label": key, "value": value}
+                for key, value in details.items()
+                if isinstance(value, (str, int, float, bool))
+            ],
+            **details,
+        )
+
+    trace = run_l32_operation_execution_graph(
+        job_id=job_id,
+        stages=[item.model_dump(mode="json") for item in result.stages],
+        operations=operations,
+        toolpath=result.toolpath.model_dump(mode="json"),
+        continuous_simulation=result.continuous_simulation.model_dump(mode="json"),
+        settings=settings,
+        progress_callback=report,
+        review_callback=review_record if ai_review_enabled else None,
+    )
+    payload: dict[str, object] = {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "mode": settings.mode,
+        "review_mode": (
+            "multimodal_ai" if ai_review_enabled and model_view.is_file()
+            else "structured_ai" if ai_review_enabled else "deterministic_rules"
+        ),
+        "release_status": "DRAFT",
+        "production_ready": False,
+        "status": trace.get("status"),
+        "summary": trace.get("summary", {}),
+        "records": trace.get("records", []),
+    }
+    write_json(directory / "agent-l32-execution.json", payload)
+
+    world_path = directory / "agent-world-model.json"
+    world = load_world_model(world_path)
+    if world is None and job.analysis:
+        world = create_manufacturing_world_model(
+            job_id=job_id, analysis=job.analysis, plan=job.plan,
+            material=job.material, machine=job.machine, filename=job.filename,
+            model_url=job.model_url,
+        )
+    if world is not None:
+        world = apply_l32_draft_execution_trace(world, payload)
+        write_json(world_path, world.model_dump(mode="json"))
+    publish_job_event(
+        job_id, "l32_operation_execution", "L32 逐工序 DRAFT 审核记录已归档", 100,
+        agent_node="archive_l32_execution", agent_title="L32 执行证据",
+        agent_kind="artifact", agent_status="completed",
+        execution_status=payload["status"], release_status="DRAFT", production_ready=False,
+        artifacts=[{
+            "id": "agent-l32-execution", "label": "L32 逐工序 DRAFT 审核", "kind": "json",
+            "url": f"/api/v1/jobs/{job_id}/files/agent-l32-execution.json",
+        }],
+    )
+    return payload
+
+
 @app.post(
     "/api/v1/jobs/{job_id}/turning/whole-program/draft",
     response_model=WholePartDraftResult,
@@ -1723,6 +1842,318 @@ def generate_turning_whole_program_draft(
     write_json(directory / "turning-whole-program-timeline.json", result.timeline.model_dump(mode="json"))
     write_json(directory / "turning-continuous-simulation.json", result.continuous_simulation.model_dump(mode="json"))
     write_json(directory / "turning-whole-program-draft.json", result.model_dump(mode="json"))
+    _run_l32_operation_execution_agent(job_id, job, result)
+    return result
+
+
+def _create_l32_whole_program_with_agent_loop(job_id: str) -> WholePartDraftResult:
+    """Compile the L32 whole-part DRAFT and run its per-operation evidence graph.
+
+    Planning used to skip L32 here because the generic FreeCAD CAM pipeline is
+    not its execution engine.  The L32 compiler already owns a continuous stock
+    simulation and an operation execution graph, so use that native path.
+    """
+    job = load_job(job_id)
+    if not job.plan or not job.machine_instance_id:
+        raise ValueError("L32 工艺尚未绑定可验证的机床实例")
+    directory = job_directory(job_id)
+    rotational = RotationalFeatureAnalysis.model_validate_json(
+        (directory / "rotational-features.json").read_text(encoding="utf-8")
+    )
+    accepted_profile = next(
+        (item for item in rotational.profiles if item.review_state == "accepted"), None,
+    )
+    # An agent trial may use the strongest non-excluded profile as a provisional
+    # hypothesis.  It remains a DRAFT and must not be confused with the stricter
+    # public whole-program endpoint, which still requires human acceptance and
+    # complete target coverage before release-oriented planning.
+    source_profile = accepted_profile or max(
+        (item for item in rotational.profiles if item.review_state != "excluded"),
+        key=lambda item: (item.confidence, len(item.points)),
+        default=None,
+    )
+    if source_profile is None:
+        raise ValueError("L32 试算缺少可用的回转轮廓")
+    z_values = [point.z for point in source_profile.points]
+    z_min, z_max = min(z_values), max(z_values)
+    length = max(z_max - z_min, 1.0)
+    cutoff = next((
+        operation for setup in job.plan.setups for operation in setup.operations
+        if operation.id == "OP40"
+    ), None)
+    cutoff_z = float(cutoff.parameters.get("z_mm", z_min)) if cutoff else z_min
+    stock_radius = float(job.plan.stock.get("diameter_mm", 0) or 0) / 2
+    if stock_radius <= 0:
+        raise ValueError("L32 整件仿真缺少有效棒料直径")
+    request = WholePartDraftRequest(
+        machine_instance_id=job.machine_instance_id,
+        source_profile_id=source_profile.id,
+        stock_radius_mm=stock_radius,
+        initial_bore_radius_mm=0,
+        resolution_mm=0.1,
+        approach_z_mm=z_max + 2,
+        pickoff_z_mm=min(z_max - 0.2, cutoff_z + length * 0.6),
+        grip_length_mm=min(max(length * 0.3, 0.5), 8),
+        synchronization_rpm=1200,
+        sub_spindle_clamp_confirmed=True,
+    )
+    snapshot = load_machine_snapshot(directory / "machine-configuration.json")
+    if snapshot.configuration_hash != job.machine_configuration_hash:
+        raise ValueError("bound machine configuration hash mismatch")
+    compile_profile = (
+        source_profile if source_profile.review_state == "accepted"
+        else source_profile.model_copy(update={"review_state": "accepted"})
+    )
+    compile_plan = job.plan.model_copy(deep=True)
+    if accepted_profile is None:
+        compile_plan.stock["profile_review_state"] = "accepted"
+    try:
+        result = compile_whole_part_draft(job_id, request, compile_plan, compile_profile, snapshot)
+    except ValueError as whole_error:
+        # Preserve useful evidence instead of turning an all-program failure
+        # into an empty validation screen.  Front operations are executed in
+        # order against the previous stock state and the first real blocker is
+        # retained for the repair/replan decision.
+        from .turning_simulation import simulate_turning_stock
+
+        operations = {
+            operation.id: operation
+            for setup in compile_plan.setups for operation in setup.operations
+            if operation.enabled
+        }
+        trial_records: list[dict[str, object]] = []
+        stock_samples = None
+        trial_z_min, trial_z_max = z_min - 2, z_max + 2
+        for operation_id in ("OP10", "OP20", "OP30"):
+            operation = operations.get(operation_id)
+            if operation is None:
+                continue
+            publish_job_event(
+                job_id, "l32_operation_execution", f"正在试算 {operation_id} 并更新连续余料", 98,
+                agent_node="execute_operation", agent_title=f"L32 工序试算 · {operation_id}",
+                agent_kind="tool_call", agent_status="running", operation_id=operation_id,
+                viewer={"kind": "operation", "operation_id": operation_id, "mode": "仿真"},
+            )
+            try:
+                draft = compile_turning_draft(
+                    job_id,
+                    TurningDraftRequest(
+                        machine_instance_id=request.machine_instance_id,
+                        operation=operation,
+                        profile=compile_profile,
+                        stock_radius_mm=request.stock_radius_mm,
+                        initial_bore_radius_mm=request.initial_bore_radius_mm,
+                        z_min_mm=trial_z_min,
+                        z_max_mm=trial_z_max,
+                        resolution_mm=request.resolution_mm,
+                    ),
+                    snapshot,
+                )
+                simulation = simulate_turning_stock(
+                    draft.toolpath,
+                    stock_radius_mm=request.stock_radius_mm,
+                    initial_bore_radius_mm=request.initial_bore_radius_mm,
+                    z_min_mm=trial_z_min,
+                    z_max_mm=trial_z_max,
+                    resolution_mm=request.resolution_mm,
+                    initial_samples=stock_samples,
+                )
+                stock_samples = simulation.samples
+                record = {
+                    "operation_id": operation_id,
+                    "status": "passed",
+                    "command_count": sum(len(channel.commands) for channel in draft.toolpath.channels),
+                    "removed_volume_mm3": simulation.metrics.removed_volume_mm3,
+                    "remaining_volume_mm3": simulation.metrics.remaining_volume_mm3,
+                }
+                trial_records.append(record)
+                write_json(directory / f"l32-trial-{operation_id}.json", {
+                    "schema_version": "1.0.0", "release_status": "DRAFT",
+                    "production_ready": False, "record": record,
+                    "toolpath": draft.toolpath.model_dump(mode="json"),
+                    "simulation": simulation.model_dump(mode="json"),
+                })
+                publish_job_event(
+                    job_id, "l32_operation_execution", f"{operation_id} 试算完成，连续余料已更新", 98.5,
+                    agent_node="review_operation", agent_title=f"L32 工序审核 · {operation_id}",
+                    agent_kind="validation", agent_status="completed", operation_id=operation_id,
+                    evidence=[
+                        {"label": "去除体积", "value": round(simulation.metrics.removed_volume_mm3, 3)},
+                        {"label": "剩余体积", "value": round(simulation.metrics.remaining_volume_mm3, 3)},
+                    ],
+                    viewer={"kind": "operation", "operation_id": operation_id, "mode": "仿真"},
+                )
+            except (OSError, ValueError) as operation_error:
+                trial_records.append({
+                    "operation_id": operation_id, "status": "blocked", "reason": str(operation_error),
+                })
+                break
+        cutoff_operation = operations.get("OP40")
+        if cutoff_operation is not None:
+            finished_back_datum_z = float(cutoff_operation.parameters.get(
+                "finished_back_datum_z_mm", cutoff_operation.parameters.get("z_mm", z_min),
+            ))
+            backside_stock_radius = min(
+                request.stock_radius_mm,
+                max(point.radius for point in compile_profile.points) + 0.2,
+            )
+            for operation_id in ("OP50", "OP55-BACK", "OP58-BACK"):
+                operation = operations.get(operation_id)
+                if operation is None:
+                    continue
+                try:
+                    backside = compile_backside_draft(
+                        job_id,
+                        BacksideDraftRequest(
+                            machine_instance_id=request.machine_instance_id,
+                            source_profile_id=compile_profile.id,
+                            operation=operation,
+                            source_cutoff_z_mm=finished_back_datum_z,
+                            stock_radius_mm=backside_stock_radius,
+                            resolution_mm=request.resolution_mm,
+                        ),
+                        compile_profile,
+                        snapshot,
+                    )
+                    record = {
+                        "operation_id": operation_id,
+                        "status": "passed",
+                        "scope": "isolated_backside_trial",
+                        "command_count": sum(
+                            len(channel.commands) for channel in backside.draft.toolpath.channels
+                        ),
+                        "removed_volume_mm3": backside.draft.simulation.metrics.removed_volume_mm3,
+                    }
+                    trial_records.append(record)
+                    publish_job_event(
+                        job_id, "l32_operation_execution", f"{operation_id} 背面独立试算通过", 98.6,
+                        agent_node="review_operation", agent_title=f"L32 工序审核 · {operation_id}",
+                        agent_kind="validation", agent_status="completed", operation_id=operation_id,
+                        evidence=[{"label": "去除体积", "value": round(backside.draft.simulation.metrics.removed_volume_mm3, 3)}],
+                        viewer={"kind": "operation", "operation_id": operation_id, "mode": "仿真"},
+                    )
+                except (OSError, ValueError) as operation_error:
+                    trial_records.append({
+                        "operation_id": operation_id,
+                        "status": "blocked",
+                        "scope": "isolated_backside_trial",
+                        "reason": str(operation_error),
+                    })
+                    publish_job_event(
+                        job_id, "l32_operation_execution", f"{operation_id} 被真实可达性约束阻断", 98.7,
+                        agent_node="verify_operation", agent_title=f"L32 工序阻断 · {operation_id}",
+                        agent_kind="error", agent_status="blocked", operation_id=operation_id,
+                        evidence=[{"label": "阻断原因", "value": str(operation_error)[:500]}],
+                        viewer={"kind": "operation", "operation_id": operation_id, "mode": "仿真"},
+                    )
+
+        from .agent.config import load_agent_settings
+        from .agent.l32_repair_graph import run_l32_repair_graph
+
+        failed_operations = [
+            str(item["operation_id"]) for item in trial_records
+            if item.get("status") == "blocked"
+        ]
+
+        def report_repair(stage: str, message: str, **details: object) -> None:
+            terminal = stage == "repair_decision"
+            publish_job_event(
+                job_id, "l32_repair", message, 98.8,
+                agent_node=stage,
+                agent_title="L32 失败诊断与修正",
+                agent_kind="decision" if terminal else "reasoning",
+                agent_status="waiting" if terminal and details.get("decision") == "human_review" else "completed" if terminal else "running",
+                evidence=[
+                    {"label": key, "value": value}
+                    for key, value in details.items()
+                    if isinstance(value, (str, int, float, bool))
+                ],
+            )
+
+        coverage = evaluate_plan_coverage(job.analysis, job.plan) if job.analysis else None
+        validated_repairs: dict[str, tuple[ProcessPlan, WholePartDraftResult]] = {}
+
+        def validate_repair_candidate(candidate: dict[str, object]) -> dict[str, object]:
+            if candidate.get("id") != "replace_turning_tool_hand":
+                return {"status": "failed", "reason": "unsupported_repair_candidate"}
+            candidate_plan = compile_plan.model_copy(deep=True)
+            candidate_operations = {
+                operation.id: operation
+                for setup in candidate_plan.setups for operation in setup.operations
+            }
+            substitutions: list[dict[str, str]] = []
+            for operation_id in failed_operations:
+                operation = candidate_operations.get(operation_id)
+                if operation is None or operation.type not in {"turn_od_roughing", "turn_od_finishing"}:
+                    return {"status": "failed", "reason": f"{operation_id} 不支持左右手刀具自动替换"}
+                positive = operation.parameters.get("cut_direction", "negative_z") == "positive_z"
+                tool_id = (
+                    "TURN-OD-L-R" if positive and operation.type == "turn_od_roughing"
+                    else "TURN-OD-L-MICRO-F" if positive
+                    else "TURN-OD-R" if operation.type == "turn_od_roughing"
+                    else "TURN-OD-MICRO-F"
+                )
+                previous = operation.tool.id
+                operation.tool = get_tool(tool_id)
+                substitutions.append({"operation_id": operation_id, "from": previous, "to": tool_id})
+            try:
+                candidate_result = compile_whole_part_draft(
+                    job_id, request, candidate_plan, compile_profile, snapshot,
+                )
+            except (OSError, ValueError) as candidate_error:
+                return {"status": "failed", "reason": str(candidate_error), "substitutions": substitutions}
+            validated_repairs[str(candidate["id"])] = (candidate_plan, candidate_result)
+            return {
+                "status": "passed",
+                "whole_program_status": candidate_result.continuous_simulation.status,
+                "substitutions": substitutions,
+            }
+
+        repair_trace = run_l32_repair_graph(
+            job_id=job_id,
+            blocker=str(whole_error),
+            failed_operations=failed_operations,
+            profile_review_state=source_profile.review_state,
+            coverage_status=coverage.status if coverage else "unknown",
+            settings=load_agent_settings(),
+            validate_candidate=validate_repair_candidate,
+            progress_callback=report_repair,
+        )
+        selected_repair = (repair_trace.get("summary") or {}).get("selected_candidate")
+        selected_repair_id = str(selected_repair.get("id")) if isinstance(selected_repair, dict) else ""
+        incremental = {
+            "schema_version": "1.0.0", "job_id": job_id, "release_status": "DRAFT",
+            "production_ready": False, "status": "blocked",
+            "records": trial_records, "whole_program_blocker": str(whole_error),
+            "repair": repair_trace.get("summary", {}),
+            "repair_candidates": repair_trace.get("candidates", []),
+            "next_action": (repair_trace.get("summary") or {}).get("next_action", "human_review"),
+        }
+        write_json(directory / "agent-l32-incremental-trial.json", incremental)
+        if selected_repair_id in validated_repairs:
+            repaired_plan, result = validated_repairs[selected_repair_id]
+            job.plan = repaired_plan
+            job.plan.warnings.append("智能体已应用通过整件重编译与连续余料验证的刀具左右手修正。")
+            save_job(directory, job)
+        else:
+            raise ValueError(
+                f"{whole_error}; 已完成 {sum(item['status'] == 'passed' for item in trial_records)} "
+                "道前序工序试算，阻断证据已归档"
+            ) from whole_error
+    if accepted_profile is None:
+        result.warnings.append("本次智能体试算使用尚待人工确认的回转轮廓，不得用于生产放行。")
+    if job.analysis:
+        coverage = evaluate_plan_coverage(job.analysis, job.plan)
+        if coverage.status != "complete":
+            result.warnings.append(
+                f"整件制造覆盖尚不完整（{coverage.covered_count}/{coverage.target_count}）；"
+                "当前结果只验证已编译的 L32 车削子集。"
+            )
+    write_json(directory / "turning-whole-program-ir.json", result.toolpath.model_dump(mode="json"))
+    write_json(directory / "turning-whole-program-timeline.json", result.timeline.model_dump(mode="json"))
+    write_json(directory / "turning-continuous-simulation.json", result.continuous_simulation.model_dump(mode="json"))
+    write_json(directory / "turning-whole-program-draft.json", result.model_dump(mode="json"))
+    _run_l32_operation_execution_agent(job_id, job, result)
     return result
 
 
@@ -2103,7 +2534,7 @@ def _process_new_job(
                 candidate = ProcessPlan.model_validate(candidate_payload)
                 promoted = bool(evaluation.get("production_result_changed"))
                 selected_as_primary = bool(evaluation.get("primary_plan_selected"))
-                if selected_as_primary or promoted:
+                if (selected_as_primary or promoted) and bool(evaluation.get("eligible_for_promotion")):
                     plan = candidate
                 else:
                     plan.ai_planning = candidate.ai_planning
@@ -2215,7 +2646,48 @@ def _process_new_job(
         save_job(directory, job)
         cam_validation_outcome = "not_requested"
         if ai_assisted:
-            if plan.process_kind == "subtractive" and job.device_id != "citizen-cincom-l32" and plan.automation_status != "unsupported" and resolve_executable(FREECAD_CMD):
+            if (
+                plan.process_kind == "subtractive"
+                and job.device_id == "citizen-cincom-l32"
+                and plan.automation_status != "unsupported"
+            ):
+                report(
+                    "cam_validation", "正在编译 L32 整件刀路，并按工序验证连续余料", 97,
+                    agent_kind="tool_call", agent_status="running", agent_title="L32 逐工序执行与审核",
+                )
+                try:
+                    l32_result = _create_l32_whole_program_with_agent_loop(job_id)
+                    execution = _optional_job_json(directory, "agent-l32-execution.json") or {}
+                    execution_status = str(execution.get("status") or "blocked")
+                    simulation_status = l32_result.continuous_simulation.status
+                    cam_validation_outcome = (
+                        "failed" if simulation_status == "failed" or execution_status == "blocked"
+                        else "warning" if execution_status == "action_required"
+                        else "passed"
+                    )
+                    report(
+                        "cam_validation",
+                        "L32 刀路、连续余料与逐工序审核已归档" if cam_validation_outcome != "failed" else "L32 逐工序验证未通过，请检查阻断原因",
+                        99,
+                        agent_kind="validation",
+                        agent_status="blocked" if cam_validation_outcome == "failed" else "completed",
+                        agent_title="L32 仿真证据已归档",
+                        evidence=[
+                            {"label": "连续余料", "value": simulation_status},
+                            {"label": "逐工序审核", "value": execution_status},
+                            {"label": "已审核工序", "value": len(l32_result.stages)},
+                        ],
+                        viewer={"kind": "model", "url": job.model_url, "mode": "仿真"},
+                    )
+                except Exception as l32_error:
+                    cam_validation_outcome = "failed"
+                    detail = getattr(l32_error, "detail", None) or str(l32_error)
+                    report(
+                        "cam_validation", f"L32 刀路或逐工序仿真未完成：{detail}", 99,
+                        agent_kind="error", agent_status="failed", agent_title="L32 仿真失败",
+                        evidence=[{"label": "原因", "value": str(detail)[:500]}],
+                    )
+            elif plan.process_kind == "subtractive" and plan.automation_status != "unsupported" and resolve_executable(FREECAD_CMD):
                 report(
                     "cam_validation", "工艺草案已保存，正在生成真实刀路并验证累计余料", 97,
                     agent_kind="tool_call", agent_status="running", agent_title="逐工序刀路与仿真",
@@ -2275,7 +2747,8 @@ def _process_new_job(
             save_job(directory, job)
         report(
             "completed", "工艺方案已生成，仿真未通过或未完成，请复核" if cam_validation_outcome == "failed" else "工艺方案已生成，仿真待验证" if cam_validation_outcome == "unavailable" else "工艺方案与仿真证据已生成" if cam_validation_outcome in {"passed", "warning"} else "工艺方案已生成", 100,
-            agent_kind="result", agent_status="completed",
+            agent_kind="result",
+            agent_status="blocked" if cam_validation_outcome == "failed" else "waiting" if cam_validation_outcome == "unavailable" else "completed",
             validation_outcome=cam_validation_outcome,
             setup_count=len(plan.setups), operation_count=operation_count,
             coverage_score=plan.coverage.score if plan.coverage else None,
@@ -2457,6 +2930,269 @@ def get_job_planning_events(job_id: str) -> list[dict[str, object]]:
 @app.get("/api/v1/agent/architecture")
 def get_agent_architecture() -> dict[str, object]:
     return agent_architecture()
+
+
+def _l32_profile_undercut_spans(profile: object) -> list[dict[str, float]]:
+    """Return compact, UI-facing evidence for axial contour reversals."""
+    points = list(getattr(profile, "points", []) or [])
+    grouped: list[tuple[float, list[float]]] = []
+    for point in sorted(points, key=lambda item: (item.z, item.radius)):
+        if grouped and abs(grouped[-1][0] - point.z) <= 1e-9:
+            grouped[-1][1].append(float(point.radius))
+        else:
+            grouped.append((float(point.z), [float(point.radius)]))
+    side = str(getattr(profile, "side", "outer"))
+    nodes = [(z, max(radii) if side == "outer" else min(radii)) for z, radii in grouped]
+    ordered = sorted(nodes, reverse=True)
+    entered_reduced_diameter = False
+    spans: list[dict[str, float]] = []
+    for left, right in zip(ordered, ordered[1:]):
+        if right[1] < left[1] - 1e-6:
+            entered_reduced_diameter = True
+        elif entered_reduced_diameter and right[1] > left[1] + 1e-6:
+            spans.append({
+                "z_start_mm": round(min(left[0], right[0]), 4),
+                "z_end_mm": round(max(left[0], right[0]), 4),
+                "radius_before_mm": round(left[1], 4),
+                "radius_after_mm": round(right[1], 4),
+                "radial_change_mm": round(right[1] - left[1], 4),
+            })
+    return spans
+
+
+def _build_l32_agent_review_context(job_id: str) -> dict[str, object]:
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="该审核工作台仅适用于 L32 任务")
+    directory = job_directory(job_id)
+    rotational_path = directory / "rotational-features.json"
+    if not rotational_path.is_file():
+        raise HTTPException(status_code=409, detail="尚未生成回转轮廓分析")
+    rotational = RotationalFeatureAnalysis.model_validate_json(
+        rotational_path.read_text(encoding="utf-8")
+    )
+    usable_profiles = [item for item in rotational.profiles if item.review_state != "excluded"]
+    recommended = next(
+        (item for item in usable_profiles if item.review_state == "accepted"),
+        max(usable_profiles, key=lambda item: (item.confidence, len(item.points)), default=None),
+    )
+    trial: dict[str, object] = {}
+    trial_path = directory / "agent-l32-incremental-trial.json"
+    if trial_path.is_file():
+        try:
+            loaded = json.loads(trial_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                trial = loaded
+        except (OSError, ValueError):
+            trial = {}
+    candidate_labels = {
+        "reverse_backside_feed": "反向背面进给",
+        "split_monotonic_backside_regions": "拆分为可达的单调轮廓区域",
+        "dedicated_grooving_or_form_tool": "改用切槽刀、成形刀或动力刀具",
+        "replace_turning_tool_hand": "更换匹配进给方向的左右手车刀",
+        "engineering_review": "工程师复核加工策略",
+    }
+    candidates = []
+    for raw in trial.get("repair_candidates", []) or []:
+        if not isinstance(raw, dict):
+            continue
+        identifier = str(raw.get("id", "engineering_review"))
+        candidates.append({
+            "id": identifier,
+            "label": candidate_labels.get(identifier, identifier),
+            "kind": raw.get("kind"),
+            "operation_ids": raw.get("operation_ids", []),
+            "status": raw.get("validation_status", "awaiting_review"),
+            "reason": raw.get("reason", "需要补充工程证据后验证"),
+            "auto_applicable": bool(raw.get("auto_applicable", False)),
+        })
+    recommended_undercuts = _l32_profile_undercut_spans(recommended) if recommended else []
+    if not candidates and recommended_undercuts:
+        candidates = [
+            {
+                "id": "split_monotonic_backside_regions",
+                "label": candidate_labels["split_monotonic_backside_regions"],
+                "kind": "operation_split", "operation_ids": [],
+                "status": "awaiting_profile_confirmation",
+                "reason": "先确认轮廓，再把标准纵向车削限制在刀具可达的单调区间。",
+                "auto_applicable": False,
+            },
+            {
+                "id": "dedicated_grooving_or_form_tool",
+                "label": candidate_labels["dedicated_grooving_or_form_tool"],
+                "kind": "process_change", "operation_ids": [],
+                "status": "awaiting_profile_confirmation",
+                "reason": "轮廓反转区域可能需要切槽刀、成形刀或动力刀具，确认后再做刀具包络校核。",
+                "auto_applicable": False,
+            },
+        ]
+    records = [item for item in trial.get("records", []) or [] if isinstance(item, dict)]
+    failed = [item for item in records if item.get("status") == "blocked"]
+    profiles = []
+    for profile in rotational.profiles:
+        point_count = len(profile.points)
+        stride = max(1, (point_count + 179) // 180)
+        preview_points = profile.points[::stride]
+        if profile.points and preview_points[-1] != profile.points[-1]:
+            preview_points.append(profile.points[-1])
+        z_values = [point.z for point in profile.points]
+        radii = [point.radius for point in profile.points]
+        profiles.append({
+            "id": profile.id,
+            "side": profile.side,
+            "method": profile.extraction_method,
+            "confidence": profile.confidence,
+            "review_state": profile.review_state,
+            "review_reasons": profile.review_reasons,
+            "point_count": point_count,
+            "z_min_mm": min(z_values) if z_values else 0,
+            "z_max_mm": max(z_values) if z_values else 0,
+            "diameter_min_mm": min(radii) * 2 if radii else 0,
+            "diameter_max_mm": max(radii) * 2 if radii else 0,
+            "points": [{"z": point.z, "radius": point.radius} for point in preview_points],
+            "undercut_spans": _l32_profile_undercut_spans(profile),
+        })
+    blocker = str(trial.get("whole_program_blocker", ""))
+    if not blocker and recommended_undercuts:
+        blocker = f"候选轮廓包含 {len(recommended_undercuts)} 处轴向半径反转，标准纵向车刀可能无法连续到达。"
+    needs_review = bool(trial.get("status") == "blocked" or any(
+        profile.review_state == "review" for profile in rotational.profiles
+    ))
+    return {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "status": "waiting_human" if needs_review else "ready",
+        "title": "确认回转轮廓并选择修正策略" if needs_review else "回转轮廓已确认",
+        "summary": (
+            "智能体已保留通过的前序工序，只对阻断区域等待判断。确认后将重新编译并连续仿真。"
+            if needs_review else "当前回转轮廓已经人工确认，可用于下一轮 DRAFT 验证。"
+        ),
+        "recommended_profile_id": recommended.id if recommended else None,
+        "blocker": blocker,
+        "failed_operations": [str(item.get("operation_id")) for item in failed],
+        "passed_operation_count": sum(item.get("status") == "passed" for item in records),
+        "profiles": profiles,
+        "repair_candidates": candidates,
+        "next_action": trial.get("next_action", "confirm_profile" if needs_review else "retry_validation"),
+        "production_ready": False,
+    }
+
+
+@app.get("/api/v1/jobs/{job_id}/agent/l32/review")
+def get_l32_agent_review(job_id: str) -> dict[str, object]:
+    return _build_l32_agent_review_context(job_id)
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/profile-decision")
+def decide_l32_agent_profile(
+    job_id: str, request: L32ProfileDecisionRequest,
+) -> dict[str, object]:
+    with L32_PROFILE_REVIEW_LOCK:
+        if job_id in L32_PROFILE_REVIEWING_JOBS:
+            raise HTTPException(status_code=409, detail="该任务正在重新编译与验证")
+        L32_PROFILE_REVIEWING_JOBS.add(job_id)
+    try:
+        review_job_rotational_profile(
+            job_id, request.profile_id,
+            FeatureReviewRequest(review_state=request.review_state),
+        )
+        directory = job_directory(job_id)
+        from .agent.world_model import EvidenceReference, load_world_model
+        world_path = directory / "agent-world-model.json"
+        world = load_world_model(world_path)
+        if world is not None:
+            evidence_id = f"human-profile-review:{request.profile_id}:{world.revision + 1}"
+            world.evidence.append(EvidenceReference(
+                id=evidence_id, kind="human", source=f"rotational-features.json#{request.profile_id}",
+                summary=f"人工将回转轮廓 {request.profile_id} 标记为 {request.review_state}",
+            ))
+            for question in world.open_questions:
+                if question.status == "open" and (
+                    "轮廓" in question.question or "倒扣" in question.question
+                    or question.id.startswith("l32-profile")
+                ):
+                    question.status = "resolved"
+                    question.answer = f"{request.profile_id}: {request.review_state}"
+                    question.evidence_ids.append(evidence_id)
+            world.revision += 1
+            world.updated_at = utc_now()
+            world.decisions.append({
+                "at": utc_now(), "kind": "human_profile_review",
+                "profile_id": request.profile_id, "review_state": request.review_state,
+                "evidence_id": evidence_id,
+            })
+            world.lifecycle = "validating" if request.review_state == "accepted" else "waiting_human"
+            world.next_action = "compile" if request.review_state == "accepted" else "human_review"
+            world.current_objective = (
+                "按人工确认轮廓重新编译并连续仿真"
+                if request.review_state == "accepted" else "选择其他有效轮廓或补充制造策略"
+            )
+            write_json(world_path, world.model_dump(mode="json"))
+        publish_job_event(
+            job_id, "l32_profile_review",
+            f"已{('确认' if request.review_state == 'accepted' else '排除')}回转轮廓 {request.profile_id}",
+            98.9, agent_node="human_profile_review", agent_title="人工几何确认",
+            agent_kind="human", agent_status="completed",
+            evidence=[{"label": "轮廓", "value": request.profile_id}, {"label": "结论", "value": request.review_state}],
+            viewer={"kind": "features", "feature_ids": [request.profile_id]},
+        )
+        result_status = "reviewed"
+        validation_error = ""
+        if request.review_state == "accepted" and request.retry_validation:
+            (directory / "agent-l32-incremental-trial.json").unlink(missing_ok=True)
+            publish_job_event(
+                job_id, "l32_operation_execution", "正在按已确认轮廓重新编译并连续仿真", 99,
+                agent_node="retry_after_profile_review", agent_title="重新验证 L32 工艺",
+                agent_kind="tool_call", agent_status="running",
+            )
+            try:
+                _create_l32_whole_program_with_agent_loop(job_id)
+                result_status = "validated"
+                publish_job_event(
+                    job_id, "l32_operation_execution", "已确认轮廓的整件编译与连续仿真通过", 100,
+                    agent_node="retry_after_profile_review", agent_title="L32 重新验证完成",
+                    agent_kind="tool_result", agent_status="completed",
+                )
+            except (OSError, ValueError, HTTPException) as error:
+                validation_error = str(error.detail if isinstance(error, HTTPException) else error)
+                result_status = "waiting_human"
+                from .agent.world_model import OpenQuestion, load_world_model as reload_world_model
+                blocked_world = reload_world_model(world_path)
+                if blocked_world is not None:
+                    blocked_world.revision += 1
+                    blocked_world.updated_at = utc_now()
+                    blocked_world.lifecycle = "waiting_human"
+                    blocked_world.next_action = "human_review"
+                    blocked_world.current_objective = "为阻断区域选择专用工艺并重新验证"
+                    if not any(
+                        item.id == "l32-special-process" and item.status == "open"
+                        for item in blocked_world.open_questions
+                    ):
+                        blocked_world.open_questions.append(OpenQuestion(
+                            id="l32-special-process",
+                            question="阻断区域应拆分加工，还是改用切槽刀、成形刀或动力刀具？",
+                            reason=validation_error[:500],
+                            priority="critical",
+                            blocking=True,
+                        ))
+                    blocked_world.decisions.append({
+                        "at": utc_now(), "kind": "validation_blocked_after_profile_review",
+                        "profile_id": request.profile_id, "summary": validation_error[:500],
+                    })
+                    write_json(world_path, blocked_world.model_dump(mode="json"))
+                publish_job_event(
+                    job_id, "l32_operation_execution", "重新验证仍被真实制造约束阻断", 99,
+                    agent_node="retry_after_profile_review", agent_title="需要选择专用工艺",
+                    agent_kind="error", agent_status="waiting",
+                    evidence=[{"label": "阻断原因", "value": validation_error[:500]}],
+                )
+        context = _build_l32_agent_review_context(job_id)
+        context["decision_status"] = result_status
+        context["validation_error"] = validation_error
+        return context
+    finally:
+        with L32_PROFILE_REVIEW_LOCK:
+            L32_PROFILE_REVIEWING_JOBS.discard(job_id)
 
 
 @app.get("/api/v1/jobs/{job_id}/agent/workspace")

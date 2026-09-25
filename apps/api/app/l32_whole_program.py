@@ -106,7 +106,7 @@ def compile_whole_part_draft(
     has_back_region = all(item in operations for item in ("OP55-BACK", "OP58-BACK"))
     required_ids = ["OP10", "OP20", "OP30", "OP40", "OP50"]
     required_ids.extend(["OP21-FORM", "OP31-FORM"] if has_front_form else [])
-    required_ids.extend(["OP55-BACK", "OP58-BACK"] if has_back_region else ["OP60"])
+    required_ids.extend(["OP55-BACK", "OP58-BACK"] if has_back_region else [])
     missing = [operation_id for operation_id in required_ids if operation_id not in operations]
     disabled = [operation_id for operation_id in required_ids if operation_id in operations and not operations[operation_id].enabled]
     if missing:
@@ -182,7 +182,7 @@ def compile_whole_part_draft(
     finished_radius = max(point.radius for point in source_profile.points)
     backside_stock_radius = min(request.stock_radius_mm, finished_radius + 0.2)
     backside_results = []
-    for operation_id in ["OP50", *([] if has_back_region else ["OP60"])]:
+    for operation_id in ["OP50"]:
         backside_results.append(compile_backside_draft(
             job_id,
             BacksideDraftRequest(
@@ -311,7 +311,7 @@ def compile_whole_part_draft(
         verification_status=_verification_status(transfer),
     ))
     sub_cursor = len(next(channel.commands for channel in transfer.toolpath.channels if channel.id == "sub")) + 1
-    backside_stage_ids = ["OP50"] if has_back_region else ["OP50", "OP60"]
+    backside_stage_ids = ["OP50"]
     for operation, result in zip(
         (operations[item] for item in backside_stage_ids), backside_results,
     ):

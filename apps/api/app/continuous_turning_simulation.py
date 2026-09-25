@@ -145,6 +145,33 @@ def _volume(samples: list[TurningStockSample]) -> float:
     return max(total, 0)
 
 
+def _retained_material_boundary(program: ToolpathProgram, datum_z_mm: float) -> float:
+    """Return the main-spindle Z at the retained edge of the cutoff kerf.
+
+    The finished back datum and the physical post-cut face are intentionally
+    different when OP50 has facing stock.  Deriving the physical edge from the
+    actual cutoff command keeps the transferred material state aligned with the
+    generated toolpath rather than reconstructing an already-finished face.
+    """
+    main = next((item for item in program.channels if item.id == "main"), None)
+    if main is None:
+        raise ValueError("whole-part program is missing channel: main")
+    cutoff_feed = next((
+        command for command in main.commands
+        if command.operation_id == "OP40"
+        and command.type == "feed_move"
+        and command.parameters.get("cut_side") == "external"
+        and float(command.parameters.get("axial_width_mm", 0)) > 0
+        and "Z" in command.axes
+    ), None)
+    if cutoff_feed is None:
+        raise ValueError("whole-part program does not expose the OP40 cutoff kerf")
+    boundary = float(cutoff_feed.axes["Z"]) + float(cutoff_feed.parameters["axial_width_mm"]) / 2
+    if boundary > datum_z_mm + 1e-9:
+        raise ValueError("cutoff kerf intrudes beyond the finished back datum")
+    return boundary
+
+
 def simulate_continuous_whole_part(
     program: ToolpathProgram,
     *,
@@ -174,6 +201,7 @@ def simulate_continuous_whole_part(
         z_max_mm=main_z_max_mm,
         resolution_mm=resolution_mm,
     )
+    retained_boundary_z_mm = _retained_material_boundary(program, transfer_datum_z_mm)
     retained_interior = [
         TurningStockSample(
             z=round(transfer_datum_z_mm - sample.z, 6),
@@ -181,18 +209,18 @@ def simulate_continuous_whole_part(
             inner_radius=sample.inner_radius,
         )
         for sample in main_result.samples
-        if sample.z > transfer_datum_z_mm + 1e-9
+        if sample.z > retained_boundary_z_mm + 1e-9
     ]
     retained_interior.sort(key=lambda item: item.z)
     if len(retained_interior) < 2:
         raise ValueError("cutoff transfer produced fewer than two retained material samples")
-    datum_side = max(retained_interior, key=lambda item: item.z)
+    boundary_side = max(retained_interior, key=lambda item: item.z)
     retained = [
         *retained_interior,
         TurningStockSample(
-            z=0,
-            outer_radius=datum_side.outer_radius,
-            inner_radius=datum_side.inner_radius,
+            z=round(transfer_datum_z_mm - retained_boundary_z_mm, 6),
+            outer_radius=boundary_side.outer_radius,
+            inner_radius=boundary_side.inner_radius,
         ),
     ]
     retained.sort(key=lambda item: item.z)

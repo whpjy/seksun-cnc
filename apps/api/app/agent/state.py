@@ -49,6 +49,21 @@ class OperationExecutionState(TypedDict, total=False):
     status: Literal["running", "passed", "action_required", "blocked"]
 
 
+class L32OperationExecutionState(TypedDict, total=False):
+    job_id: str
+    mode: Literal["disabled", "shadow", "active"]
+    stages: list[dict[str, Any]]
+    operations: dict[str, dict[str, Any]]
+    toolpath: dict[str, Any]
+    continuous_simulation: dict[str, Any]
+    cursor: int
+    current_stage: dict[str, Any]
+    current_evidence: dict[str, Any]
+    records: list[dict[str, Any]]
+    summary: dict[str, Any]
+    status: Literal["running", "passed", "action_required", "blocked"]
+
+
 class ValidationRemediationState(TypedDict, total=False):
     job_id: str
     mode: Literal["disabled", "shadow", "active"]

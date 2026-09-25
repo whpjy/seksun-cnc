@@ -518,6 +518,52 @@ export type RotationalFeatureAnalysis = {
   warnings: string[];
 };
 
+export type L32AgentReviewContext = {
+  schema_version: string;
+  job_id: string;
+  status: "waiting_human" | "ready";
+  title: string;
+  summary: string;
+  recommended_profile_id: string | null;
+  blocker: string;
+  failed_operations: string[];
+  passed_operation_count: number;
+  profiles: Array<{
+    id: string;
+    side: "outer" | "inner";
+    method: RotationalProfile["extraction_method"];
+    confidence: number;
+    review_state: RotationalProfile["review_state"];
+    review_reasons: string[];
+    point_count: number;
+    z_min_mm: number;
+    z_max_mm: number;
+    diameter_min_mm: number;
+    diameter_max_mm: number;
+    points: Array<{ z: number; radius: number }>;
+    undercut_spans: Array<{
+      z_start_mm: number;
+      z_end_mm: number;
+      radius_before_mm: number;
+      radius_after_mm: number;
+      radial_change_mm: number;
+    }>;
+  }>;
+  repair_candidates: Array<{
+    id: string;
+    label: string;
+    kind?: string;
+    operation_ids: string[];
+    status: string;
+    reason: string;
+    auto_applicable: boolean;
+  }>;
+  next_action: string;
+  production_ready: false;
+  decision_status?: "reviewed" | "validated" | "waiting_human";
+  validation_error?: string;
+};
+
 export type TurningDraftResult = {
   schema_version: string;
   job_id: string;

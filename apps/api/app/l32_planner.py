@@ -542,6 +542,7 @@ def build_l32_process_plan(
                 )
                 for index, groove in enumerate(internal_groove_features, start=1)
             ]
+        back_face_allowance_mm = 0.25
         operations = [] if blocking_reasons else [
             create_operation_instance(
                 id="OP10", sequence=10, type="turn_facing", name="棒料端面建立 Z 基准",
@@ -693,12 +694,20 @@ def build_l32_process_plan(
                 feature_ids=[profile.id], tool=get_tool("TURN-CUTOFF-2"),
                 parameters={
                     **_turning_parameters(0.05, cutting_speed * 0.65),
-                    "z_mm": finished_back_z - float(get_tool("TURN-CUTOFF-2").cutting_width_mm or 0) / 2,
+                    "z_mm": (
+                        finished_back_z
+                        - back_face_allowance_mm
+                        - float(get_tool("TURN-CUTOFF-2").cutting_width_mm or 0) / 2
+                    ),
                     "cutting_width_mm": 2.0,
                     "breakthrough_radius_mm": 0.1,
                     "finished_back_datum_z_mm": finished_back_z,
-                    "retained_material_min_z_mm": finished_back_z,
-                    "sacrificial_extension_mm": float(get_tool("TURN-CUTOFF-2").cutting_width_mm or 0),
+                    "retained_material_min_z_mm": finished_back_z - back_face_allowance_mm,
+                    "back_face_allowance_mm": back_face_allowance_mm,
+                    "sacrificial_extension_mm": (
+                        float(get_tool("TURN-CUTOFF-2").cutting_width_mm or 0)
+                        + back_face_allowance_mm
+                    ),
                 },
                 rationale=[
                     "切断刀中心向成品背面外偏移半个刀宽，使完整刀缝落在牺牲余料内",
@@ -788,20 +797,6 @@ def build_l32_process_plan(
                     ],
                     confidence=min(profile.confidence, 0.7), status="warning",
                 )] if backside_turning_candidate is not None else []),
-                *([create_operation_instance(
-                    id="OP60", sequence=60, type="turn_od_finishing", name="背面切断邻域外圆清根",
-                    channel_id="sub", spindle_id="sub", workpiece_side="back",
-                    synchronization_group="TRANSFER-1", enabled=False,
-                    feature_ids=[back_profile_id], tool=get_tool("TURN-OD-F"),
-                    parameters={
-                        **common_finish,
-                        "radial_allowance_mm": 0.0,
-                        "axial_allowance_mm": 0.0,
-                        "back_cleanup_length_mm": 1.0,
-                    },
-                    rationale=["仅精车背面切断邻域，不重复加工完整外圆", "绑定具备 back_turning 能力的设备实例后启用"],
-                    confidence=min(profile.confidence, 0.75), status="warning",
-                )] if backside_turning_candidate is None and protected_limit is None else []),
                 ],
             ))
 

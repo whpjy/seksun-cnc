@@ -122,6 +122,7 @@ def test_active_graph_promotes_only_eligible_candidate(tmp_path: Path) -> None:
 
     assert result["status"] == "eligible"
     assert result["evaluation"]["production_result_changed"] is True
+    assert result["evaluation"]["eligible_for_promotion"] is True
     assert result["evaluation"]["primary_plan_selected"] is True
     audit = result["evaluation"]["operation_audit"]
     assert audit["operation_count"] > 0
@@ -153,6 +154,7 @@ def test_operation_audit_blocks_planned_cam_capability(tmp_path: Path) -> None:
 
     assert result["status"] == "blocked"
     assert result["evaluation"]["production_result_changed"] is False
+    assert result["evaluation"]["primary_plan_selected"] is False
     assert result["evaluation"]["operation_audit"]["status"] == "blocked"
     assert "AI-UNSUPPORTED" in result["evaluation"]["operation_audit"]["blocked_operation_ids"]
 
@@ -232,7 +234,8 @@ def test_agent_compiler_applies_remove_and_add_decisions(tmp_path: Path) -> None
         for setup in result["candidate_plan"]["setups"]
     )
     assert result["candidate_plan"]["ai_planning"]["planner"] == "langgraph_ai_primary"
-    assert result["evaluation"]["primary_plan_selected"] is True
+    assert result["evaluation"]["eligible_for_promotion"] is False
+    assert result["evaluation"]["primary_plan_selected"] is False
 
 
 def test_graph_falls_back_when_ai_review_fails(tmp_path: Path) -> None:
@@ -243,4 +246,5 @@ def test_graph_falls_back_when_ai_review_fails(tmp_path: Path) -> None:
 
     assert result["status"] == "fallback"
     assert result["evaluation"]["eligible_for_promotion"] is False
+    assert result["evaluation"]["primary_plan_selected"] is False
     assert "provider unavailable" in result["evaluation"]["blocking_reasons"][0]

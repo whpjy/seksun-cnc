@@ -73,7 +73,9 @@ def _evaluate_candidate(
         "mode": settings.mode,
         "eligible_for_promotion": eligible,
         "production_result_changed": settings.writes_production_results and eligible,
-        "primary_plan_selected": settings.writes_production_results,
+        # Active mode grants permission to write a result, but it must never
+        # bypass the same promotion gate used for production changes.
+        "primary_plan_selected": settings.writes_production_results and eligible,
         "blocking_reasons": blocking_reasons,
         "risk_counts": risk_counts,
         "requires_engineer_review": requires_review,
@@ -138,6 +140,7 @@ def build_process_planning_subgraph(
                     "schema_version": "1.0.0", "mode": settings.mode,
                     "eligible_for_promotion": False,
                     "production_result_changed": False,
+                    "primary_plan_selected": False,
                     "blocking_reasons": [f"AI 研判不可用：{error}"],
                 },
             }

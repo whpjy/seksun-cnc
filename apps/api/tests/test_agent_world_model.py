@@ -8,7 +8,7 @@ from app.agent.workspace import build_agent_workspace
 from app.agent.world_model import (
     ManufacturingWorldModel,
     OpenQuestion,
-    apply_execution_trace,
+    apply_execution_trace, apply_l32_draft_execution_trace,
     create_manufacturing_world_model,
 )
 
@@ -204,6 +204,27 @@ def test_world_model_holds_local_pass_when_global_verification_fails() -> None:
     assert updated.next_action == "human_review"
     assert len(updated.material_states) == 1
     assert updated.stop_conditions["all_operations_committed"] is False
+
+
+def test_l32_draft_trace_preserves_candidate_material_without_production_commit() -> None:
+    updated = apply_l32_draft_execution_trace(sample_world(), {
+        "status": "passed",
+        "records": [{
+            "operation_id": "OP10", "status": "passed",
+            "evidence": {
+                "toolpath_generated": True,
+                "material_snapshot_available": True,
+                "remaining_volume_mm3": 81.0,
+            },
+            "release_status": "DRAFT", "production_ready": False,
+        }],
+    })
+
+    assert updated.operations[0].status == "verified"
+    assert updated.operations[0].review["production_ready"] is False
+    assert updated.material_states[-1].status == "candidate"
+    assert updated.stop_conditions["all_operations_committed"] is False
+    assert updated.stop_conditions["production_release_ready"] is False
 
 
 def test_workspace_exposes_world_summary_and_artifact(tmp_path: Path) -> None:

@@ -532,7 +532,7 @@ def test_binding_back_tooling_uses_sacrificial_cutoff_and_persists_whole_draft(
         operation for setup in bound.json()["plan"]["setups"] for operation in setup["operations"]
         if operation["workpiece_side"] == "back"
     ]
-    assert [operation["id"] for operation in back_operations] == ["OP50", "OP60"]
+    assert [operation["id"] for operation in back_operations] == ["OP50"]
     assert all(operation["enabled"] for operation in back_operations)
 
     operation = back_operations[0]
@@ -573,19 +573,33 @@ def test_binding_back_tooling_uses_sacrificial_cutoff_and_persists_whole_draft(
     payload = whole.json()
     assert payload["nc_generated"] is False
     assert [stage["operation_id"] for stage in payload["stages"]] == [
-        "OP10", "OP20", "OP30", "OP40", "OP50", "OP60",
+        "OP10", "OP20", "OP30", "OP40", "OP50",
     ]
     assert payload["coordinate_frames"][1]["source_cutoff_z_mm"] == -25
     assert payload["continuous_simulation"]["status"] == "passed"
     snapshots = payload["continuous_simulation"]["stage_snapshots"]
     assert [item["operation_id"] for item in snapshots] == [
-        "OP10", "OP20", "OP30", "OP40", "OP50", "OP60",
+        "OP10", "OP20", "OP30", "OP40", "OP50",
     ]
     assert snapshots[0]["channel_id"] == "main"
     assert snapshots[-1]["channel_id"] == "sub"
     assert snapshots[0]["before_samples"] != snapshots[0]["after_samples"]
     assert snapshots[-1]["metrics"]["remaining_volume_mm3"] <= snapshots[-1]["metrics"]["initial_volume_mm3"]
     assert (directory / "turning-whole-program-draft.json").is_file()
+    execution = json.loads((directory / "agent-l32-execution.json").read_text(encoding="utf-8"))
+    assert execution["status"] == "passed"
+    assert execution["release_status"] == "DRAFT"
+    assert execution["production_ready"] is False
+    assert [item["operation_id"] for item in execution["records"]] == [
+        "OP10", "OP20", "OP30", "OP40", "OP50",
+    ]
+    assert all(item["evidence"]["toolpath_generated"] for item in execution["records"])
+    assert all(item["evidence"]["removed_volume_delta_mm3"] > 0 for item in execution["records"])
+    assert execution["records"][-1]["operation_id"] == "OP50"
+    assert execution["records"][-1]["blocking_reasons"] == []
+    assert execution["summary"]["skipped_operation_ids"] == []
+    world = json.loads((directory / "agent-world-model.json").read_text(encoding="utf-8"))
+    assert world["stop_conditions"]["production_release_ready"] is False
 
     # A later enabled operation must not silently disappear from a regenerated
     # whole-part artifact, even when it has no new coverage target.

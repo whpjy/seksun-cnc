@@ -270,12 +270,13 @@ def test_l32_builds_formal_turning_plan_from_rotational_profile() -> None:
         "turn_od_finishing",
         "turn_cutoff",
     ]
-    assert [operation.id for operation in plan.setups[1].operations] == ["OP50", "OP60"]
+    assert [operation.id for operation in plan.setups[1].operations] == ["OP50"]
     cutoff = next(item for item in plan.setups[0].operations if item.id == "OP40")
-    assert cutoff.parameters["z_mm"] == -26
+    assert cutoff.parameters["z_mm"] == -26.25
     assert cutoff.parameters["finished_back_datum_z_mm"] == -25
-    assert cutoff.parameters["retained_material_min_z_mm"] == -25
-    assert cutoff.parameters["sacrificial_extension_mm"] == 2
+    assert cutoff.parameters["retained_material_min_z_mm"] == -25.25
+    assert cutoff.parameters["back_face_allowance_mm"] == 0.25
+    assert cutoff.parameters["sacrificial_extension_mm"] == 2.25
     assert all(not operation.enabled for operation in plan.setups[1].operations)
     assert all(operation.channel_id == "sub" for operation in plan.setups[1].operations)
     assert all(operation.spindle_id == "sub" for operation in plan.setups[1].operations)
@@ -315,7 +316,7 @@ def test_partial_rotational_section_cannot_define_whole_part_cutoff() -> None:
     assert plan.stock["length_mm"] == 54
     assert plan.stock["finished_back_z_mm"] == -25
     cutoff = next(item for item in plan.setups[0].operations if item.id == "OP40")
-    assert cutoff.parameters["z_mm"] == -26
+    assert cutoff.parameters["z_mm"] == -26.25
     assert cutoff.parameters["finished_back_datum_z_mm"] == -25
     assert plan.automation_status == "review"
     assert plan.coverage is not None
@@ -1054,6 +1055,67 @@ def test_profile_review_updates_the_formal_plan_and_invalidates_cam(tmp_path, mo
     assert persisted.plan.coverage is not None
     assert persisted.plan.coverage.targets[-1].state == "covered"
     assert not (directory / "toolpath.json").exists()
+
+
+def test_agent_profile_review_context_and_explicit_decision(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "a1" * 16
+    directory = tmp_path / job_id
+    directory.mkdir()
+    analysis = shaft_analysis()
+    job = JobResponse(
+        id=job_id,
+        status="completed",
+        filename="shaft.step",
+        created_at="2026-09-25T00:00:00+00:00",
+        material="S45C",
+        machine="Citizen Cincom L32",
+        device_id="citizen-cincom-l32",
+        analysis=analysis,
+        plan=build_process_plan(analysis, "S45C", "Citizen Cincom L32"),
+    )
+    main.save_job(directory, job)
+    rotational = infer_rotational_features(analysis)
+    profile_id = rotational.profiles[0].id
+    main.write_json(directory / "rotational-features.json", rotational.model_dump(mode="json"))
+    main.write_json(directory / "agent-l32-incremental-trial.json", {
+        "schema_version": "1.0.0",
+        "status": "blocked",
+        "whole_program_blocker": "轮廓存在标准纵向车刀无法从当前方向到达的倒扣",
+        "records": [
+            {"operation_id": "OP10", "status": "passed"},
+            {"operation_id": "OP55-BACK", "status": "blocked", "reason": "倒扣"},
+        ],
+        "repair_candidates": [{
+            "id": "dedicated_grooving_or_form_tool",
+            "kind": "process_change",
+            "operation_ids": ["OP55-BACK"],
+            "auto_applicable": False,
+            "validation_status": "rejected_by_safety_gate",
+            "reason": "需要专用刀具",
+        }],
+        "next_action": "confirm_profile_and_select_special_process",
+    })
+
+    context = client.get(f"/api/v1/jobs/{job_id}/agent/l32/review")
+
+    assert context.status_code == 200
+    assert context.json()["status"] == "waiting_human"
+    assert context.json()["recommended_profile_id"] == profile_id
+    assert context.json()["passed_operation_count"] == 1
+    assert context.json()["failed_operations"] == ["OP55-BACK"]
+    assert context.json()["repair_candidates"][0]["label"] == "改用切槽刀、成形刀或动力刀具"
+
+    decision = client.post(
+        f"/api/v1/jobs/{job_id}/agent/l32/profile-decision",
+        json={"profile_id": profile_id, "review_state": "accepted", "retry_validation": False},
+    )
+
+    assert decision.status_code == 200
+    assert decision.json()["decision_status"] == "reviewed"
+    persisted = main.load_job(job_id)
+    assert persisted.analysis is not None
+    assert persisted.analysis.rotational_profile_reviews[profile_id] == "accepted"
 
 
 def test_rotational_child_feature_review_persists_and_invalidates_cam(tmp_path, monkeypatch) -> None:

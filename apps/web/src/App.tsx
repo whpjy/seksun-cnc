@@ -31,7 +31,9 @@ import { L32Workbench } from "./L32Workbench";
 import { ToolLibraryPanel } from "./ToolLibraryPanel";
 import { ProcessDesigner } from "./ProcessDesigner";
 import { AgentWorkspacePanel } from "./AgentWorkspacePanel";
-import type { AgentArtifact, AgentTraceEvent, AgentWorkspace, BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, ManufacturingFeature, Operation, RotationalFeatureAnalysis, RotationalManufacturingFeature, RotationalProfile, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
+import AgentArtifactViewer from "./AgentArtifactViewer";
+import { L32AgentReviewPanel } from "./L32AgentReviewPanel";
+import type { AgentArtifact, AgentTraceEvent, AgentWorkspace, BacksideDraftResult, CamResult, Catalogs, DeviceLibrary, Job, L32AgentReviewContext, ManufacturingFeature, Operation, RotationalFeatureAnalysis, RotationalManufacturingFeature, RotationalProfile, SpatialDefectRegion, ToolpathSegment, TurningDraftResult, TurningStageView, Vec3, WholePartDraftResult } from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 const APP_NAME = (import.meta.env.VITE_APP_NAME ?? "NEXUS CNC").trim() || "NEXUS CNC";
@@ -569,6 +571,7 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
     { stage: "uploading", message: "三维模型上传完成", title: "模型接入", status: "completed", percent: 6 },
   ]);
   const [artifacts, setArtifacts] = useState<AgentArtifact[]>([]);
+  const [selectedAgentArtifact, setSelectedAgentArtifact] = useState<AgentArtifact | null>(null);
   const [orchestration, setOrchestration] = useState<AgentWorkspace["orchestration"]>();
   const [previewCam, setPreviewCam] = useState<CamResult | null>(null);
   const [liveToolpath, setLiveToolpath] = useState<ToolpathSegment[]>(EMPTY_TOOLPATH_SEGMENTS);
@@ -709,12 +712,13 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
   const sceneStages = [
     { label: "模型理解", hint: previewJob.analysis ? "几何已解析" : "等待解析", icon: Box, ready: Boolean(previewJob.analysis), matches: (event: PlanningProgressEvent) => event.stage === "geometry_analysis" || event.subgraph === "feature_recognition" },
     { label: "工艺决策", hint: plannedOperations.length ? `${plannedOperations.length} 道候选工序` : "等待规划", icon: Bot, ready: plannedOperations.length > 0, matches: (event: PlanningProgressEvent) => event.stage === "ai_planning" || event.stage === "process_generation" || event.subgraph === "process_planning" },
-    { label: "刀路生成", hint: previewCam ? `${previewCam.preview_segments.length} 段已归档` : liveToolpath.length ? `${liveToolpath.length} 段草稿待校验` : "等待真实刀路", icon: Wrench, ready: Boolean(previewCam), matches: (event: PlanningProgressEvent) => event.stage === "cam_validation" || event.subgraph === "operation_execution" },
+    { label: "刀路生成", hint: previewCam ? `${previewCam.preview_segments.length} 段已归档` : liveToolpath.length ? `${liveToolpath.length} 段草稿待校验` : "等待真实刀路", icon: Wrench, ready: Boolean(previewCam), matches: (event: PlanningProgressEvent) => event.stage === "cam_validation" || event.stage === "l32_operation_execution" || event.subgraph === "operation_execution" },
     { label: "仿真校验", hint: previewCam?.simulation ? "查看校验证据" : "尚无仿真结论", icon: ShieldCheck, ready: Boolean(previewCam?.simulation), matches: (event: PlanningProgressEvent) => event.stage === "cam_validation" && ["completed", "blocked", "failed"].includes(event.status ?? "") },
   ];
   const sceneStageIndex = sceneMode === "刀路" ? 2 : sceneMode === "工序" ? 1 : sceneMode === "特征" ? 0 :
     activeAgentEvent?.stage === "cam_validation" ? 2 : activeAgentEvent?.stage === "process_generation" || activeAgentEvent?.stage === "ai_planning" ? 1 : 0;
   const focusEvent = (event: PlanningProgressEvent) => {
+    setSelectedAgentArtifact(null);
     pinnedEventIdRef.current = event.event_id ?? null;
     setPinnedEventId(event.event_id ?? null);
     setActiveAgentEvent(event);
@@ -733,10 +737,16 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
     </header>
     <section className="workspace processing-workspace workbench-workspace left-panel-open">
       <aside className="workbench-sidebar processing-sidebar">
-        <AgentWorkspacePanel events={progressEvents} artifacts={artifacts} orchestration={orchestration} activeEventId={activeAgentEvent?.event_id} progress={latestProgress?.percent ?? 6} live apiUrl={apiUrl} onSelectEvent={focusEvent} onSelectArtifact={(artifact) => { if (artifact.kind === "model") setPreviewJob((current) => ({ ...current, model_url: artifact.url })); }} />
+        <AgentWorkspacePanel events={progressEvents} artifacts={artifacts} orchestration={orchestration} activeEventId={activeAgentEvent?.event_id} progress={latestProgress?.percent ?? 6} live apiUrl={apiUrl} onSelectEvent={focusEvent} onSelectArtifact={(artifact) => {
+          if (artifact.kind === "model") {
+            setSelectedAgentArtifact(null);
+            setPreviewJob((current) => ({ ...current, model_url: artifact.url }));
+          } else setSelectedAgentArtifact(artifact);
+        }} />
         {error && <div className="planning-workbench-error floating"><AlertTriangle size={15} /><span>{error}</span><button onClick={onNew}>新建任务</button></div>}
       </aside>
       <section className="viewport panel processing-viewport">
+        {selectedAgentArtifact && <AgentArtifactViewer artifact={selectedAgentArtifact} apiUrl={apiUrl} onClose={() => setSelectedAgentArtifact(null)} />}
         <div className="agent-scene-rail" aria-label="智能体工作阶段">
           <div className="agent-scene-rail-title"><span>智能体工作现场</span><small>实时证据 · 点击回看</small></div>
           <div className="agent-scene-stage-list">{sceneStages.map((stage, index) => {
@@ -749,7 +759,7 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
         </div>
         {pinnedEventId && <button className="agent-follow-live" onClick={() => { pinnedEventIdRef.current = null; setPinnedEventId(null); setActiveAgentEvent(progressEvents.at(-1) ?? null); }}>返回实时进度</button>}
         {previewJob.model_url
-          ? <ModelViewer modelUrl={apiUrl(previewJob.model_url)} features={previewFeatures} selectedFeatureIds={focusedFeatureIds} onSelectFeature={IGNORE_FEATURE_SELECTION} viewMode={focusedToolpath.length ? "刀路" : "特征"} toolpathSegments={focusedToolpath} activeOperationId={focusedToolpath.length ? focusedOperationId : undefined} showFeatureAnnotations={focusedFeatureIds.length === 1} showFeatureSummary={false} compositionInsetLeftRatio={0.18} />
+          ? <ModelViewer modelUrl={apiUrl(previewJob.model_url)} features={previewFeatures} selectedFeatureIds={focusedFeatureIds} onSelectFeature={IGNORE_FEATURE_SELECTION} viewMode={focusedToolpath.length ? "刀路" : "特征"} toolpathSegments={focusedToolpath} activeOperationId={focusedToolpath.length ? focusedOperationId : undefined} showFeatureAnnotations={focusedFeatureIds.length === 1} showFeatureSummary={false} compositionInsetLeftRatio={0} />
           : <div className="processing-model-placeholder"><LoaderCircle className="spin" size={28} /><strong>正在构建三维预览</strong><small>完成 STEP 拓扑解析后将在这里显示原始模型</small></div>}
         {!previewJob.model_url && <div className="processing-model-badge"><Box size={14} /><span>模型解析中</span></div>}
         <div className="agent-scene-headline"><span className="agent-scene-live-dot" /><div><small>{pinnedEventId ? "历史步骤 · 正在回看" : "实时执行 · 自动跟随"}</small><strong>{activeAgentEvent?.title ?? activeAgentEvent?.message ?? "正在接收制造任务"}</strong><p>{activeAgentEvent?.summary ?? activeAgentEvent?.detail ?? "智能体会按实际工具结果更新视图与证据。"}</p></div></div>
@@ -802,8 +812,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [operationBusy, setOperationBusy] = useState(false);
   const [solidBusy, setSolidBusy] = useState(false);
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
-  const [leftWorkbenchPanel, setLeftWorkbenchPanel] = useState<"features" | "process" | "agent" | null>("process");
+  const [leftWorkbenchPanel, setLeftWorkbenchPanel] = useState<"features" | "process" | "agent" | null>("agent");
   const [agentWorkspace, setAgentWorkspace] = useState<AgentWorkspace | null>(null);
+  const [selectedAgentArtifact, setSelectedAgentArtifact] = useState<AgentArtifact | null>(null);
   const [perceptionPending, setPerceptionPending] = useState(false);
   const [perceptionError, setPerceptionError] = useState<string | null>(null);
   const [trialPending, setTrialPending] = useState(false);
@@ -821,6 +832,9 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [showProcessDesigner, setShowProcessDesigner] = useState(false);
   const [l32Program, setL32Program] = useState<WholePartDraftResult | null>(null);
   const [l32Rotational, setL32Rotational] = useState<RotationalFeatureAnalysis | null>(null);
+  const [l32AgentReview, setL32AgentReview] = useState<L32AgentReviewContext | null>(null);
+  const [l32AgentReviewPending, setL32AgentReviewPending] = useState(false);
+  const [l32AgentReviewError, setL32AgentReviewError] = useState<string | null>(null);
   const [l32OperationPreview, setL32OperationPreview] = useState<L32TurningPreview | null>(null);
   const [l32TurningPreviews, setL32TurningPreviews] = useState<Record<string, L32TurningPreview>>({});
   const [l32GroovePreviews, setL32GroovePreviews] = useState<Record<string, L32GroovePreview>>({});
@@ -984,6 +998,48 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const isSheetForming = job.plan?.process_kind === "sheet_forming";
   const isL32 = job.device_id === "citizen-cincom-l32";
 
+  const refreshL32AgentReview = useCallback(async () => {
+    if (!isL32) return;
+    try {
+      const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/agent/l32/review`), { cache: "no-store" });
+      if (!response.ok) return;
+      setL32AgentReview(await response.json() as L32AgentReviewContext);
+    } catch {
+      // The review surface is supplementary; keep the model usable if it is unavailable.
+    }
+  }, [isL32, job.id]);
+
+  const decideL32Profile = useCallback(async (profileId: string, reviewState: "accepted" | "excluded") => {
+    setL32AgentReviewPending(true);
+    setL32AgentReviewError(null);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/agent/l32/profile-decision`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ profile_id: profileId, review_state: reviewState, retry_validation: reviewState === "accepted" }),
+      });
+      const payload = await response.json() as L32AgentReviewContext & { detail?: string };
+      if (!response.ok) throw new Error(payload.detail || `轮廓审核失败（${response.status}）`);
+      setL32AgentReview(payload);
+      if (payload.validation_error) setL32AgentReviewError(payload.validation_error);
+      const [jobResponse, rotationalResponse, programResponse] = await Promise.all([
+        fetch(apiUrl(`/api/v1/jobs/${job.id}`), { cache: "no-store" }),
+        fetch(apiUrl(`/api/v1/jobs/${job.id}/turning/analyze`), { method: "POST", cache: "no-store" }),
+        fetch(apiUrl(`/api/v1/jobs/${job.id}/files/turning-whole-program-draft.json`), { cache: "no-store" }),
+      ]);
+      if (jobResponse.ok) setJob(await jobResponse.json() as Job);
+      if (rotationalResponse.ok) setL32Rotational(await rotationalResponse.json() as RotationalFeatureAnalysis);
+      if (programResponse.ok) setL32Program(await programResponse.json() as WholePartDraftResult);
+      else setL32Program(null);
+      await refreshAgentWorkspace();
+    } catch (reason) {
+      setL32AgentReviewError(reason instanceof Error ? reason.message : "轮廓审核失败");
+      await refreshAgentWorkspace();
+    } finally {
+      setL32AgentReviewPending(false);
+    }
+  }, [job.id, refreshAgentWorkspace]);
+
   useEffect(() => {
     if (!isL32) return undefined;
     let cancelled = false;
@@ -1014,6 +1070,11 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       });
     return () => { cancelled = true; };
   }, [isL32, job.id]);
+
+  useEffect(() => {
+    if (!isL32) return;
+    void refreshL32AgentReview();
+  }, [isL32, refreshL32AgentReview, agentWorkspace?.active_event_id]);
   const automationBlocked = job.plan?.automation_status === "unsupported";
   const holes = useMemo(
     () => job.analysis?.cylindrical_features.filter((item) => item.kind === "hole" && item.review_state !== "excluded") ?? [],
@@ -2032,6 +2093,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   };
 
   const focusAgentEvent = (event: AgentTraceEvent) => {
+    setSelectedAgentArtifact(null);
     setActiveAgentEvent(event);
     const operationId = event.viewer?.operation_id;
     const featureIds = event.viewer?.feature_ids ?? [];
@@ -2362,26 +2424,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       );
       if (!sourceProfile) throw new Error("该工序没有绑定可用于刀路计算的已确认回转轮廓");
       if (sourceProfile.review_state !== "accepted") {
-        const response = await fetch(apiUrl(`/api/v1/jobs/${job.id}/turning/profiles/${sourceProfile.id}`), {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ review_state: "accepted" }),
-        });
-        const accepted = await response.json() as RotationalFeatureAnalysis & { detail?: string };
-        if (!response.ok) throw new Error(accepted.detail || "无法确认工序使用的回转轮廓");
-        if (requestId !== l32PreviewRequestRef.current) return;
-        setL32Rotational(accepted);
-        sourceProfile = accepted.profiles.find((profile) => profile.id === sourceProfile?.id);
-        if (!sourceProfile || sourceProfile.review_state !== "accepted") {
-          throw new Error("工序使用的回转轮廓确认失败");
-        }
-        const refreshedResponse = await fetch(apiUrl(`/api/v1/jobs/${job.id}`));
-        const refreshed = await refreshedResponse.json() as Job & { detail?: string };
-        if (!refreshedResponse.ok) throw new Error(refreshed.detail || "无法刷新已确认的工艺方案");
-        if (requestId !== l32PreviewRequestRef.current) return;
-        setJob(refreshed);
-        previewJob = refreshed;
-        previewOperation = refreshed.plan?.setups.flatMap((setup) => setup.operations).find((item) => item.id === operation.id) ?? previewOperation;
+        throw new Error("该工序依赖尚未确认的回转轮廓；请先在 AI 智能体右侧审核轮廓，再重新验证");
       }
       const stockRadius = Number(previewJob.plan?.stock.diameter_mm ?? 0) / 2
         || Math.max(...sourceProfile.points.map((point) => point.radius));
@@ -2809,12 +2852,13 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             onSelectEvent={focusAgentEvent}
             onSelectArtifact={(artifact) => {
               if (artifact.kind === "model") {
+                setSelectedAgentArtifact(null);
                 setStockSelected(false);
                 setSelectedFeatureIds([]);
                 setIsolatedFeatureId(null);
                 setShowOperationViewSwitch(false);
                 setActiveMode("特征");
-              }
+              } else setSelectedAgentArtifact(artifact);
             }}
             onClose={() => setLeftWorkbenchPanel(null)}
           />}
@@ -2939,14 +2983,16 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             operationContextVisible={showOperationViewSwitch || stockSelected}
             operationIntent={stockSelected ? null : operationIntent}
             compositionInsetLeftRatio={leftWorkbenchPanel
-              ? (showOperationViewSwitch || stockSelected
+              ? (leftWorkbenchPanel === "agent" ? 0 : showOperationViewSwitch || stockSelected
                 ? (activeMode === "仿真" ? 0.34 : 0.25)
                 : (activeMode === "仿真" ? 0.2 : 0.16))
               : 0}
             compositionInsetRightRatio={leftWorkbenchPanel ? 0.04 : 0}
             showFeatureAnnotations={leftWorkbenchPanel === "features" && isolatedFeatureId !== null}
           />}
-          {leftWorkbenchPanel === "agent" && <>
+          {leftWorkbenchPanel === "agent" && selectedAgentArtifact && <AgentArtifactViewer artifact={selectedAgentArtifact} apiUrl={apiUrl} onClose={() => setSelectedAgentArtifact(null)} />}
+          {leftWorkbenchPanel === "agent" && isL32 && l32AgentReview?.status === "waiting_human" && !selectedAgentArtifact && <L32AgentReviewPanel context={l32AgentReview} pending={l32AgentReviewPending} error={l32AgentReviewError} onDecision={(profileId, state) => void decideL32Profile(profileId, state)} />}
+          {leftWorkbenchPanel === "agent" && l32AgentReview?.status !== "waiting_human" && <>
             <div className="agent-review-heading"><Bot size={18} /><div><small>智能体执行回看</small><strong>{activeAgentEvent?.title ?? activeAgentEvent?.message ?? "选择左侧步骤查看执行依据"}</strong><p>{activeAgentEvent?.summary ?? activeAgentEvent?.detail ?? "模型、工序、刀路和仿真按实际归档证据展示。"}</p></div></div>
             <div className="agent-review-evidence"><div><small>本任务证据</small><strong>{agentWorkspace?.events.length ?? 0} 条执行记录</strong></div><div><span>{agentWorkspace?.artifacts.length ?? 0}<small>文件</small></span><span>{camResult?.simulation.operation_snapshots?.length ?? 0}<small>仿真</small></span></div><p>{activeAgentEvent?.viewer?.kind === "operation" ? `当前步骤关联工序 ${activeAgentEvent.viewer.operation_id ?? "—"}；请核对左侧记录与模型。` : "点击左侧执行步骤，可回看当时的观察、规划判断与工具证据。"}</p></div>
           </>}
