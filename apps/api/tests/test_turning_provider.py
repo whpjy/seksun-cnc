@@ -3,6 +3,8 @@ import pytest
 from app.catalogs import get_tool
 from app.models import Operation
 from app.rotational_features import RotationalProfile, RotationalProfilePoint
+from app.turning_simulation import simulate_turning_stock
+from app.turning_verification import verify_turning_profile
 from cam.providers.turning import TurningContext, TurningProvider
 
 
@@ -241,6 +243,50 @@ def test_internal_groove_retracts_inside_base_bore_and_cuts_outward() -> None:
     assert {item.parameters["cut_side"] for item in cuts} == {"internal"}
     assert max(item.axes["X"] for item in cuts) == 15
     assert {item.axes["X"] for item in rapids} == {10.0}
+
+
+def test_full_radius_contour_groove_adds_compensated_profile_finish() -> None:
+    profile = RotationalProfile(
+        id="RP-G", axis_id="RA-1", side="outer", extraction_method="exact_section",
+        points=[
+            RotationalProfilePoint(z=-1.2, radius=5),
+            RotationalProfilePoint(z=-0.8, radius=4.4),
+            RotationalProfilePoint(z=-0.4, radius=4),
+            RotationalProfilePoint(z=0.4, radius=4),
+            RotationalProfilePoint(z=0.8, radius=4.4),
+            RotationalProfilePoint(z=1.2, radius=5),
+        ], confidence=1, review_state="accepted",
+    )
+    program = TurningProvider().generate(
+        operation(
+            "turn_grooving", tool_id="ENGINEERING-GROOVE-FULL-R-0.4",
+            z_mm=0, groove_width_mm=2.4, final_diameter_mm=8,
+            groove_depth_mm=1, peck_depth_mm=0.5,
+            exact_groove_envelope=True, groove_strategy="full_radius_contour",
+        ),
+        context(), profile,
+    )
+
+    contour = [
+        item for item in program.channels[0].commands
+        if item.parameters.get("groove_strategy") == "full_radius_contour"
+    ]
+    assert len(contour) == len(profile.points)
+    assert all(item.parameters["position_role"] == "nose_center" for item in contour)
+    assert all(item.parameters["tool_nose_radius_mm"] == 0.2 for item in contour)
+    approach = next(
+        item for item in program.channels[0].commands
+        if "axial_contouring_capability_confirmed" in item.safety_requirements
+    )
+    assert approach.type == "rapid_move"
+    simulation = simulate_turning_stock(
+        program, stock_radius_mm=12, z_min_mm=-1.2, z_max_mm=1.2,
+        resolution_mm=0.05,
+    )
+    verification = verify_turning_profile(profile, simulation, tolerance_mm=0.05)
+    assert verification.status == "passed"
+    assert verification.metrics.overcut_sample_count == 0
+    assert verification.metrics.excess_stock_sample_count == 0
 
 
 def test_inner_finishing_requires_confirmed_initial_bore_and_stays_inside_profile() -> None:

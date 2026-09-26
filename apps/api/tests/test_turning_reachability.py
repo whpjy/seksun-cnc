@@ -146,3 +146,18 @@ def test_axial_drill_uses_drill_envelope_instead_of_boring_bar_checks() -> None:
     assert checks["drill_profile_clearance"].status == "passed"
     assert checks["drill_axial_reach"].status == "passed"
     assert "boring_bar_entry" not in checks
+
+
+def test_grooving_tool_does_not_require_turning_insert_nose_radius() -> None:
+    grooving = operation("TURN-GROOVE-0.8")
+    grooving.type = "turn_grooving"
+    grooving.parameters = {"groove_side": "external", "groove_width_mm": 0.9}
+
+    result = assess_turning_reachability(
+        grooving,
+        profile("outer", [(-1, 2), (0, 1), (1, 2)]),
+        context(),
+    )
+
+    assert result.status == "passed"
+    assert next(item for item in result.checks if item.id == "nose_radius").status == "passed"

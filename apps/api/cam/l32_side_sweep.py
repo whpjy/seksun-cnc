@@ -34,7 +34,7 @@ def sweep(start, end, radius, flute_length, sign):
     return first.fuse([second,bridge])
 
 
-def check_draft(target, draft):
+def check_draft(target, stock, draft):
     sign = int(draft.get("access_sign",1 if float(draft["face_y_mm"]) > 0 else -1))
     radius = float(draft["tool_diameter_mm"])/2
     flute_length = float(draft["provisional_flute_length_mm"])
@@ -43,11 +43,15 @@ def check_draft(target, draft):
     summed = 0.0
     maximum = 0.0
     first_contacts = []
+    removed_volume = 0.0
     previous = None
     for move in draft["moves"]:
         if previous is not None and move["kind"] == "feed":
             cutter = sweep(previous,move,radius,flute_length,sign)
             contact = target.common(cutter).Volume
+            before = stock.Volume
+            stock = stock.cut(cutter)
+            removed_volume += max(before - stock.Volume, 0.0)
             checked += 1
             summed += contact
             maximum = max(maximum,contact)
@@ -61,12 +65,14 @@ def check_draft(target, draft):
                         "to_xyz_mm": move["point"],
                     })
         previous = move
-    return {
+    return stock, {
         "analysis_face_id": draft["analysis_face_id"],
         "checked_feed_segments": checked,
         "contacting_segments": touching,
         "summed_target_contact_mm3": round(summed,6),
         "maximum_single_contact_mm3": round(maximum,6),
+        "removed_stock_volume_mm3": round(removed_volume,6),
+        "remaining_stock_volume_mm3": round(stock.Volume,6),
         "first_contacts": first_contacts,
     }
 
@@ -78,10 +84,44 @@ def main():
     if len(target_solids) != 1:
         raise ValueError(f"expected one STEP target solid, got {len(target_solids)}")
     target = target_solids[0]
-    results = [check_draft(target,draft) for draft in drafts]
+    if not drafts:
+        raise ValueError("at least one side-milling draft is required")
+    bounds = target.BoundBox
+    stock_radius = float(drafts[0]["stock_radius_mm"])
+    if any(abs(float(draft["stock_radius_mm"]) - stock_radius) > 1e-9 for draft in drafts):
+        raise ValueError("all side-milling drafts must share one stock radius")
+    stock = Part.makeCylinder(
+        stock_radius, bounds.XLength,
+        App.Vector(bounds.XMin, 0, 0), App.Vector(1, 0, 0),
+    )
+    initial_stock_volume = stock.Volume
+    x_values = [
+        float(move["point"]["x"])
+        for draft in drafts for move in draft.get("moves", [])
+        if isinstance(move, dict) and isinstance(move.get("point"), dict)
+    ]
+    if not x_values:
+        raise ValueError("side-milling drafts contain no cutter positions")
+    region_min, region_max = min(x_values), max(x_values)
+    machining_region = Part.makeBox(
+        max(region_max-region_min, 0.001), 2*stock_radius+2, 2*stock_radius+2,
+        App.Vector(region_min, -stock_radius-1, -stock_radius-1),
+    )
+    initial_excess_region = stock.cut(target).common(machining_region).Volume
+    results = []
+    for draft in drafts:
+        stock, result = check_draft(target, stock, draft)
+        results.append(result)
     print("CNC_SIDE_SWEEP " + json.dumps({
         "target_solid_valid": target.isValid(),
         "target_volume_mm3": round(target.Volume,6),
+        "initial_stock_volume_mm3": round(initial_stock_volume,6),
+        "remaining_stock_volume_mm3": round(stock.Volume,6),
+        "removed_stock_volume_mm3": round(initial_stock_volume-stock.Volume,6),
+        "missing_target_volume_mm3": round(target.cut(stock).Volume,6),
+        "machining_region_x_mm": [round(region_min,6), round(region_max,6)],
+        "initial_excess_region_mm3": round(initial_excess_region,6),
+        "remaining_excess_region_mm3": round(stock.cut(target).common(machining_region).Volume,6),
         "checks": results,
     },separators=(",", ":")),flush=True)
 

@@ -81,6 +81,7 @@ def assess_turning_reachability(
     ))
 
     is_axial_tool = operation.type in {"axial_drilling", "axial_tapping"}
+    nose_radius_not_applicable = is_axial_tool or operation.type in {"turn_grooving", "turn_cutoff"}
     orientation_complete = is_axial_tool or (
         operation.tool.orientation_code is not None and operation.tool.hand is not None
     )
@@ -102,10 +103,10 @@ def assess_turning_reachability(
         ))
     nose_radius = float(operation.tool.nose_radius_mm or 0)
     checks.append(_check(
-        "nose_radius", "passed" if nose_radius > 0 or is_axial_tool else "warning",
-        "轴向钻削不使用车刀刀尖圆弧补偿" if is_axial_tool else "刀尖圆弧半径已用于精车补偿" if nose_radius > 0 else "未配置刀尖圆弧半径，将退化为中心线近似",
-        "not_applicable" if is_axial_tool else nose_radius,
-        "not_applicable" if is_axial_tool else "> 0",
+        "nose_radius", "passed" if nose_radius > 0 or nose_radius_not_applicable else "warning",
+        "该工序不使用轮廓车刀刀尖圆弧补偿" if nose_radius_not_applicable else "刀尖圆弧半径已用于精车补偿" if nose_radius > 0 else "未配置刀尖圆弧半径，将退化为中心线近似",
+        "not_applicable" if nose_radius_not_applicable else nose_radius,
+        "not_applicable" if nose_radius_not_applicable else "> 0",
     ))
 
     contour_operations = {

@@ -16,7 +16,28 @@ from .models import (
 )
 
 
-ReviewState = Literal["accepted", "review", "excluded"]
+ReviewState = Literal["accepted", "ai_provisional", "review", "excluded"]
+
+
+class AIProvisionalProfileDecision(BaseModel):
+    decision_source: Literal["ai"] = "ai"
+    scope: Literal["full", "partial"]
+    z_min_mm: float
+    z_max_mm: float
+    diameter_min_mm: float = Field(ge=0)
+    diameter_max_mm: float = Field(ge=0)
+    confidence: float = Field(ge=0.5, le=1)
+    rationale: str = Field(min_length=10, max_length=2000)
+    evidence_refs: list[str] = Field(min_length=1, max_length=20)
+    production_ready: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "AIProvisionalProfileDecision":
+        if self.z_max_mm <= self.z_min_mm:
+            raise ValueError("provisional profile scope requires z_max_mm > z_min_mm")
+        if self.diameter_max_mm < self.diameter_min_mm:
+            raise ValueError("provisional profile diameter bounds are invalid")
+        return self
 
 
 class RotationalAxisCandidate(BaseModel):
@@ -43,6 +64,7 @@ class RotationalProfile(BaseModel):
     confidence: float = Field(ge=0, le=1)
     review_state: ReviewState = "review"
     review_reasons: list[str] = Field(default_factory=list)
+    provisional_decision: AIProvisionalProfileDecision | None = None
 
     @model_validator(mode="after")
     def validate_ordered_profile(self) -> "RotationalProfile":

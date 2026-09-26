@@ -103,7 +103,7 @@ class TurningProvider:
             assert profile is not None
             _generate_id_finishing(builder, suppress_rectangular_internal_grooves(profile))
         elif operation.type == "turn_grooving":
-            _generate_grooving(builder)
+            _generate_grooving(builder, profile)
         elif operation.type == "turn_threading":
             _generate_threading(builder)
         elif operation.type == "axial_drilling":
@@ -474,7 +474,29 @@ def _generate_axial_cycle(builder: _CommandBuilder, *, tapping: bool) -> None:
     )
 
 
-def _generate_grooving(builder: _CommandBuilder) -> None:
+def _profile_radius_at(profile: RotationalProfile, z_value: float) -> float:
+    for left, right in zip(profile.points, profile.points[1:]):
+        if left.z - 1e-9 <= z_value <= right.z + 1e-9:
+            if right.z - left.z <= 1e-12:
+                return max(left.radius, right.radius)
+            fraction = max(0.0, min(1.0, (z_value - left.z) / (right.z - left.z)))
+            return left.radius + fraction * (right.radius - left.radius)
+    return profile.points[0].radius if z_value < profile.points[0].z else profile.points[-1].radius
+
+
+def _profile_envelope_radius(
+    profile: RotationalProfile, minimum_z: float, maximum_z: float,
+) -> float:
+    return max(
+        _profile_radius_at(profile, minimum_z),
+        _profile_radius_at(profile, maximum_z),
+        *(point.radius for point in profile.points if minimum_z <= point.z <= maximum_z),
+    )
+
+
+def _generate_grooving(
+    builder: _CommandBuilder, profile: RotationalProfile | None = None,
+) -> None:
     z_value = _number(builder.operation, "z_mm")
     final_diameter = _number(builder.operation, "final_diameter_mm")
     if final_diameter < 0:
@@ -488,9 +510,17 @@ def _generate_grooving(builder: _CommandBuilder) -> None:
     tool_width = float(builder.operation.tool.cutting_width_mm or 0)
     if tool_width <= 0 or tool_width > groove_width + 1e-9:
         raise ValueError("grooving tool width must be positive and no larger than the groove width")
-    pass_count = max(1, ceil(max(groove_width - tool_width, 0) / tool_width) + 1)
-    minimum_center = z_value - groove_width / 2 + tool_width / 2
-    maximum_center = z_value + groove_width / 2 - tool_width / 2
+    profile_envelope = (
+        profile is not None
+        and groove_side == "external"
+        and bool(builder.operation.parameters.get("exact_groove_envelope", False))
+    )
+    covered_minimum = min(point.z for point in profile.points) if profile_envelope else z_value - groove_width / 2
+    covered_maximum = max(point.z for point in profile.points) if profile_envelope else z_value + groove_width / 2
+    covered_width = covered_maximum - covered_minimum
+    pass_count = max(1, ceil(max(covered_width - tool_width, 0) / tool_width) + 1)
+    minimum_center = covered_minimum + tool_width / 2
+    maximum_center = covered_maximum - tool_width / 2
     positions = [
         minimum_center + (maximum_center - minimum_center) * index / max(pass_count - 1, 1)
         for index in range(pass_count)
@@ -509,17 +539,33 @@ def _generate_grooving(builder: _CommandBuilder) -> None:
         if groove_side == "external"
         else max(initial_diameter - 2 * builder.context.radial_clearance_mm, 0)
     )
-    radial_passes = max(1, ceil(radial_depth / peck_depth))
+    allowance = float(builder.operation.parameters.get("radial_allowance_mm", 0))
     for axial_index, position in enumerate(positions, start=1):
+        target_diameter_for_position = final_diameter
+        if profile_envelope:
+            target_diameter_for_position = 2 * (
+                _profile_envelope_radius(
+                    profile, position - tool_width / 2, position + tool_width / 2,
+                ) + allowance
+            )
+        local_depth = (
+            max((initial_diameter - target_diameter_for_position) / 2, 0)
+            if groove_side == "external"
+            else max((target_diameter_for_position - initial_diameter) / 2, 0)
+        )
+        radial_passes = max(1, ceil(local_depth / peck_depth))
         builder.add(
             "rapid_move", axes={"X": retract_diameter, "Z": position},
             safety_requirements=["work_spindle_running", "tool_offset_active"],
         )
         for radial_index in range(1, radial_passes + 1):
             target_diameter = (
-                max(initial_diameter - 2 * peck_depth * radial_index, final_diameter)
+                max(initial_diameter - 2 * peck_depth * radial_index, target_diameter_for_position)
                 if groove_side == "external"
-                else min(initial_diameter + 2 * peck_depth * radial_index, final_diameter)
+                else min(
+                    initial_diameter + 2 * peck_depth * radial_index,
+                    target_diameter_for_position,
+                )
             )
             builder.add("feed_move", axes={"X": target_diameter, "Z": position}, parameters={
                 "cut_side": groove_side, "axial_width_mm": tool_width,
@@ -527,6 +573,56 @@ def _generate_grooving(builder: _CommandBuilder) -> None:
                 "groove_radial_pass": radial_index, "groove_radial_pass_count": radial_passes,
             })
         builder.add("rapid_move", axes={"X": retract_diameter})
+
+    strategy = str(builder.operation.parameters.get("groove_strategy", "plunge_envelope"))
+    if strategy == "plunge_envelope":
+        return
+    if strategy != "full_radius_contour":
+        raise ValueError(f"unsupported groove strategy: {strategy}")
+    if not profile_envelope:
+        raise ValueError("full-radius contour grooving requires an exact external groove profile")
+    if builder.operation.tool.groove_profile != "full_radius":
+        raise ValueError("full-radius contour grooving requires a full-radius grooving insert")
+    if not builder.operation.tool.axial_contouring_supported:
+        raise ValueError("grooving tool is not verified for axial contouring")
+    tip_radius = float(builder.operation.tool.nose_radius_mm or 0)
+    if tip_radius <= 0 or abs(2 * tip_radius - tool_width) > 1e-6:
+        raise ValueError("full-radius grooving insert radius must equal half its cutting width")
+
+    contour = sorted(
+        compensate_profile_for_nose(
+            profile, nose_radius_mm=tip_radius, allowance_mm=allowance,
+        ),
+        key=lambda item: (item.z, item.radius),
+        reverse=builder.context.cut_direction == "negative_z",
+    )
+    if len(contour) < 2:
+        raise ValueError("full-radius contour grooving requires at least two profile points")
+    first = contour[0]
+    builder.add(
+        "rapid_move",
+        axes={"X": retract_diameter, "Z": _approach_z(first.z, builder.context)},
+        safety_requirements=[
+            "work_spindle_running", "tool_offset_active",
+            "axial_contouring_capability_confirmed",
+        ],
+    )
+    contour_parameters = {
+        "cut_side": "external",
+        "position_role": "nose_center",
+        "tool_nose_radius_mm": tip_radius,
+        "groove_strategy": "full_radius_contour",
+    }
+    builder.add(
+        "feed_move", axes={"X": 2 * first.radius, "Z": first.z},
+        parameters=contour_parameters,
+    )
+    for point in contour[1:]:
+        builder.add(
+            "feed_move", axes={"X": 2 * point.radius, "Z": point.z},
+            parameters=contour_parameters,
+        )
+    builder.add("rapid_move", axes={"X": retract_diameter})
 
 
 def _generate_cutoff(builder: _CommandBuilder) -> None:

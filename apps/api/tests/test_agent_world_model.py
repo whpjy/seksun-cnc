@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from app.agent.config import load_agent_settings
@@ -243,3 +244,35 @@ def test_workspace_exposes_world_summary_and_artifact(tmp_path: Path) -> None:
     assert workspace["orchestration"]["current_operation_id"] == "OP10"
     assert workspace["orchestration"]["next_action"] == "compile"
     assert "agent-world-model" in {item["id"] for item in workspace["artifacts"]}
+
+
+def test_workspace_exposes_plan_blocker_repair_candidates(tmp_path: Path) -> None:
+    world = sample_world()
+    (tmp_path / "agent-world-model.json").write_text(
+        world.model_dump_json(indent=2), encoding="utf-8",
+    )
+    (tmp_path / "agent-l32-rolling-loop.json").write_text(json.dumps({
+        "status": "plan_blocked", "accepted_count": 3,
+        "expected_operation_count": 9, "next_action": "select_safe_back_face_process",
+    }), encoding="utf-8")
+    (tmp_path / "agent-l32-incremental-trial.json").write_text(json.dumps({
+        "repair": {
+            "status": "waiting", "decision": "human_review",
+            "next_action": "select_safe_back_face_process",
+            "diagnosis": {"defect": "missing_back_face_process"},
+        },
+        "repair_candidates": [{
+            "id": "back_live_tool_face_finish", "kind": "special_process",
+            "auto_applicable": False, "capability_available": True,
+            "validation_status": "requires_human_confirmation",
+            "required_evidence": ["back_face_boundary"],
+        }],
+    }), encoding="utf-8")
+
+    workspace = build_agent_workspace(
+        job_id=world.job_id, job_status="completed", directory=tmp_path, events=[],
+    )
+
+    assert workspace["orchestration"]["rolling_loop"]["status"] == "plan_blocked"
+    assert workspace["orchestration"]["repair"]["diagnosis"]["defect"] == "missing_back_face_process"
+    assert workspace["orchestration"]["repair"]["candidates"][0]["capability_available"] is True

@@ -10,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 
 from .checkpoint import open_sqlite_checkpointer
 from .config import AgentSettings
+from .process_strategies import BackLiveToolFaceStrategy
 
 
 class L32RepairState(TypedDict, total=False):
@@ -18,6 +19,7 @@ class L32RepairState(TypedDict, total=False):
     failed_operations: list[str]
     profile_review_state: str
     coverage_status: str
+    manufacturing_context: dict[str, Any]
     diagnosis: dict[str, Any]
     candidates: list[dict[str, Any]]
     decision: str
@@ -42,7 +44,15 @@ def build_l32_repair_graph(
 
     def diagnose(state: L32RepairState) -> L32RepairState:
         blocker = state["blocker"]
-        if "倒扣" in blocker or "undercut" in blocker.lower():
+        normalized_blocker = blocker.lower()
+        missing_back_face = (
+            ("missing operations" in normalized_blocker and "op50" in normalized_blocker)
+            or "back-face finishing operation" in normalized_blocker
+            or "back face finishing operation" in normalized_blocker
+        )
+        if missing_back_face:
+            defect = "missing_back_face_process"
+        elif "倒扣" in blocker or "undercut" in blocker.lower():
             defect = "profile_undercut"
         elif "左右手" in blocker or "tool hand" in blocker.lower():
             defect = "tool_hand_mismatch"
@@ -55,6 +65,7 @@ def build_l32_repair_graph(
             "failed_operations": state.get("failed_operations", []),
             "profile_review_state": state.get("profile_review_state", "unknown"),
             "coverage_status": state.get("coverage_status", "unknown"),
+            "manufacturing_context": state.get("manufacturing_context", {}),
             "safety_gate": "production_release_forbidden",
         }
         report(
@@ -66,7 +77,49 @@ def build_l32_repair_graph(
     def propose_repairs(state: L32RepairState) -> L32RepairState:
         defect = state["diagnosis"]["defect"]
         failed = state.get("failed_operations", [])
-        if defect == "tool_hand_mismatch":
+        context = state.get("manufacturing_context", {})
+        if defect == "missing_back_face_process":
+            protected_limit = context.get("nonrotational_turning_limit_z_mm")
+            capabilities = set(context.get("machine_capabilities") or [])
+            safe_back_turning = protected_limit is None and "back_turning" in capabilities
+            live_tool_strategy = BackLiveToolFaceStrategy.describe(
+                capability_available="back_live_tool_milling" in capabilities,
+            )
+            live_tool_candidate = live_tool_strategy.model_dump(mode="json")
+            live_tool_candidate.update({
+                "operation_ids": [],
+                "auto_applicable": False,
+                "capability_available": "back_live_tool_milling" in capabilities,
+                "reason": "用背面动力刀具按非回转边界分区精加工切断端，避免车刀扫过成品实体。",
+                "required_evidence": [
+                    item.validator for item in live_tool_strategy.validation_requirements
+                    if item.required_for_draft
+                ],
+            })
+            candidates = [
+                {
+                    "id": "restore_op50_back_turning",
+                    "kind": "operation_restore",
+                    "operation_ids": ["OP50"],
+                    "auto_applicable": safe_back_turning,
+                    "reason": (
+                        "零件没有背面非回转保护区且设备具备 back_turning，可恢复标准 OP50 后重新运行整件连续仿真。"
+                        if safe_back_turning else
+                        "检测到背面非回转保护区，车削整张端面可能切除成品；安全门禁止自动恢复 OP50。"
+                    ),
+                    "required_evidence": ["accepted_rotational_profile", "back_turning_capability", "no_nonrotational_protected_region"],
+                },
+                live_tool_candidate,
+                {
+                    "id": "secondary_setup_face_finish",
+                    "kind": "external_process",
+                    "operation_ids": ["OP50-EXT"],
+                    "auto_applicable": False,
+                    "reason": "将背面端面转移到二次装夹铣削或磨削；需要新增设备、基准和装夹验证。",
+                    "required_evidence": ["secondary_machine", "datum_transfer", "fixture_plan", "inspection_plan"],
+                },
+            ]
+        elif defect == "tool_hand_mismatch":
             candidates = [{
                 "id": "replace_turning_tool_hand",
                 "kind": "tool_substitution",
@@ -114,10 +167,15 @@ def build_l32_repair_graph(
 
     def validate_repairs(state: L32RepairState) -> L32RepairState:
         evaluated: list[dict[str, Any]] = []
+        defect = str((state.get("diagnosis") or {}).get("defect") or "")
         for candidate in state.get("candidates", []):
             item = dict(candidate)
             if not item.get("auto_applicable"):
-                item["validation_status"] = "rejected_by_safety_gate"
+                item["validation_status"] = (
+                    "requires_human_confirmation"
+                    if defect == "missing_back_face_process"
+                    else "rejected_by_safety_gate"
+                )
             elif validate_candidate is None:
                 item["validation_status"] = "validator_unavailable"
             else:
@@ -142,6 +200,7 @@ def build_l32_repair_graph(
         ), None)
         decision = "retry" if selected else "human_review"
         status = "repair_ready" if selected else "waiting"
+        defect = str((state.get("diagnosis") or {}).get("defect") or "")
         summary = {
             "schema_version": "1.0.0",
             "status": status,
@@ -149,7 +208,12 @@ def build_l32_repair_graph(
             "selected_candidate": selected,
             "failed_operations": state.get("failed_operations", []),
             "candidate_count": len(state.get("candidates", [])),
-            "next_action": "recompile_and_simulate" if selected else "confirm_profile_and_select_special_process",
+            "next_action": (
+                "recompile_and_simulate" if selected
+                else "select_safe_back_face_process" if defect == "missing_back_face_process"
+                else "confirm_profile_and_select_special_process"
+            ),
+            "diagnosis": state.get("diagnosis", {}),
             "production_ready": False,
         }
         report(
@@ -179,6 +243,7 @@ def run_l32_repair_graph(
     failed_operations: list[str],
     profile_review_state: str,
     coverage_status: str,
+    manufacturing_context: dict[str, Any] | None = None,
     settings: AgentSettings,
     validate_candidate: CandidateValidator | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -195,5 +260,6 @@ def run_l32_repair_graph(
             "failed_operations": failed_operations,
             "profile_review_state": profile_review_state,
             "coverage_status": coverage_status,
+            "manufacturing_context": manufacturing_context or {},
             "status": "running",
         }, {"configurable": {"thread_id": f"{job_id}:l32-repair"}})

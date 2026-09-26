@@ -14,6 +14,7 @@ from .rotational_features import (
     split_outer_profile_for_longitudinal_turning,
 )
 from .groove_binding import bind_verified_groove_requirements
+from .l32_front_groove import build_front_groove_geometry_draft
 from .route_planner import build_manufacturing_route
 
 
@@ -252,6 +253,20 @@ def build_l32_process_plan(
             and profile.extraction_method == "exact_section"
             and profile.review_state == "accepted"
         ]
+        groove_scopes: dict[str, tuple[float, float]] = {}
+        for groove in groove_features:
+            groove_tool = get_tool("TURN-GROOVE-0.8" if groove.width_mm < 2.0 else "TURN-GROOVE-2")
+            try:
+                groove_draft = build_front_groove_geometry_draft(
+                    profile, groove, stock_radius_mm=stock_radius,
+                    actual_planned_tool_width_mm=float(groove_tool.cutting_width_mm or 0),
+                )
+            except ValueError:
+                continue
+            groove_scopes[groove.id] = (
+                min(item.z_min_mm for item in groove_draft.strips),
+                max(item.z_max_mm for item in groove_draft.strips),
+            )
         accepted_pockets = [
             item for item in analysis.prismatic_features
             if item.kind == "pocket"
@@ -521,6 +536,10 @@ def build_l32_process_plan(
                         "z_mm": round((groove.z_start + groove.z_end) / 2, 6),
                         "groove_start_z_mm": min(groove.z_start, groove.z_end),
                         "groove_end_z_mm": max(groove.z_start, groove.z_end),
+                        **({
+                            "profile_z_min_mm": groove_scopes[groove.id][0],
+                            "profile_z_max_mm": groove_scopes[groove.id][1],
+                        } if groove.id in groove_scopes else {}),
                         "groove_width_mm": groove.width_mm,
                         "final_diameter_mm": max(groove.radius_start, groove.radius_end) * 2,
                         "groove_depth_mm": groove.depth_mm,
@@ -639,6 +658,11 @@ def build_l32_process_plan(
                         "z_mm": round((groove.z_start + groove.z_end) / 2, 6),
                         "groove_start_z_mm": min(groove.z_start, groove.z_end),
                         "groove_end_z_mm": max(groove.z_start, groove.z_end),
+                        **({
+                            "profile_z_min_mm": groove_scopes[groove.id][0],
+                            "profile_z_max_mm": groove_scopes[groove.id][1],
+                            "exact_groove_envelope": True,
+                        } if groove.id in groove_scopes else {}),
                         "groove_width_mm": groove.width_mm,
                         "final_diameter_mm": min(groove.radius_start, groove.radius_end) * 2,
                         "groove_depth_mm": groove.depth_mm,

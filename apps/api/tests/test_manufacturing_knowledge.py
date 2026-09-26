@@ -43,9 +43,13 @@ def test_cam_mapping_only_references_real_operation_definitions() -> None:
     operation_ids = {item.id for item in OPERATION_DEFINITIONS}
     mapping = payload["cam_operation_mapping"]
     assert set(mapping).issubset(operation_ids)
-    assert len(mapping) == 18
+    assert len(mapping) == 25
     assert mapping["drilling"] == "GX-C-11"
     assert mapping["surface_3d"] == "GX-C-09"
+    assert mapping["turn_od_roughing"] == "GX-C-01"
+    assert mapping["turn_od_finishing"] == "GX-C-03"
+    assert mapping["turn_threading"] == "GX-C-06"
+    assert mapping["axial_drilling"] == "GX-C-11"
 
 
 def test_catalog_can_be_filtered_and_compacted() -> None:

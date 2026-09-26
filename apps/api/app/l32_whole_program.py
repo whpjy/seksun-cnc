@@ -8,6 +8,7 @@ from .l32_backside import BacksideDraftRequest, compile_backside_draft
 from .l32_backside_chain import (
     BacksideChainDraftRequest, compile_backside_chain_draft,
 )
+from .l32_back_live_face import BackLiveFaceDraftRequest, compile_back_live_face_draft
 from .l32_front_chain import FrontChainDraftRequest, compile_front_chain_draft
 from .channel_timeline import ChannelTimelineResult, schedule_channel_timeline
 from .continuous_turning_simulation import (
@@ -51,7 +52,7 @@ class WholePartStage(BaseModel):
     operation_id: str
     operation_name: str
     channel_id: Literal["main", "sub"]
-    phase: Literal["front_turning", "synchronized_transfer", "back_turning"]
+    phase: Literal["front_turning", "synchronized_transfer", "back_turning", "back_milling"]
     command_start: int = Field(ge=1)
     command_end: int = Field(ge=1)
     command_count: int = Field(ge=1)
@@ -104,10 +105,33 @@ def compile_whole_part_draft(
     operations = _operation_map(plan)
     has_front_form = all(item in operations for item in ("OP21-FORM", "OP31-FORM"))
     has_back_region = all(item in operations for item in ("OP55-BACK", "OP58-BACK"))
-    required_ids = ["OP10", "OP20", "OP30", "OP40", "OP50"]
+    separation_operations = [
+        operation for operation in operations.values()
+        if operation.enabled and operation.type == "turn_cutoff"
+    ]
+    if len(separation_operations) != 1:
+        raise ValueError(
+            "formal L32 process plan requires exactly one material-separation operation; "
+            f"found {len(separation_operations)}"
+        )
+    separation = separation_operations[0]
+    back_face_operations = [
+        operation for operation in operations.values()
+        if operation.enabled and (
+            operation.type == "back_live_face_finishing"
+            or (operation.type == "turn_facing" and operation.workpiece_side == "back")
+        )
+    ]
+    if len(back_face_operations) != 1:
+        raise ValueError(
+            "formal L32 process plan requires exactly one back-face finishing operation; "
+            f"found {len(back_face_operations)}"
+        )
+    back_face_operation = back_face_operations[0]
+    required_ids = ["OP10", "OP20", "OP30", separation.id, back_face_operation.id]
     required_ids.extend(["OP21-FORM", "OP31-FORM"] if has_front_form else [])
     required_ids.extend(["OP55-BACK", "OP58-BACK"] if has_back_region else [])
-    missing = [operation_id for operation_id in required_ids if operation_id not in operations]
+    missing = [operation_id for operation_id in required_ids if " or " in operation_id or operation_id not in operations]
     disabled = [operation_id for operation_id in required_ids if operation_id in operations and not operations[operation_id].enabled]
     if missing:
         raise ValueError("formal L32 process plan is missing operations: " + ", ".join(missing))
@@ -117,7 +141,7 @@ def compile_whole_part_draft(
         raise ValueError("formal L32 rotational profile must be accepted")
     if source_profile.id != request.source_profile_id or source_profile.review_state != "accepted":
         raise ValueError("whole-part draft requires the accepted source profile")
-    kerf_intrusion = cutoff_kerf_intrusion_mm(operations["OP40"], source_profile)
+    kerf_intrusion = cutoff_kerf_intrusion_mm(separation, source_profile)
     if kerf_intrusion > 0.05:
         raise ValueError(
             f"cutoff kerf overlaps the accepted finished profile by {kerf_intrusion:.3f} mm; "
@@ -159,7 +183,7 @@ def compile_whole_part_draft(
         job_id,
         TurningTransferDraftRequest(
             machine_instance_id=request.machine_instance_id,
-            operation=operations["OP40"],
+            operation=separation,
             profile=source_profile,
             stock_radius_mm=request.stock_radius_mm,
             initial_bore_radius_mm=request.initial_bore_radius_mm,
@@ -175,14 +199,16 @@ def compile_whole_part_draft(
         snapshot,
     )
 
-    cutoff_z = float(operations["OP40"].parameters["z_mm"])
-    finished_back_datum_z = float(operations["OP40"].parameters.get(
+    cutoff_z = float(separation.parameters["z_mm"])
+    finished_back_datum_z = float(separation.parameters.get(
         "finished_back_datum_z_mm", cutoff_z,
     ))
     finished_radius = max(point.radius for point in source_profile.points)
     backside_stock_radius = min(request.stock_radius_mm, finished_radius + 0.2)
     backside_results = []
-    for operation_id in ["OP50"]:
+    for operation_id in (
+        [back_face_operation.id] if back_face_operation.type == "turn_facing" else []
+    ):
         backside_results.append(compile_backside_draft(
             job_id,
             BacksideDraftRequest(
@@ -196,6 +222,21 @@ def compile_whole_part_draft(
             source_profile,
             snapshot,
         ))
+    back_live_face = None
+    if back_face_operation.type == "back_live_face_finishing":
+        axial_stock = float(back_face_operation.parameters.get(
+            "stock_allowance_mm", separation.parameters.get("back_face_allowance_mm", 0),
+        ))
+        back_live_face = compile_back_live_face_draft(
+            BackLiveFaceDraftRequest(
+                machine_instance_id=request.machine_instance_id,
+                operation=back_face_operation,
+                stock_radius_mm=backside_stock_radius,
+                axial_stock_mm=axial_stock,
+                axial_clearance_mm=float(back_face_operation.parameters.get("axial_clearance_mm", 1)),
+            ),
+            snapshot,
+        )
     backside_chain = (
         compile_backside_chain_draft(
             job_id,
@@ -215,6 +256,8 @@ def compile_whole_part_draft(
     main_groups.append(next(channel.commands for channel in transfer.toolpath.channels if channel.id == "main"))
     sub_groups = [next(channel.commands for channel in transfer.toolpath.channels if channel.id == "sub")]
     sub_groups.extend(result.draft.toolpath.channels[0].commands for result in backside_results)
+    if back_live_face is not None:
+        sub_groups.append(back_live_face.toolpath.channels[0].commands)
     if backside_chain is not None:
         sub_groups.append(backside_chain.toolpath.channels[0].commands)
     main_commands = _renumber([command for group in main_groups for command in group], "main")
@@ -305,13 +348,13 @@ def compile_whole_part_draft(
             main_cursor += item.command_count
     transfer_count = len(next(channel.commands for channel in transfer.toolpath.channels if channel.id == "main"))
     stages.append(WholePartStage(
-        sequence=len(stages) + 1, operation_id="OP40", operation_name=operations["OP40"].name,
+        sequence=len(stages) + 1, operation_id=separation.id, operation_name=separation.name,
         channel_id="main", phase="synchronized_transfer", command_start=main_cursor,
         command_end=main_cursor + transfer_count - 1, command_count=transfer_count,
         verification_status=_verification_status(transfer),
     ))
     sub_cursor = len(next(channel.commands for channel in transfer.toolpath.channels if channel.id == "sub")) + 1
-    backside_stage_ids = ["OP50"]
+    backside_stage_ids = [back_face_operation.id] if back_face_operation.type == "turn_facing" else []
     for operation, result in zip(
         (operations[item] for item in backside_stage_ids), backside_results,
     ):
@@ -321,6 +364,16 @@ def compile_whole_part_draft(
             channel_id="sub", phase="back_turning", command_start=sub_cursor,
             command_end=sub_cursor + count - 1, command_count=count,
             verification_status=_verification_status(result.draft),
+        ))
+        sub_cursor += count
+    if back_live_face is not None:
+        operation = back_face_operation
+        count = len(back_live_face.toolpath.channels[0].commands)
+        stages.append(WholePartStage(
+            sequence=len(stages) + 1, operation_id=operation.id,
+            operation_name=operation.name, channel_id="sub", phase="back_milling",
+            command_start=sub_cursor, command_end=sub_cursor + count - 1,
+            command_count=count, verification_status=back_live_face.status,
         ))
         sub_cursor += count
     if backside_chain is not None:
@@ -345,6 +398,7 @@ def compile_whole_part_draft(
         *(warning for result in backside_results for warning in result.warnings),
         *(front_chain.warnings if front_chain is not None else []),
         *(backside_chain.warnings if backside_chain is not None else []),
+        *(back_live_face.warnings if back_live_face is not None else []),
         "整件程序已合并轴对称跨坐标系连续材料状态；仍未替代三维机床运动学与碰撞验证。",
         "不得将本草案直接转换或发送到机床，必须完成后处理器映射、机床级仿真、干运行和首件验证。",
     ]))

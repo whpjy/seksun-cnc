@@ -142,7 +142,10 @@ class GeometryAnalysis(BaseModel):
     internal_profile_features: list[InternalProfileFeature] = Field(default_factory=list)
     solid_candidates: list[SolidCandidate] = Field(default_factory=list)
     rotational_sections: list[RotationalSectionCandidate] = Field(default_factory=list)
-    rotational_profile_reviews: dict[str, Literal["accepted", "review", "excluded"]] = Field(default_factory=dict)
+    rotational_profile_reviews: dict[
+        str, Literal["accepted", "ai_provisional", "review", "excluded"]
+    ] = Field(default_factory=dict)
+    rotational_profile_decisions: dict[str, dict[str, Any]] = Field(default_factory=dict)
     visual_edges: list[list[Vec3]] = Field(default_factory=list)
 
 
@@ -162,6 +165,9 @@ class Tool(BaseModel):
     insert_shape: str | None = None
     hand: Literal["left", "right", "neutral"] | None = None
     orientation_code: int | None = Field(default=None, ge=1, le=9)
+    groove_profile: Literal["rectangular", "full_radius"] | None = None
+    axial_contouring_supported: bool = False
+    inventory_id: str | None = None
 
 
 class MaterialProfile(BaseModel):
@@ -207,6 +213,10 @@ class Operation(BaseModel):
     type: str
     name: str
     feature_ids: list[str]
+    # The geometry being machined belongs in feature_ids. Turning simulation may
+    # additionally need the complete parent profile, which is a reference rather
+    # than another machining target.
+    reference_profile_id: str | None = None
     tool: Tool
     parameters: dict[str, float | int | str | bool]
     rationale: list[str]
@@ -485,6 +495,55 @@ class L32ProfileDecisionRequest(BaseModel):
     retry_validation: bool = True
 
 
+class L32AIProfileDecisionRequest(BaseModel):
+    profile_id: str
+    scope: Literal["full", "partial"] = "partial"
+    z_min_mm: float
+    z_max_mm: float
+    confidence: float = Field(ge=0.5, le=1)
+    rationale: str = Field(min_length=10, max_length=2000)
+    evidence_refs: list[str] = Field(min_length=1, max_length=20)
+
+
+class L32OperationTrialDecisionRequest(BaseModel):
+    rationale: str = Field(min_length=3, max_length=1000)
+    acknowledge_warning: bool = False
+
+
+class L32AutonomousProcessRequest(BaseModel):
+    rebuild_plan: bool = False
+    max_operations: int = Field(default=30, ge=1, le=80)
+    max_repair_attempts_per_operation: int = Field(default=2, ge=0, le=5)
+    max_tool_calls: int = Field(default=120, ge=4, le=500)
+    max_seconds: int = Field(default=900, ge=30, le=3600)
+
+
+class L32OperationRepairCandidate(BaseModel):
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    rationale: str = Field(min_length=3, max_length=1000)
+    target_operation_id: str | None = Field(default=None, min_length=1, max_length=64)
+    tool_id: str | None = Field(default=None, min_length=1, max_length=64)
+    feature_ids: list[str] | None = None
+    reference_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
+    parameters: dict[str, float | int | str | bool] = Field(default_factory=dict)
+
+
+class L32OperationCandidateEvaluationRequest(BaseModel):
+    candidates: list[L32OperationRepairCandidate] = Field(min_length=1, max_length=5)
+
+
+class L32OperationCandidateSelectionRequest(BaseModel):
+    candidate_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    rationale: str = Field(min_length=3, max_length=1000)
+    acknowledge_warning: bool = False
+    confirmed: bool = False
+
+
+class L32CandidateToolBindingRequest(BaseModel):
+    inventory_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    rationale: str = Field(min_length=3, max_length=1000)
+
+
 class SolidSelectionRequest(BaseModel):
     solid_index: int = Field(ge=1)
 
@@ -501,15 +560,22 @@ OperationParameterValue = float | int | str | bool
 class OperationCreateRequest(BaseModel):
     definition_id: str
     feature_ids: list[str] = Field(default_factory=list)
+    reference_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
     tool_id: str | None = None
     name: str | None = None
     parameters: dict[str, OperationParameterValue] = Field(default_factory=dict)
     insert_after_operation_id: str | None = None
+    source: Literal["manual", "recommendation"] = "manual"
+    rationale: list[str] = Field(default_factory=list)
+    channel_id: Literal["main", "sub"] | None = None
+    spindle_id: Literal["main", "sub"] | None = None
+    workpiece_side: Literal["front", "back"] | None = None
 
 
 class OperationUpdateRequest(BaseModel):
     name: str | None = None
     feature_ids: list[str] | None = None
+    reference_profile_id: str | None = Field(default=None, min_length=1, max_length=64)
     tool_id: str | None = None
     parameters: dict[str, OperationParameterValue] | None = None
     enabled: bool | None = None

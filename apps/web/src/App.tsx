@@ -39,12 +39,17 @@ const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 const APP_NAME = (import.meta.env.VITE_APP_NAME ?? "NEXUS CNC").trim() || "NEXUS CNC";
 const PAGE_TITLE = (import.meta.env.VITE_PAGE_TITLE ?? "智能工艺规划").trim() || "智能工艺规划";
 const APP_LOGO_TEXT = (import.meta.env.VITE_APP_LOGO_TEXT ?? "N").trim().slice(0, 2) || "N";
+const HARNESS_URL = (import.meta.env.VITE_HARNESS_URL ?? "http://127.0.0.1:3080").trim() || "http://127.0.0.1:3080";
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
 const EMPTY_PROFILE_BOUNDARIES: { operation_id: string; setup_id: string; work_axis: Vec3; points: Vec3[] }[] = [];
 const EMPTY_MATERIAL_SNAPSHOTS: { urls: string[]; stages: { operationId: string; start: number; count: number }[] } = { urls: [], stages: [] };
 const IGNORE_FEATURE_SELECTION = () => undefined;
 function apiUrl(path: string) {
   return `${API_BASE}${path}`;
+}
+
+function openHarness() {
+  window.open(HARNESS_URL, "_blank", "noopener,noreferrer");
 }
 
 type PlanningProgressEvent = AgentTraceEvent;
@@ -344,26 +349,8 @@ function NewJobDialog({ open, onClose, onCreated, canClose = true }: {
   }, [busy, canClose, closeDialog, open]);
 
   const submit = async () => {
-    if (!stepFile || !selectedNewJobDeviceId) return;
-    setBusy(true);
-    setError("");
-    setProgressEvents([{ stage: "uploading", message: "正在上传三维模型", percent: 2 }]);
-    const form = new FormData();
-    form.append("step", stepFile);
-    form.append("device_id", selectedNewJobDeviceId);
-    try {
-      const response = await fetch(apiUrl("/api/v1/jobs/start"), { method: "POST", body: form });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || "分析失败");
-      const pendingJob = payload as Job;
-      setStepFile(null);
-      setBusy(false);
-      setProgressEvents([]);
-      onCreated(pendingJob);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "无法连接分析服务");
-      setBusy(false);
-    }
+    openHarness();
+    closeDialog();
   };
 
   if (!open) return null;
@@ -639,7 +626,12 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
         const refreshed = payload as Job;
         planLoadedRef.current = Boolean(refreshed.plan);
         setPreviewJob(refreshed);
-        if (expectCompleted || refreshed.status === "completed") onCompleted(refreshed);
+        // STEP geometry completion and Harness process-plan completion are two
+        // different milestones.  A Harness-owned job is marked `completed`
+        // after deterministic geometry parsing, while its process draft may
+        // still be absent.  Keep the live planning workspace visible until
+        // Harness has actually created that draft.
+        if ((expectCompleted || refreshed.status === "completed") && refreshed.plan) onCompleted(refreshed);
         else if (refreshed.status === "failed") setError(refreshed.error || "工艺规划失败");
       } catch (reason) {
         if (!disposed) setError(reason instanceof Error ? reason.message : "无法加载任务状态");
@@ -730,7 +722,7 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
       <div className="project-title"><strong>{initialJob.filename}</strong></div>
       <div className="top-meta"><span className="planning-header-state"><LoaderCircle className="spin" size={13} />工艺规划中</span></div>
       <div className="header-actions">
-        <button className="header-command-button" onClick={onNew}><FileUp size={14} />新建任务</button>
+        <button className="header-command-button" onClick={onNew}><FileUp size={14} />打开 Harness</button>
         <button className="header-command-button" onClick={onHistory}><History size={14} />历史记录</button>
         <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
       </div>
@@ -743,7 +735,7 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
             setPreviewJob((current) => ({ ...current, model_url: artifact.url }));
           } else setSelectedAgentArtifact(artifact);
         }} />
-        {error && <div className="planning-workbench-error floating"><AlertTriangle size={15} /><span>{error}</span><button onClick={onNew}>新建任务</button></div>}
+        {error && <div className="planning-workbench-error floating"><AlertTriangle size={15} /><span>{error}</span><button onClick={onNew}>打开 Harness</button></div>}
       </aside>
       <section className="viewport panel processing-viewport">
         {selectedAgentArtifact && <AgentArtifactViewer artifact={selectedAgentArtifact} apiUrl={apiUrl} onClose={() => setSelectedAgentArtifact(null)} />}
@@ -819,6 +811,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [perceptionError, setPerceptionError] = useState<string | null>(null);
   const [trialPending, setTrialPending] = useState(false);
   const [trialError, setTrialError] = useState<string | null>(null);
+  const [rollingPending, setRollingPending] = useState(false);
+  const [rollingError, setRollingError] = useState<string | null>(null);
   const [activeAgentEvent, setActiveAgentEvent] = useState<AgentTraceEvent | null>(null);
   const [showOperationViewSwitch, setShowOperationViewSwitch] = useState(false);
   const [stockSelected, setStockSelected] = useState(false);
@@ -880,6 +874,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   useEffect(() => {
     let cancelled = false;
     let refreshing = false;
+    const embeddedInHarness = new URLSearchParams(window.location.search).get("embed") === "harness";
     const refreshJob = async () => {
       if (refreshing) return;
       refreshing = true;
@@ -913,8 +908,14 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     // synchronization for later focus/visibility changes only.
     window.addEventListener("focus", refreshJob);
     document.addEventListener("visibilitychange", refreshWhenVisible);
+    // Harness mutates the process draft through MCP calls after deterministic
+    // STEP parsing has already completed.  Those updates do not produce a
+    // browser focus event, so the embedded engineering view must follow them.
+    const refreshTimer = embeddedInHarness ? window.setInterval(refreshJob, 2000) : undefined;
+    if (embeddedInHarness) void refreshJob();
     return () => {
       cancelled = true;
+      if (refreshTimer !== undefined) window.clearInterval(refreshTimer);
       window.removeEventListener("focus", refreshJob);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
@@ -967,10 +968,48 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     }
   }, [initialJob.id, refreshAgentWorkspace]);
 
+  const advanceL32Operation = useCallback(async () => {
+    setRollingPending(true);
+    setRollingError(null);
+    try {
+      const refresh = ["blocked", "plan_blocked"].includes(agentWorkspace?.orchestration?.rolling_loop?.status || "");
+      const response = await fetch(apiUrl(`/api/v1/jobs/${initialJob.id}/agent/l32/loop/advance${refresh ? "?refresh=true" : ""}`), { method: "POST" });
+      const payload = await response.json().catch(() => null) as { detail?: string; message?: string } | null;
+      if (!response.ok) throw new Error(payload?.detail ?? `逐工序验证失败（${response.status}）`);
+      await refreshAgentWorkspace();
+    } catch (reason) {
+      setRollingError(reason instanceof Error ? reason.message : "逐工序验证失败");
+      await refreshAgentWorkspace();
+    } finally {
+      setRollingPending(false);
+    }
+  }, [agentWorkspace?.orchestration?.rolling_loop?.status, initialJob.id, refreshAgentWorkspace]);
+
   useEffect(() => {
     const handle = window.setTimeout(() => { void refreshAgentWorkspace(); }, 0);
     return () => window.clearTimeout(handle);
   }, [refreshAgentWorkspace]);
+
+  useEffect(() => {
+    if (agentWorkspace?.orchestration?.autonomous_process?.status !== "running") return;
+    let cancelled = false;
+    const refreshAutonomous = async () => {
+      await refreshAgentWorkspace();
+      try {
+        const response = await fetch(apiUrl(`/api/v1/jobs/${initialJob.id}`), { cache: "no-store" });
+        if (!response.ok || cancelled) return;
+        const refreshed = await response.json() as Job;
+        if (!cancelled) setJob(refreshed);
+      } catch {
+        // The next bounded poll retries while the autonomous executor is active.
+      }
+    };
+    const handle = window.setInterval(() => { void refreshAutonomous(); }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(handle);
+    };
+  }, [agentWorkspace?.orchestration?.autonomous_process?.status, initialJob.id, refreshAgentWorkspace]);
 
   const operations = useMemo(
     () => job.plan?.setups.flatMap((setup) => setup.operations) ?? [],
@@ -2679,7 +2718,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   };
 
   if (!job.plan || !job.analysis || !job.model_url) {
-    return <div className="fatal-state"><AlertTriangle />{job.error || "任务没有产生可用结果"}<button onClick={onNew}>上传新零件</button></div>;
+    return <div className="fatal-state"><AlertTriangle />{job.error || "任务没有产生可用结果"}<button onClick={onNew}>前往 Harness</button></div>;
   }
 
   return (
@@ -2696,7 +2735,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           {readOnly && <span className="readonly-badge">只读模式</span>}
         </div>
         <div className="header-actions">
-          <button className="header-command-button" onClick={onNew}><FileUp size={14} />新建任务</button>
+          <button className="header-command-button" onClick={onNew}><FileUp size={14} />打开 Harness</button>
           <button className="header-command-button" onClick={onHistory}><History size={14} />历史记录</button>
           <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
         </div>
@@ -2846,6 +2885,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             trialAvailable={job.plan?.process_kind === "subtractive" && job.plan.automation_status !== "unsupported" && job.device_id !== "citizen-cincom-l32"}
             trialPending={trialPending}
             trialError={trialError}
+            onAdvanceOperation={() => void advanceL32Operation()}
+            rollingAvailable={job.device_id === "citizen-cincom-l32" && agentWorkspace?.orchestration?.rolling_loop?.status !== "completed"}
+            rollingPending={rollingPending}
+            rollingError={rollingError}
             activeEventId={activeAgentEvent?.event_id}
             progress={agentWorkspace?.events.at(-1)?.percent ?? (job.status === "completed" ? 100 : 0)}
             apiUrl={apiUrl}
@@ -3095,7 +3138,6 @@ export default function App() {
   const [loadingSession, setLoadingSession] = useState(true);
   const [sessionError, setSessionError] = useState("");
   const [readOnly, setReadOnly] = useState(false);
-  const [showNewJob, setShowNewJob] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
 
   useEffect(() => {
@@ -3108,7 +3150,6 @@ export default function App() {
       if (!match) {
         setJob(null);
         setReadOnly(false);
-        setShowNewJob(false);
         setLoadingSession(false);
         return;
       }
@@ -3136,7 +3177,6 @@ export default function App() {
     window.history.pushState({}, "", `/jobs/${createdJob.id}`);
     setReadOnly(false);
     setJob(createdJob);
-    setShowNewJob(false);
     setShowHistory(false);
     setSessionError("");
   };
@@ -3158,11 +3198,10 @@ export default function App() {
   if (loadingSession) return <div className="fatal-state"><LoaderCircle className="spin" />正在加载任务会话…</div>;
   return <>
     {job
-      ? job.status === "completed"
-        ? <Workbench key={job.id} initialJob={job} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} readOnly={readOnly} />
-        : <ProcessingWorkbench key={job.id} initialJob={job} onCompleted={completePlanningJob} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} />
-      : <EmptyWorkbench error={sessionError} onNew={() => setShowNewJob(true)} onHistory={() => setShowHistory(true)} />}
-    <NewJobDialog open={showNewJob} canClose onClose={() => setShowNewJob(false)} onCreated={openJob} />
+      ? job.status === "completed" && job.plan
+        ? <Workbench key={job.id} initialJob={job} onNew={openHarness} onHistory={() => setShowHistory(true)} readOnly={readOnly} />
+        : <ProcessingWorkbench key={job.id} initialJob={job} onCompleted={completePlanningJob} onNew={openHarness} onHistory={() => setShowHistory(true)} />
+      : <EmptyWorkbench error={sessionError} onNew={openHarness} onHistory={() => setShowHistory(true)} />}
     {showHistory && <HistoryDialog activeJobId={job?.id} onClose={() => setShowHistory(false)} onSelected={openJob} onDeleted={handleDeletedJob} />}
   </>;
 }
@@ -3207,7 +3246,7 @@ function EmptyWorkbench({ error, onNew, onHistory }: { error: string; onNew: () 
       <div className="project-title empty-project-title"><strong>尚未导入模型</strong></div>
       <div className="top-meta" />
       <div className="header-actions">
-        <button className="header-command-button" onClick={onNew}><FileUp size={14} />新建任务</button>
+        <button className="header-command-button" onClick={onNew}><FileUp size={14} />打开 Harness</button>
         <button className="header-command-button" onClick={onHistory}><History size={14} />历史记录</button>
         <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
       </div>
@@ -3219,8 +3258,8 @@ function EmptyWorkbench({ error, onNew, onHistory }: { error: string; onNew: () 
         <div className="empty-part-state">
           {error ? <AlertTriangle size={27} /> : <Box size={27} />}
           <strong>{error || "尚未导入模型"}</strong>
-          <small>新建任务并上传 STEP 模型后，这里将显示模型与工艺规划</small>
-          <button onClick={onNew}><FileUp size={15} />新建任务</button>
+          <small>请在 Harness 上传 STEP/STP；CNC 页面仅用于查看模型、工序与仿真证据</small>
+          <button onClick={onNew}><FileUp size={15} />前往 Harness</button>
         </div>
         <nav className="inspection-rail empty-inspection-rail" aria-label="工程检查与工艺工具">
           <button className={`inspection-card tool ${showOperationLibrary ? "active" : ""}`} onClick={() => { setShowToolLibrary(false); setShowOperationLibrary(true); }}><Library size={19} /><strong>工序库</strong><small>{catalogs?.operations.length ?? 0} 项工序</small></button>

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -23,7 +24,8 @@ from .models import (
     AxialDrillingOperationReviewRequest, BoringOperationReviewRequest, FeatureReviewRequest, GeometryAnalysis, GroovingOperationReviewRequest, JobHistoryItem, JobResponse, OperationCreateRequest,
     GrooveBindingConfirmRequest, ManufacturingRequirement, ManufacturingRequirements,
     ManufacturingRequirementsImportRequest, OperationReorderRequest, OperationUpdateRequest,
-    L32ProfileDecisionRequest, ProcessPlan, SafetyConfigurationRequest, ThreadBindingConfirmRequest,
+    L32AutonomousProcessRequest, L32CandidateToolBindingRequest, L32OperationCandidateEvaluationRequest, L32OperationCandidateSelectionRequest,
+    L32AIProfileDecisionRequest, L32OperationTrialDecisionRequest, L32ProfileDecisionRequest, Operation, ProcessPlan, SafetyConfigurationRequest, ThreadBindingConfirmRequest,
     ThreadOperationReviewRequest,
     SolidSelectionRequest,
 )
@@ -37,7 +39,11 @@ from .l32_configuration import l32_definition_payload, l32_viii_live_tool_catalo
 from .l32_indexed_pocket import IndexedPocketDraft, IndexedPocketSweepCheck, build_indexed_back_pocket_draft
 from .l32_side_milling import build_l32_exterior_clear_draft, build_l32_side_mill_draft
 from .l32_front_groove import build_front_groove_geometry_draft
-from .tool_inventory import ToolInventoryInput, ToolInventoryRecord, physical_tool_fit_for_groove, record_physical_tool
+from .tool_inventory import (
+    ToolInventoryInput, ToolInventoryRecord, bind_verified_inventory_tool,
+    inventory_binding_evidence_request, physical_tool_fit_for_groove,
+    record_physical_tool,
+)
 from .machine_models import MachineBindingRequest, MachineConfigurationSnapshot, MachineInstance
 from .manufacturing_knowledge import assess_plan_knowledge, get_manufacturing_process, manufacturing_process_payload
 from .route_planner import build_manufacturing_route
@@ -50,11 +56,16 @@ from .recognizer import normalize_manufacturing_features, recognize_planar_machi
 from .engines import probe_engine, resolve_executable, run_camotics, run_freecad_adapter
 from .forming import build_forming_preview
 from .qwen import QwenPlanningError, probe_qwen, qwen_config_payload, review_process_plan
+from .agent.process_strategies import (
+    ValidationOutcome, evaluate_validation_contract, get_process_strategy,
+    operations_for_role,
+)
 from .benchmarks import example_catalog_payload
 from .coverage import evaluate_plan_coverage
 from .remediation import apply_automatic_remediation, build_remediation_report
 from .rotational_features import (
-    RotationalFeatureAnalysis, bind_thread_requirements, infer_rotational_features,
+    AIProvisionalProfileDecision, RotationalFeatureAnalysis, bind_thread_requirements,
+    clip_rotational_profile, infer_rotational_features,
 )
 from .groove_binding import (
     DrawingGrooveRequirement, bind_groove_requirement, groove_candidate_evidence,
@@ -72,6 +83,7 @@ from .l32_backside_chain import (
 )
 from .l32_front_chain import FrontChainDraftRequest, FrontChainDraftResult, compile_front_chain_draft
 from .l32_whole_program import WholePartDraftRequest, WholePartDraftResult, compile_whole_part_draft
+from .l32_back_live_face import BackLiveFaceDraftRequest, compile_back_live_face_draft
 from .inner_bore_chain import InnerBoreChainRequest, InnerBoreChainResult, compile_inner_bore_chain
 from .agent.architecture import agent_architecture
 from .agent.events import build_agent_event
@@ -87,6 +99,7 @@ CAM_ADAPTER_SCRIPT = Path(os.getenv("CNC_CAM_ADAPTER_SCRIPT", APP_ROOT / "cam" /
 MAX_UPLOAD_BYTES = int(os.getenv("CNC_MAX_UPLOAD_MB", "200")) * 1024 * 1024
 PUBLIC_BASE_URL = os.getenv("CNC_PUBLIC_BASE_URL", "").rstrip("/")
 MEAS_API_BASE_URL = os.getenv("CNC_MEAS_API_BASE_URL", "").strip().rstrip("/")
+HARNESS_ONLY_MODE = os.getenv("CNC_HARNESS_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
 MEAS_TIMEOUT_SECONDS = max(float(os.getenv("CNC_MEAS_TIMEOUT_SECONDS", "600")), 1.0)
 BENCHMARK_REPORT_PATH = Path(os.getenv(
     "CNC_BENCHMARK_REPORT", STORAGE_ROOT.parent / "benchmark-report.json",
@@ -100,6 +113,14 @@ AGENT_TRIAL_LOCK = threading.Lock()
 AGENT_TRIALING_JOBS: set[str] = set()
 L32_PROFILE_REVIEW_LOCK = threading.Lock()
 L32_PROFILE_REVIEWING_JOBS: set[str] = set()
+L32_AGENT_VALIDATION_LOCK = threading.Lock()
+L32_AGENT_VALIDATING_JOBS: set[str] = set()
+L32_ROLLING_LOOP_LOCK = threading.Lock()
+L32_ROLLING_LOOP_JOBS: set[str] = set()
+L32_OPERATION_TRIAL_LOCK = threading.Lock()
+L32_OPERATION_TRIALING_JOBS: set[str] = set()
+L32_AUTONOMOUS_PROCESS_LOCK = threading.Lock()
+L32_AUTONOMOUS_PROCESS_JOBS: set[str] = set()
 L32_MATERIAL_SNAPSHOT_LOCK = threading.Lock()
 AI_REVIEWING_JOBS: set[str] = set()
 JOB_EVENT_CONDITION = threading.Condition()
@@ -244,14 +265,26 @@ def persist_rotational_analysis(
         path.unlink(missing_ok=True)
         return None
     result = infer_rotational_features(analysis)
+    for profile in result.profiles:
+        raw_decision = analysis.rotational_profile_decisions.get(profile.id)
+        if profile.review_state == "ai_provisional" and raw_decision:
+            profile.provisional_decision = AIProvisionalProfileDecision.model_validate(raw_decision)
     accepted_axis_ids = {
         profile.axis_id for profile in result.profiles
         if profile.review_state == "accepted"
+    }
+    provisional_axis_ids = {
+        profile.axis_id for profile in result.profiles
+        if profile.review_state == "ai_provisional"
     }
     for axis in result.axes:
         if axis.id in accepted_axis_ids:
             axis.review_state = "accepted"
             axis.review_reasons = []
+        elif axis.id in provisional_axis_ids:
+            axis.review_state = "ai_provisional"
+            if "AI provisional axis authorization for DRAFT-only planning" not in axis.review_reasons:
+                axis.review_reasons.append("AI provisional axis authorization for DRAFT-only planning")
     requirements = job.plan.manufacturing_requirements if job.plan else None
     result = bind_thread_requirements(result, requirements)
     write_json(path, result.model_dump(mode="json"))
@@ -352,6 +385,10 @@ def invalidate_cam_artifacts(directory: Path) -> None:
         "simulation.json", "collision.json", "remediation.json", "remediation-history.json", "ai-plan.json", "cam-manifest.json",
         "agent-execution.json", "agent-remediation.json",
         "agent-operation-trial.json",
+        "agent-l32-operation-trial.json",
+        "agent-l32-operation-candidates.json",
+        "agent-l32-auto-repair.json",
+        "agent-l32-rolling-loop.json",
         "agent-world-model.json", "agent-orchestrator.json",
         "turning-toolpath-ir.json", "turning-simulation.json", "turning-verification.json", "turning-thread-verification.json", "turning-reachability.json", "turning-draft.json",
         "turning-transfer-ir.json", "turning-transfer-draft.json",
@@ -445,6 +482,7 @@ def health() -> dict[str, object]:
         "verification": "static_preflight_available",
         "simulation": "camotics_available" if camotics.available else "height_field_fallback",
         "collision": "tool_holder_fixture_envelope_available",
+        "planning_entry": "deepseek_harness" if HARNESS_ONLY_MODE else "legacy_api_and_harness",
         "engines": [freecad.as_dict(), camotics.as_dict()],
     }
 
@@ -544,6 +582,13 @@ def get_l32_catalog_back_pocket_draft(job_id: str, feature_id: str) -> IndexedPo
 def check_l32_catalog_back_pocket_sweep(job_id: str, feature_id: str) -> IndexedPocketSweepCheck:
     """Compare the actual OCC cutter sweep to the original STEP solid."""
     draft = get_l32_catalog_back_pocket_draft(job_id, feature_id)
+    return _run_l32_pocket_sweep(job_id, draft)
+
+
+def _run_l32_pocket_sweep(
+    job_id: str, draft: IndexedPocketDraft,
+) -> IndexedPocketSweepCheck:
+    """Run an exact pocket sweep for either the default or a sandbox candidate draft."""
     job = load_job(job_id)
     source = job_directory(job_id) / job.filename
     if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
@@ -580,7 +625,7 @@ def check_l32_catalog_back_pocket_sweep(job_id: str, feature_id: str) -> Indexed
         else "within_geometric_tolerance"
     )
     response = IndexedPocketSweepCheck(
-        feature_id=feature_id,
+        feature_id=draft.feature_id,
         bound_machine_has_required_module=draft.bound_machine_has_required_module,
         pocket_region_status=status,
         target_material_inside_pocket_region_mm3=result["target_material_inside_pocket_region_mm3"],
@@ -704,7 +749,7 @@ def _check_l32_reference_sweep(
     if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
         raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
     cache_signature = cached_preview_signature(
-        "l32-reference-sweep-v1", source,
+        "l32-reference-sweep-v2", source,
         {"toolpaths": toolpaths, "bound_machine_has_required_module": has_module},
     )
     cache_path = job_directory(job_id) / f"l32-preview-cache-sweep-{cache_signature[:20]}.json"
@@ -743,6 +788,13 @@ def _check_l32_reference_sweep(
             for index,item in enumerate(checks)
         ),
         "whole_part_material_verified": False,
+        "initial_stock_volume_mm3": result.get("initial_stock_volume_mm3"),
+        "remaining_stock_volume_mm3": result.get("remaining_stock_volume_mm3"),
+        "removed_stock_volume_mm3": result.get("removed_stock_volume_mm3"),
+        "missing_target_volume_mm3": result.get("missing_target_volume_mm3"),
+        "machining_region_x_mm": result.get("machining_region_x_mm"),
+        "initial_excess_region_mm3": result.get("initial_excess_region_mm3"),
+        "remaining_excess_region_mm3": result.get("remaining_excess_region_mm3"),
         "checks": checks,
     }
     write_cached_preview(cache_path, cache_signature, payload)
@@ -860,6 +912,7 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
     grooves: dict[str, dict[str, float]] = {}
     pockets: dict[str, dict[str, object]] = {}
     cutoffs: dict[str, dict[str, float]] = {}
+    back_faces: dict[str, dict[str, float]] = {}
     stages: list[dict[str, object]] = []
     for operation in operations:
         if operation.enabled is False:
@@ -905,6 +958,17 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
             stages.append({"operation_id": operation.id, "kind": "exterior", "rough": True})
         elif operation.type == "live_tool_contour_finishing":
             stages.append({"operation_id": operation.id, "kind": "exterior", "rough": False})
+        elif operation.type == "back_live_face_finishing":
+            finished = float(operation.parameters.get(
+                "finished_back_datum_z_mm", job.plan.stock.get("finished_back_z_mm"),
+            ))
+            allowance = float(operation.parameters.get("stock_allowance_mm", 0))
+            if allowance > 0:
+                back_faces[operation.id] = {
+                    "minimum": finished - allowance,
+                    "maximum": finished,
+                }
+                stages.append({"operation_id": operation.id, "kind": "back_face", "rough": False})
         elif operation.type in {"pocket_roughing", "pocket_finishing"}:
             feature_id = next((item for item in operation.feature_ids if item.startswith("MF-")), None)
             if feature_id:
@@ -940,6 +1004,7 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
         "face_overhang": float(job.plan.stock.get("allowance_mm", {}).get("axial", 2.0)),
         "grooves": grooves,
         "cutoffs": cutoffs,
+        "back_faces": back_faces,
         "pockets": pockets,
     }
     stages_json = json.dumps({"stages": stages, "context": context}, separators=(",", ":"))
@@ -1215,7 +1280,7 @@ def apply_l32_machine_configuration(
         for operation in setup.operations:
             if operation.workpiece_side != "back":
                 continue
-            if operation.type in {"pocket_roughing", "pocket_finishing"}:
+            if operation.type in {"pocket_roughing", "pocket_finishing", "back_live_face_finishing"}:
                 operation.enabled = back_live_tool_available
             else:
                 operation.enabled = back_turning_enabled and operation.id != "OP60"
@@ -1863,17 +1928,25 @@ def _create_l32_whole_program_with_agent_loop(job_id: str) -> WholePartDraftResu
     accepted_profile = next(
         (item for item in rotational.profiles if item.review_state == "accepted"), None,
     )
-    # An agent trial may use the strongest non-excluded profile as a provisional
-    # hypothesis.  It remains a DRAFT and must not be confused with the stricter
-    # public whole-program endpoint, which still requires human acceptance and
-    # complete target coverage before release-oriented planning.
+    # Whole-program validation may use a complete AI-provisional exact section,
+    # but it must never silently promote an unreviewed or partial contour.
     source_profile = accepted_profile or max(
-        (item for item in rotational.profiles if item.review_state != "excluded"),
+        (item for item in rotational.profiles if item.review_state == "ai_provisional"),
         key=lambda item: (item.confidence, len(item.points)),
         default=None,
     )
     if source_profile is None:
         raise ValueError("L32 试算缺少可用的回转轮廓")
+    if (
+        source_profile.review_state == "ai_provisional"
+        and (
+            source_profile.provisional_decision is None
+            or source_profile.provisional_decision.scope != "full"
+        )
+    ):
+        raise ValueError(
+            "A partial AI-provisional profile is valid only for bounded per-operation DRAFT trials"
+        )
     z_values = [point.z for point in source_profile.points]
     z_min, z_max = min(z_values), max(z_values)
     length = max(z_max - z_min, 1.0)
@@ -2115,6 +2188,12 @@ def _create_l32_whole_program_with_agent_loop(job_id: str) -> WholePartDraftResu
             failed_operations=failed_operations,
             profile_review_state=source_profile.review_state,
             coverage_status=coverage.status if coverage else "unknown",
+            manufacturing_context={
+                "nonrotational_turning_limit_z_mm": compile_plan.stock.get("nonrotational_turning_limit_z_mm"),
+                "nonrotational_region_z_mm": compile_plan.stock.get("nonrotational_region_z_mm"),
+                "machine_capabilities": list(snapshot.validation.capabilities),
+                "machine_instance_id": snapshot.instance.id,
+            },
             settings=load_agent_settings(),
             validate_candidate=validate_repair_candidate,
             progress_callback=report_repair,
@@ -2155,6 +2234,2083 @@ def _create_l32_whole_program_with_agent_loop(job_id: str) -> WholePartDraftResu
     write_json(directory / "turning-whole-program-draft.json", result.model_dump(mode="json"))
     _run_l32_operation_execution_agent(job_id, job, result)
     return result
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/validate")
+def validate_l32_agent_plan(job_id: str) -> dict[str, object]:
+    """Run the real L32 compile/simulate/review loop and return compact evidence.
+
+    This endpoint is intentionally DRAFT-only.  A blocked operation is a useful
+    agent result, so validation failures are returned as evidence instead of
+    being flattened into an HTTP error with no machine-readable trace.
+    """
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="该验证工具仅适用于 L32 任务")
+    if job.status != "completed" or not job.analysis or not job.plan:
+        raise HTTPException(status_code=409, detail="需要已完成的几何分析与工艺草案")
+    with L32_AGENT_VALIDATION_LOCK:
+        if job_id in L32_AGENT_VALIDATING_JOBS:
+            raise HTTPException(status_code=409, detail="该任务正在执行 L32 智能体验证")
+        L32_AGENT_VALIDATING_JOBS.add(job_id)
+    directory = job_directory(job_id)
+    publish_job_event(
+        job_id, "l32_agent_validation", "Harness 已请求真实 L32 编译与逐工序仿真", 98,
+        agent_node="harness_validate", agent_title="L32 工具验证",
+        agent_kind="tool_call", agent_status="running",
+    )
+    try:
+        error = ""
+        try:
+            result = _create_l32_whole_program_with_agent_loop(job_id)
+            simulation_status = result.continuous_simulation.status
+        except (OSError, ValueError, HTTPException) as exc:
+            error = str(exc.detail if isinstance(exc, HTTPException) else exc)
+            simulation_status = "blocked"
+        execution = _optional_job_json(directory, "agent-l32-execution.json") or {}
+        incremental = _optional_job_json(directory, "agent-l32-incremental-trial.json") or {}
+        records = execution.get("records") or incremental.get("records") or []
+        status = str(execution.get("status") or incremental.get("status") or simulation_status)
+        payload: dict[str, object] = {
+            "schema_version": "1.0.0",
+            "job_id": job_id,
+            "status": status,
+            "release_status": "DRAFT",
+            "production_ready": False,
+            "simulation_status": simulation_status,
+            "operation_count": len(records),
+            "operations": [
+                {
+                    "operation_id": item.get("operation_id"),
+                    "status": item.get("status"),
+                    "blocking_reasons": item.get("blocking_reasons") or (
+                        [item.get("reason")] if item.get("reason") else []
+                    ),
+                    "evidence": item.get("evidence") or {
+                        key: item.get(key) for key in (
+                            "command_count", "removed_volume_mm3", "remaining_volume_mm3",
+                        ) if item.get(key) is not None
+                    },
+                }
+                for item in records if isinstance(item, dict)
+            ],
+            "summary": execution.get("summary") or incremental.get("repair") or {},
+            "next_action": (
+                (execution.get("summary") or {}).get("next_action")
+                or incremental.get("next_action")
+                or ("human_review" if error else "machine_level_validation")
+            ),
+            "error": error or None,
+            "artifacts": [
+                name for name in (
+                    "turning-whole-program-ir.json", "turning-continuous-simulation.json",
+                    "agent-l32-execution.json", "agent-l32-incremental-trial.json",
+                ) if (directory / name).is_file()
+            ],
+        }
+        publish_job_event(
+            job_id, "l32_agent_validation",
+            "L32 智能体验证通过" if status == "passed" else "L32 智能体验证已保留阻断证据",
+            100, agent_node="harness_validate", agent_title="L32 工具验证",
+            agent_kind="validation", agent_status="completed" if status == "passed" else "blocked",
+            evidence=[
+                {"label": "状态", "value": status},
+                {"label": "已审核工序", "value": len(records)},
+            ],
+        )
+        return payload
+    finally:
+        with L32_AGENT_VALIDATION_LOCK:
+            L32_AGENT_VALIDATING_JOBS.discard(job_id)
+
+
+def _public_l32_rolling_loop(payload: dict[str, object]) -> dict[str, object]:
+    """Hide the cached validation envelope while keeping cited evidence compact."""
+    return {key: value for key, value in payload.items() if key != "validation_cache"}
+
+
+def _l32_nonrotational_trial_evidence(
+    job_id: str, operation: Operation, *, job: JobResponse | None = None,
+) -> dict[str, object] | None:
+    """Build deterministic OCC evidence for indexed L32 milling operations."""
+    if operation.type not in {
+        "pocket_roughing", "pocket_finishing",
+        "live_tool_contour_roughing", "live_tool_contour_finishing",
+    }:
+        return None
+    job = job or load_job(job_id)
+    snapshot_path = job_directory(job_id) / "machine-configuration.json"
+    if not snapshot_path.is_file():
+        return {
+            "machine_capability_status": "failed",
+            "target_protection_status": "not_run",
+            "material_removal_status": "not_run",
+            "operation_coverage_status": "not_run",
+            "detail": "Bound L32 machine configuration is unavailable.",
+        }
+    snapshot = load_machine_snapshot(snapshot_path)
+    capabilities = set(snapshot.validation.capabilities)
+    modules = set(snapshot.instance.installed_modules)
+
+    if operation.type in {"pocket_roughing", "pocket_finishing"}:
+        feature_id = next((item for item in operation.feature_ids if item.startswith("MF-")), None)
+        if feature_id is None:
+            return {
+                "machine_capability_status": "failed", "target_protection_status": "not_run",
+                "material_removal_status": "not_run", "operation_coverage_status": "not_run",
+                "detail": "Pocket operation has no accepted prismatic feature binding.",
+            }
+        feature = next((item for item in job.analysis.prismatic_features if item.id == feature_id), None)
+        if feature is None:
+            return {
+                "machine_capability_status": "failed", "target_protection_status": "not_run",
+                "material_removal_status": "not_run", "operation_coverage_status": "not_run",
+                "detail": "Pocket feature is absent from the accepted geometry analysis.",
+            }
+        diameter = float(operation.tool.diameter_mm)
+        depth_step = float(operation.parameters.get("step_down_mm") or 0.3)
+        stepover = operation.parameters.get("step_over_mm")
+        if not isinstance(stepover, (int, float)) or isinstance(stepover, bool):
+            percent = operation.parameters.get("step_over_percent")
+            stepover = diameter * float(percent) / 100 if isinstance(percent, (int, float)) else min(0.35, diameter * 0.35)
+        try:
+            draft = build_indexed_back_pocket_draft(
+                job.analysis, feature, tool_diameter_mm=diameter,
+                depth_step_mm=depth_step, stepover_mm=float(stepover),
+            )
+        except ValueError as error:
+            return {
+                "machine_capability_status": "passed", "target_protection_status": "not_run",
+                "material_removal_status": "failed", "operation_coverage_status": "failed",
+                "detail": str(error), "feature_id": feature_id,
+            }
+        draft.tool_catalog_match = operation.tool.catalog_match
+        draft.bound_machine_has_required_module = (
+            "U151B" in modules
+            and snapshot.instance.id == job.machine_instance_id
+            and snapshot.configuration_hash == job.machine_configuration_hash
+        )
+        sweep = _run_l32_pocket_sweep(job_id, draft)
+        capability_passed = (
+            "back_live_tool_milling" in capabilities
+            and "U151B" in modules
+            and draft.bound_machine_has_required_module is True
+        )
+        protection_passed = sweep.summed_target_contact_mm3 <= 0.0001
+        removal_passed = sweep.removed_pocket_region_mm3 > 0.0001
+        finishing = operation.type == "pocket_finishing"
+        coverage_passed = (
+            protection_passed and removal_passed
+            and (not finishing or sweep.remaining_pocket_region_mm3 <= 0.0001)
+        )
+        return {
+            "executor": "exact_occ_indexed_pocket_sweep",
+            "feature_id": feature_id,
+            "machine_capability_status": "passed" if capability_passed else "failed",
+            "target_protection_status": "passed" if protection_passed else "failed",
+            "material_removal_status": "passed" if removal_passed else "failed",
+            "operation_coverage_status": "passed" if coverage_passed else "failed",
+            "removed_volume_mm3": sweep.removed_pocket_region_mm3,
+            "remaining_feature_material_mm3": sweep.remaining_pocket_region_mm3,
+            "target_contact_mm3": sweep.summed_target_contact_mm3,
+            "bound_module": "U151B",
+            "artifacts": {
+                "draft": f"/api/v1/jobs/{job_id}/l32/catalog-back-pocket/{feature_id}/draft",
+                "sweep": f"/api/v1/jobs/{job_id}/l32/catalog-back-pocket/{feature_id}/sweep-check",
+            },
+            "diagnostic_hints": ([
+                "Finishing still leaves material in the exact pocket region; choose a smaller tool or a validated corner-cleanup process."
+            ] if finishing and not coverage_passed else []),
+        }
+
+    geometry = get_l32_catalog_ear_geometry(job_id)
+    faces = geometry["side_faces"]
+    if len(faces) != 2 or {int(face["normal_y"]) for face in faces} != {-1, 1}:
+        return {
+            "machine_capability_status": "passed", "target_protection_status": "not_run",
+            "material_removal_status": "failed", "operation_coverage_status": "failed",
+            "detail": "Two opposing exact radial faces are required for exterior clearing.",
+        }
+    stock_radius = float(job.plan.stock["diameter_mm"]) / 2
+    diameter = float(operation.tool.diameter_mm)
+    radial_step = float(operation.parameters.get("step_down_mm") or min(0.4, diameter * 0.8))
+    stepover = operation.parameters.get("step_over_mm")
+    if not isinstance(stepover, (int, float)) or isinstance(stepover, bool):
+        percent = operation.parameters.get("step_over_percent")
+        stepover = diameter * float(percent) / 100 if isinstance(percent, (int, float)) else min(0.35, diameter * 0.7)
+    raw_clearance = operation.parameters.get("silhouette_clearance_mm")
+    silhouette_clearance = float(raw_clearance) if isinstance(raw_clearance, (int, float)) else 0.18
+    try:
+        drafts = [
+            build_l32_exterior_clear_draft(
+                face, stock_radius_mm=stock_radius,
+                access_sign=1 if face["normal_y"] > 0 else -1,
+                tool_diameter_mm=diameter, radial_step_mm=radial_step,
+                stepover_mm=float(stepover), silhouette_clearance_mm=silhouette_clearance,
+            ).model_dump(mode="json")
+            for face in faces
+        ]
+    except (KeyError, TypeError, ValueError) as error:
+        return {
+            "machine_capability_status": "passed", "target_protection_status": "not_run",
+            "material_removal_status": "failed", "operation_coverage_status": "failed",
+            "detail": str(error),
+        }
+    module_bound = (
+        "U30B" in modules
+        and snapshot.instance.id == job.machine_instance_id
+        and snapshot.configuration_hash == job.machine_configuration_hash
+    )
+    sweep = _check_l32_reference_sweep(job_id, drafts, module_bound)
+    capability_passed = (
+        "live_tool_milling" in capabilities
+        and "U30B" in modules
+        and sweep.get("bound_machine_has_required_module") is True
+    )
+    protection_passed = bool(sweep.get("target_gouge_check_passed")) and float(
+        sweep.get("missing_target_volume_mm3") or 0
+    ) <= 0.0001
+    removed = float(sweep.get("removed_stock_volume_mm3") or 0)
+    remaining = float(sweep.get("remaining_excess_region_mm3") or 0)
+    initial_excess = float(sweep.get("initial_excess_region_mm3") or 0)
+    removal_passed = removed > 0.0001 and remaining <= initial_excess + 0.0001
+    finishing = operation.type == "live_tool_contour_finishing"
+    tolerance = max(0.001, initial_excess * 0.005)
+    coverage_passed = (
+        protection_passed and removal_passed
+        and (not finishing or remaining <= tolerance)
+    )
+    return {
+        "executor": "exact_occ_nonrotational_exterior_sweep",
+        "feature_ids": operation.feature_ids,
+        "machine_capability_status": "passed" if capability_passed else "failed",
+        "target_protection_status": "passed" if protection_passed else "failed",
+        "material_removal_status": "passed" if removal_passed else "failed",
+        "operation_coverage_status": "passed" if coverage_passed else "failed",
+        "removed_volume_mm3": removed,
+        "initial_excess_region_mm3": initial_excess,
+        "remaining_excess_region_mm3": remaining,
+        "coverage_tolerance_mm3": tolerance,
+        "bound_module": "U30B",
+        "artifacts": {
+            "draft": f"/api/v1/jobs/{job_id}/l32/catalog-exterior-toolpaths",
+            "sweep": f"/api/v1/jobs/{job_id}/l32/catalog-exterior-sweep-check",
+        },
+        "diagnostic_hints": ([
+            "Exact exterior sweep leaves material in the nonrotational region; revise the live-tool strategy before finishing acceptance."
+        ] if finishing and not coverage_passed else []),
+    }
+
+
+@app.get("/api/v1/jobs/{job_id}/agent/l32/operation-trials/state")
+def get_l32_independent_operation_state(job_id: str) -> dict[str, object]:
+    """Return the accepted operation prefix without exposing the full stock sample field."""
+    from .agent.l32_operation_trial import (
+        STATE_SCHEMA_VERSION, evidence_context_signature, reconcile_state, state_summary,
+    )
+
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="Independent operation trials currently require an L32 job")
+    directory = job_directory(job_id)
+    state = _optional_job_json(directory, "harness-l32-operation-state.json")
+    rotational_path = directory / "rotational-features.json"
+    snapshot_path = directory / "machine-configuration.json"
+    context_signature = None
+    if rotational_path.is_file() and snapshot_path.is_file():
+        context_signature = evidence_context_signature(
+            job,
+            RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8")),
+            load_machine_snapshot(snapshot_path),
+        )
+    reconciled = reconcile_state(job, state, context_signature)
+    if reconciled != state:
+        write_json(directory / "harness-l32-operation-state.json", reconciled)
+    summary = state_summary(job, reconciled)
+    latest = _optional_job_json(directory, "agent-l32-operation-trial.json") or {}
+    latest_public = {
+        key: latest.get(key)
+        for key in ("operation_id", "status", "can_accept", "reason", "detail", "next_action", "evidence")
+        if latest.get(key) is not None
+    }
+    if latest_public and context_signature and latest.get("context_signature") != context_signature:
+        latest_public.update({
+            "status": "stale", "can_accept": False,
+            "reason": "evidence_context_changed",
+            "detail": "Geometry, stock or machine context changed; run the operation trial again.",
+            "next_action": "trial_l32_operation",
+        })
+    elif latest_public and latest.get("schema_version") != STATE_SCHEMA_VERSION:
+        latest_public.update({
+            "status": "stale", "can_accept": False,
+            "reason": "material_world_model_upgraded",
+            "detail": "The material world model changed; retrial from the first operation on the fixed grid.",
+            "next_action": "trial_l32_operation",
+        })
+    summary["latest_trial"] = latest_public or None
+    return summary
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/operations/{operation_id}/trial")
+def trial_l32_operation_independently(job_id: str, operation_id: str) -> dict[str, object]:
+    """Compile and simulate exactly the next operation from the accepted material state."""
+    from .agent.l32_operation_trial import public_trial_result, run_independent_trial
+
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="Independent operation trials currently require an L32 job")
+    if job.status != "completed" or job.analysis is None or job.plan is None:
+        raise HTTPException(status_code=409, detail="Completed geometry and a Harness process draft are required")
+    directory = job_directory(job_id)
+    rotational_path = directory / "rotational-features.json"
+    snapshot_path = directory / "machine-configuration.json"
+    if not rotational_path.is_file() or not snapshot_path.is_file():
+        raise HTTPException(status_code=409, detail="Rotational geometry or machine configuration evidence is missing")
+    with L32_OPERATION_TRIAL_LOCK:
+        if job_id in L32_OPERATION_TRIALING_JOBS:
+            raise HTTPException(status_code=409, detail="An independent operation trial is already running")
+        L32_OPERATION_TRIALING_JOBS.add(job_id)
+    publish_job_event(
+        job_id, "harness_operation_trial", f"正在独立编译并仿真 {operation_id}", 70,
+        agent_node="harness_operation_trial", agent_title="单道工序试算",
+        agent_kind="tool_call", agent_status="running", operation_id=operation_id,
+    )
+    try:
+        rotational = RotationalFeatureAnalysis.model_validate_json(
+            rotational_path.read_text(encoding="utf-8")
+        )
+        snapshot = load_machine_snapshot(snapshot_path)
+        state = _optional_job_json(directory, "harness-l32-operation-state.json")
+        try:
+            operation = next(
+                item for setup in job.plan.setups for item in setup.operations
+                if item.enabled and item.id == operation_id
+            )
+            nonrotational_evidence = _l32_nonrotational_trial_evidence(job_id, operation)
+            result, reconciled = run_independent_trial(
+                job=job, operation_id=operation_id, rotational=rotational,
+                snapshot=snapshot, state=state,
+                nonrotational_evidence=nonrotational_evidence,
+            )
+        except (StopIteration, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        write_json(directory / "harness-l32-operation-state.json", reconciled)
+        write_json(directory / "agent-l32-operation-trial.json", result)
+        public = public_trial_result(result)
+        public["artifacts"] = {
+            "trial": f"/api/v1/jobs/{job_id}/files/agent-l32-operation-trial.json",
+            "state": f"/api/v1/jobs/{job_id}/files/harness-l32-operation-state.json",
+        }
+        publish_job_event(
+            job_id, "harness_operation_trial",
+            f"{operation_id} 单道试算{'通过' if result.get('can_accept') else '被阻断'}", 82,
+            agent_node="harness_operation_trial", agent_title="单道工序试算",
+            agent_kind="validation",
+            agent_status="completed" if result.get("can_accept") else "blocked",
+            operation_id=operation_id,
+            evidence=[
+                {"label": "门禁状态", "value": result.get("status")},
+                {"label": "材料去除 mm³", "value": (result.get("evidence") or {}).get("removed_volume_mm3")},
+                {"label": "轮廓验证", "value": (result.get("evidence") or {}).get("verification_status")},
+                {"label": "可达性", "value": (result.get("evidence") or {}).get("reachability_status")},
+            ],
+        )
+        return public
+    finally:
+        with L32_OPERATION_TRIAL_LOCK:
+            L32_OPERATION_TRIALING_JOBS.discard(job_id)
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/operations/{operation_id}/trial/accept")
+def accept_l32_independent_operation_trial(
+    job_id: str, operation_id: str, request: L32OperationTrialDecisionRequest,
+) -> dict[str, object]:
+    """Accept planning evidence only; this never approves production or releases NC."""
+    from .agent.l32_operation_trial import (
+        accept_trial, evidence_context_signature, state_summary,
+    )
+
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.plan is None:
+        raise HTTPException(status_code=409, detail="An L32 process draft is required")
+    directory = job_directory(job_id)
+    state = _optional_job_json(directory, "harness-l32-operation-state.json")
+    trial = _optional_job_json(directory, "agent-l32-operation-trial.json")
+    if not trial:
+        raise HTTPException(status_code=409, detail="No independent operation trial is available")
+    rotational_path = directory / "rotational-features.json"
+    snapshot_path = directory / "machine-configuration.json"
+    if not rotational_path.is_file() or not snapshot_path.is_file():
+        raise HTTPException(status_code=409, detail="Rotational geometry or machine configuration evidence is missing")
+    context_signature = evidence_context_signature(
+        job,
+        RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8")),
+        load_machine_snapshot(snapshot_path),
+    )
+    try:
+        accepted = accept_trial(
+            job=job, state=state, trial=trial, operation_id=operation_id,
+            context_signature=context_signature,
+            decision_rationale=request.rationale,
+            acknowledge_warning=request.acknowledge_warning,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    write_json(directory / "harness-l32-operation-state.json", accepted)
+    summary = state_summary(job, accepted)
+    summary.update({
+        "decision": "accepted_for_next_planning_step",
+        "operation_id": operation_id,
+        "evidence": trial.get("evidence") or {},
+        "next_action": (
+            "add_next_operation" if summary.get("next_operation_id") is None
+            else "trial_l32_operation"
+        ),
+        "notice": "Accepted only inside the DRAFT planning loop; no NC or production release was granted.",
+        "decision_rationale": request.rationale,
+        "warning_acknowledged": request.acknowledge_warning,
+    })
+    publish_job_event(
+        job_id, "harness_operation_accept", f"{operation_id} 已通过规划门禁，余料状态已传给下一道", 86,
+        agent_node="harness_operation_accept", agent_title="接受单道工序证据",
+        agent_kind="decision", agent_status="completed", operation_id=operation_id,
+        evidence=[
+            {"label": "已接受工序", "value": summary["accepted_count"]},
+            {"label": "下一工序", "value": summary.get("next_operation_id") or "等待规划"},
+            {"label": "生产放行", "value": "否"},
+            {"label": "决策理由", "value": request.rationale},
+        ],
+    )
+    return summary
+
+
+def _apply_l32_trial_candidate(
+    job: JobResponse, operation_id: str, candidate: object,
+) -> tuple[JobResponse, object]:
+    candidate_job = job.model_copy(deep=True)
+    target_operation_id = candidate.target_operation_id or operation_id
+    operation = next((
+        item for setup in candidate_job.plan.setups for item in setup.operations
+        if item.id == target_operation_id
+    ), None) if candidate_job.plan else None
+    if operation is None:
+        raise ValueError("operation does not exist in the current process draft")
+    definition = get_operation_definition(operation.definition_id or operation.type)
+    feature_ids = candidate.feature_ids if candidate.feature_ids is not None else operation.feature_ids
+    if candidate.feature_ids is not None:
+        _validate_operation_geometry(candidate_job, definition, feature_ids)
+    operation.feature_ids = feature_ids
+    if candidate.reference_profile_id is not None:
+        _validate_reference_profile(candidate_job, candidate.reference_profile_id)
+        operation.reference_profile_id = candidate.reference_profile_id
+    if candidate.tool_id:
+        tool = get_tool(candidate.tool_id)
+        if tool.kind not in definition.tool.accepts:
+            raise ValueError(f"tool type {tool.kind} is incompatible with {definition.name}")
+        operation.tool = tool
+    operation.parameters = validate_parameters(
+        definition, {**operation.parameters, **candidate.parameters},
+    )
+    operation.rationale = [*operation.rationale, f"Harness repair candidate {candidate.id}: {candidate.rationale}"]
+    operation.status = "proposed"
+    operation.generation_state = "dirty"
+    apply_cutting_parameters(
+        operation, resolve_material(candidate_job.material), resolve_machine(candidate_job.machine),
+    )
+    return candidate_job, operation
+
+
+def _l32_candidate_rank(trial: dict[str, object]) -> dict[str, object]:
+    """Rank trial evidence while keeping deterministic acceptance as a hard gate."""
+    evidence = trial.get("evidence") if isinstance(trial.get("evidence"), dict) else {}
+    verification = (
+        evidence.get("verification_metrics")
+        if isinstance(evidence, dict) and isinstance(evidence.get("verification_metrics"), dict)
+        else {}
+    )
+    overcut_count = int(verification.get("overcut_sample_count") or 0)
+    excess_count = int(verification.get("excess_stock_sample_count") or 0)
+    max_overcut = float(verification.get("maximum_overcut_mm") or 0)
+    max_excess = float(verification.get("maximum_excess_stock_mm") or 0)
+    excess_volume = float(verification.get("estimated_excess_stock_volume_mm3") or 0)
+    command_count = int(evidence.get("command_count") or 0) if isinstance(evidence, dict) else 0
+    remaining_feature = float(evidence.get("remaining_feature_material_mm3") or 0) if isinstance(evidence, dict) else 0
+    remaining_exterior = float(evidence.get("remaining_excess_region_mm3") or 0) if isinstance(evidence, dict) else 0
+    target_contact = float(evidence.get("target_contact_mm3") or 0) if isinstance(evidence, dict) else 0
+    reachability = str(evidence.get("reachability_status") or "unknown") if isinstance(evidence, dict) else "unknown"
+    can_accept = bool(trial.get("can_accept"))
+    status = str(trial.get("status") or "blocked")
+
+    # Unsafe or incomplete trials may still carry a diagnostic score so the
+    # agent can explain measurable improvement, but they are never eligible.
+    diagnostic_score = max(
+        0.0,
+        100.0
+        - min(45.0, overcut_count * 3.0 + max_overcut * 20.0)
+        - min(35.0, excess_count * 0.5 + max_excess * 5.0 + excess_volume * 0.02)
+        - min(10.0, command_count * 0.02)
+        - min(45.0, (remaining_feature + remaining_exterior) * 2.0 + target_contact * 100.0),
+    )
+    if reachability not in {"passed", "not_required"}:
+        diagnostic_score = max(0.0, diagnostic_score - 20.0)
+    eligible = can_accept and status in {"passed", "warning"}
+    rank_score = (100.0 if status == "passed" else 75.0) - min(5.0, command_count * 0.005) if eligible else 0.0
+    return {
+        "rank_score": round(rank_score, 3),
+        "diagnostic_score": round(diagnostic_score, 3),
+        "eligible_for_application": eligible,
+        "quality_metrics": {
+            "overcut_sample_count": overcut_count,
+            "excess_stock_sample_count": excess_count,
+            "maximum_overcut_mm": max_overcut,
+            "maximum_excess_stock_mm": max_excess,
+            "estimated_excess_stock_volume_mm3": excess_volume,
+            "command_count": command_count,
+            "reachability_status": reachability,
+            "remaining_feature_material_mm3": remaining_feature,
+            "remaining_excess_region_mm3": remaining_exterior,
+            "target_contact_mm3": target_contact,
+        },
+    }
+
+
+def _l32_candidate_improvement(
+    baseline: dict[str, object], candidate: dict[str, object],
+) -> dict[str, object]:
+    baseline_rank = _l32_candidate_rank(baseline)
+    candidate_rank = _l32_candidate_rank(candidate)
+    base_metrics = baseline_rank["quality_metrics"]
+    candidate_metrics = candidate_rank["quality_metrics"]
+    return {
+        "diagnostic_score_delta": round(
+            float(candidate_rank["diagnostic_score"]) - float(baseline_rank["diagnostic_score"]), 3,
+        ),
+        "excess_stock_sample_reduction": (
+            int(base_metrics["excess_stock_sample_count"])
+            - int(candidate_metrics["excess_stock_sample_count"])
+        ),
+        "excess_stock_volume_reduction_mm3": round(
+            float(base_metrics["estimated_excess_stock_volume_mm3"])
+            - float(candidate_metrics["estimated_excess_stock_volume_mm3"]), 6,
+        ),
+        "maximum_excess_reduction_mm": round(
+            float(base_metrics["maximum_excess_stock_mm"])
+            - float(candidate_metrics["maximum_excess_stock_mm"]), 6,
+        ),
+        "nonrotational_residual_reduction_mm3": round(
+            float(base_metrics["remaining_feature_material_mm3"])
+            + float(base_metrics["remaining_excess_region_mm3"])
+            - float(candidate_metrics["remaining_feature_material_mm3"])
+            - float(candidate_metrics["remaining_excess_region_mm3"]),
+            6,
+        ),
+        "became_acceptable": (
+            not bool(baseline_rank["eligible_for_application"])
+            and bool(candidate_rank["eligible_for_application"])
+        ),
+    }
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/operations/{operation_id}/candidates/evaluate")
+def evaluate_l32_operation_candidates(
+    job_id: str, operation_id: str, request: L32OperationCandidateEvaluationRequest,
+) -> dict[str, object]:
+    """Evaluate several AI-proposed repairs in isolation without mutating the formal plan."""
+    from .agent.l32_operation_trial import (
+        evidence_context_signature, operation_signature, public_trial_result,
+        reconcile_state, run_independent_trial,
+    )
+
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.analysis is None or job.plan is None:
+        raise HTTPException(status_code=409, detail="A completed L32 Harness process draft is required")
+    candidate_ids = [candidate.id for candidate in request.candidates]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise HTTPException(status_code=422, detail="Candidate ids must be unique")
+    directory = job_directory(job_id)
+    rotational_path = directory / "rotational-features.json"
+    snapshot_path = directory / "machine-configuration.json"
+    if not rotational_path.is_file() or not snapshot_path.is_file():
+        raise HTTPException(status_code=409, detail="Rotational geometry or machine configuration evidence is missing")
+    rotational = RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8"))
+    snapshot = load_machine_snapshot(snapshot_path)
+    context_signature = evidence_context_signature(job, rotational, snapshot)
+    state = reconcile_state(
+        job, _optional_job_json(directory, "harness-l32-operation-state.json"), context_signature,
+    )
+    operations = [
+        operation for setup in job.plan.setups for operation in sorted(setup.operations, key=lambda item: item.sequence)
+        if operation.enabled
+    ]
+    accepted_count = len(state["accepted"])
+    if accepted_count >= len(operations) or operations[accepted_count].id != operation_id:
+        expected = operations[accepted_count].id if accepted_count < len(operations) else None
+        raise HTTPException(status_code=409, detail=f"Candidate sandbox expects next operation {expected}")
+    base_operation = operations[accepted_count]
+    all_operations = {
+        item.id: item for setup in job.plan.setups for item in setup.operations
+    }
+    base_target_signatures = {
+        candidate.target_operation_id: operation_signature(all_operations[candidate.target_operation_id])
+        for candidate in request.candidates
+        if candidate.target_operation_id
+        and candidate.target_operation_id in all_operations
+        and candidate.target_operation_id != operation_id
+    }
+    results: list[dict[str, object]] = []
+    full_results: list[dict[str, object]] = []
+    for position, candidate in enumerate(request.candidates):
+        try:
+            candidate_job, candidate_operation = _apply_l32_trial_candidate(job, operation_id, candidate)
+            nonrotational_evidence = _l32_nonrotational_trial_evidence(
+                job_id, candidate_operation, job=candidate_job,
+            )
+            trial, _ = run_independent_trial(
+                job=candidate_job, operation_id=operation_id, rotational=rotational,
+                snapshot=snapshot, state=state,
+                nonrotational_evidence=nonrotational_evidence,
+            )
+            public = public_trial_result(trial)
+            ranking = _l32_candidate_rank(trial)
+            if not candidate_operation.tool.catalog_match:
+                sandbox_acceptable = bool(ranking["eligible_for_application"])
+                ranking.update({
+                    "rank_score": 0.0,
+                    "eligible_for_application": False,
+                    "application_blocker": "candidate_tool_is_not_bound_to_verified_catalog_inventory",
+                    "sandbox_acceptable_before_inventory_binding": sandbox_acceptable,
+                    "evidence_request": inventory_binding_evidence_request(
+                        candidate_operation.tool,
+                        _load_tool_inventory(job.machine_instance_id) if job.machine_instance_id else [],
+                    ),
+                })
+            record = {
+                "candidate_id": candidate.id,
+                "rationale": candidate.rationale,
+                "target_operation_id": candidate.target_operation_id or operation_id,
+                **ranking,
+                "candidate_operation": candidate_operation.model_dump(mode="json"),
+                "trial": trial,
+                "position": position,
+            }
+            full_results.append(record)
+            results.append({
+                "candidate_id": candidate.id, "rationale": candidate.rationale,
+                "target_operation_id": candidate.target_operation_id or operation_id,
+                **ranking, "tool_id": candidate_operation.tool.id,
+                "parameters": candidate.parameters,
+                "trial": public,
+            })
+        except (HTTPException, ValueError, OSError) as error:
+            detail = str(error.detail if isinstance(error, HTTPException) else error)
+            record = {
+                "candidate_id": candidate.id, "rationale": candidate.rationale,
+                "rank_score": -1, "error": detail, "position": position,
+            }
+            full_results.append(record)
+            results.append(record)
+    ranked = sorted(
+        results, key=lambda item: (
+            -float(item.get("rank_score", -1)),
+            -float(item.get("diagnostic_score", -1)),
+            int(item.get("position", 0)),
+        ),
+    )
+    recommended = next((item for item in ranked if item.get("eligible_for_application") is True), None)
+    inventory_binding_candidate = next((
+        item for item in ranked
+        if item.get("sandbox_acceptable_before_inventory_binding") is True
+        and item.get("application_blocker")
+        == "candidate_tool_is_not_bound_to_verified_catalog_inventory"
+    ), None)
+    payload = {
+        "schema_version": "1.0.0", "job_id": job_id, "operation_id": operation_id,
+        "base_operation_signature": operation_signature(base_operation),
+        "base_target_signatures": base_target_signatures,
+        "context_signature": context_signature,
+        "status": "candidate_available" if recommended else "no_candidate_passed",
+        "recommended_candidate_id": recommended.get("candidate_id") if recommended else None,
+        "candidates": results,
+        "next_action": (
+            "apply_l32_operation_candidate" if recommended
+            else "inspect_l32_candidate_tool_requirements" if inventory_binding_candidate
+            else "observe_or_propose_new_candidates"
+        ),
+        "release_status": "DRAFT", "production_ready": False,
+    }
+    write_json(directory / "agent-l32-operation-candidates.json", {
+        **payload, "candidates": full_results,
+    })
+    publish_job_event(
+        job_id, "harness_candidate_sandbox",
+        f"{operation_id} 已完成 {len(results)} 个修正候选的隔离试算", 84,
+        agent_node="harness_candidate_sandbox", agent_title="工序修正候选沙盒",
+        agent_kind="validation", agent_status="completed" if recommended else "blocked",
+        operation_id=operation_id,
+        evidence=[
+            {"label": "候选数量", "value": len(results)},
+            {"label": "推荐候选", "value": recommended.get("candidate_id") if recommended else "无"},
+        ],
+    )
+    return payload
+
+
+@app.get(
+    "/api/v1/jobs/{job_id}/agent/l32/operations/{operation_id}/candidates/{candidate_id}/tool-requirements"
+)
+def inspect_l32_candidate_tool_requirements(
+    job_id: str, operation_id: str, candidate_id: str,
+) -> dict[str, object]:
+    """Describe compatible inventory or the exact physical evidence still required."""
+    from .agent.l32_operation_trial import operation_signature
+
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.plan is None or not job.machine_instance_id:
+        raise HTTPException(status_code=409, detail="A machine-bound L32 process draft is required")
+    evaluation = _optional_job_json(
+        job_directory(job_id), "agent-l32-operation-candidates.json",
+    ) or {}
+    selected = next((
+        item for item in evaluation.get("candidates", [])
+        if isinstance(item, dict) and item.get("candidate_id") == candidate_id
+    ), None)
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Evaluated repair candidate was not found")
+    if str(selected.get("target_operation_id") or operation_id) != operation_id:
+        raise HTTPException(status_code=409, detail="Tool requirements require the active operation")
+    current_operation = next((
+        item for setup in job.plan.setups for item in setup.operations if item.id == operation_id
+    ), None)
+    if current_operation is None:
+        raise HTTPException(status_code=404, detail="Operation no longer exists")
+    if evaluation.get("base_operation_signature") != operation_signature(current_operation):
+        raise HTTPException(status_code=409, detail="Operation changed after candidate evaluation")
+    candidate_operation = type(current_operation).model_validate(selected.get("candidate_operation"))
+    evidence_request = inventory_binding_evidence_request(
+        candidate_operation.tool, _load_tool_inventory(job.machine_instance_id),
+    )
+    return {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "operation_id": operation_id,
+        "candidate_id": candidate_id,
+        "sandbox_acceptable_before_inventory_binding": selected.get(
+            "sandbox_acceptable_before_inventory_binding", False,
+        ),
+        **evidence_request,
+        "release_status": "DRAFT",
+        "production_ready": False,
+    }
+
+
+@app.post(
+    "/api/v1/jobs/{job_id}/agent/l32/operations/{operation_id}/candidates/{candidate_id}/bind-tool"
+)
+def bind_l32_candidate_inventory_tool(
+    job_id: str, operation_id: str, candidate_id: str,
+    request: L32CandidateToolBindingRequest,
+) -> dict[str, object]:
+    """Bind measured machine inventory to a diagnostic candidate, then rerun its sandbox trial."""
+    from .agent.l32_operation_trial import (
+        evidence_context_signature, operation_signature, public_trial_result,
+        reconcile_state, run_independent_trial,
+    )
+
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.plan is None or not job.machine_instance_id:
+        raise HTTPException(status_code=409, detail="A machine-bound L32 process draft is required")
+    directory = job_directory(job_id)
+    evaluation_path = directory / "agent-l32-operation-candidates.json"
+    evaluation = _optional_job_json(directory, evaluation_path.name) or {}
+    selected = next((
+        item for item in evaluation.get("candidates", [])
+        if isinstance(item, dict) and item.get("candidate_id") == candidate_id
+    ), None)
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Evaluated repair candidate was not found")
+    if str(selected.get("target_operation_id") or operation_id) != operation_id:
+        raise HTTPException(status_code=409, detail="Inventory binding currently requires the active operation")
+    rotational_path = directory / "rotational-features.json"
+    snapshot_path = directory / "machine-configuration.json"
+    if not rotational_path.is_file() or not snapshot_path.is_file():
+        raise HTTPException(status_code=409, detail="Rotational geometry or machine configuration evidence is missing")
+    rotational = RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8"))
+    snapshot = load_machine_snapshot(snapshot_path)
+    current_context = evidence_context_signature(job, rotational, snapshot)
+    current_operation = next((
+        item for setup in job.plan.setups for item in setup.operations if item.id == operation_id
+    ), None)
+    if current_operation is None:
+        raise HTTPException(status_code=404, detail="Operation no longer exists")
+    if evaluation.get("context_signature") != current_context:
+        raise HTTPException(status_code=409, detail="Geometry, stock or machine context changed; reevaluate candidates")
+    if evaluation.get("base_operation_signature") != operation_signature(current_operation):
+        raise HTTPException(status_code=409, detail="Operation changed after candidate evaluation")
+
+    inventory = next((
+        item for item in _load_tool_inventory(job.machine_instance_id)
+        if item.inventory_id == request.inventory_id
+    ), None)
+    if inventory is None:
+        raise HTTPException(status_code=404, detail="Physical tool inventory record was not found")
+    candidate_operation = type(current_operation).model_validate(selected.get("candidate_operation"))
+    try:
+        candidate_operation.tool = bind_verified_inventory_tool(inventory, candidate_operation.tool)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    candidate_operation.parameters.update({
+        "tool_inventory_id": inventory.inventory_id,
+        "tool_capability_verification_reference": inventory.capability_verification_reference,
+    })
+    candidate_operation.rationale.append(
+        f"Bound verified physical tool {inventory.inventory_id}: {request.rationale}"
+    )
+    candidate_job = job.model_copy(deep=True)
+    target = next(
+        item for setup in candidate_job.plan.setups for item in setup.operations
+        if item.id == operation_id
+    )
+    target_setup = next(setup for setup in candidate_job.plan.setups if target in setup.operations)
+    target_setup.operations[target_setup.operations.index(target)] = candidate_operation
+    state = reconcile_state(
+        job, _optional_job_json(directory, "harness-l32-operation-state.json"), current_context,
+    )
+    try:
+        trial, _ = run_independent_trial(
+            job=candidate_job, operation_id=operation_id, rotational=rotational,
+            snapshot=snapshot, state=state,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    ranking = _l32_candidate_rank(trial)
+    selected.update({
+        **ranking,
+        "candidate_operation": candidate_operation.model_dump(mode="json"),
+        "trial": trial,
+        "inventory_binding": {
+            "machine_instance_id": job.machine_instance_id,
+            "inventory_id": inventory.inventory_id,
+            "verification_state": inventory.verification_state,
+            "verified_by": inventory.capability_verified_by,
+            "verification_reference": inventory.capability_verification_reference,
+        },
+    })
+    selected.pop("application_blocker", None)
+    selected.pop("evidence_request", None)
+    recommended = next((
+        item for item in evaluation.get("candidates", [])
+        if isinstance(item, dict) and item.get("eligible_for_application") is True
+    ), None)
+    evaluation.update({
+        "status": (
+            "candidate_available" if recommended
+            else "tool_evidence_required" if inventory_binding_candidate
+            else "no_candidate_passed"
+        ),
+        "recommended_candidate_id": recommended.get("candidate_id") if recommended else None,
+        "next_action": (
+            "apply_l32_operation_candidate" if recommended else "revise_inventory_or_strategy"
+        ),
+    })
+    write_json(evaluation_path, evaluation)
+    public = {
+        "schema_version": "1.0.0", "job_id": job_id, "operation_id": operation_id,
+        "candidate_id": candidate_id, **ranking,
+        "tool": candidate_operation.tool.model_dump(mode="json"),
+        "inventory_binding": selected["inventory_binding"],
+        "trial": public_trial_result(trial),
+        "next_action": evaluation["next_action"],
+        "release_status": "DRAFT", "production_ready": False,
+    }
+    publish_job_event(
+        job_id, "harness_candidate_tool_binding",
+        f"{operation_id} 候选已绑定现场刀具 {inventory.inventory_id} 并重新试算", 86,
+        agent_node="harness_candidate_tool_binding", agent_title="绑定现场刀具并复验",
+        agent_kind="validation",
+        agent_status="completed" if ranking["eligible_for_application"] else "blocked",
+        operation_id=operation_id,
+        evidence=[
+            {"label": "现场刀具", "value": inventory.inventory_id},
+            {"label": "验证状态", "value": inventory.verification_state},
+            {"label": "试算", "value": trial.get("status")},
+        ],
+    )
+    return public
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/operations/{operation_id}/repairs/auto-evaluate")
+def auto_evaluate_l32_operation_repairs(job_id: str, operation_id: str) -> dict[str, object]:
+    """Diagnose the next operation and sandbox evidence-led repair candidates."""
+    from .agent.l32_operation_trial import _profile_for_operation
+    from .agent.l32_repair_candidates import propose_l32_operation_repairs
+
+    baseline = trial_l32_operation_independently(job_id, operation_id)
+    directory = job_directory(job_id)
+    full_trial = _optional_job_json(directory, "agent-l32-operation-trial.json") or {}
+    job = load_job(job_id)
+    if job.plan is None:
+        raise HTTPException(status_code=409, detail="An L32 process draft is required")
+    operation = next((
+        item for setup in job.plan.setups for item in setup.operations
+        if item.id == operation_id and item.enabled
+    ), None)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Operation does not exist in the active draft")
+    rotational_path = directory / "rotational-features.json"
+    if not rotational_path.is_file():
+        raise HTTPException(status_code=409, detail="Rotational geometry evidence is missing")
+    rotational = RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8"))
+    proposal = propose_l32_operation_repairs(
+        operation, full_trial, _profile_for_operation(operation, rotational),
+        operations=[item for setup in job.plan.setups for item in setup.operations],
+        rotational=rotational,
+    )
+    payload: dict[str, object] = {
+        "schema_version": "1.0.0",
+        "job_id": job_id,
+        "operation_id": operation_id,
+        "baseline_trial": baseline,
+        "proposal": proposal,
+        "release_status": "DRAFT",
+        "production_ready": False,
+    }
+    candidates = proposal.get("candidates") or []
+    if baseline.get("can_accept"):
+        payload.update({
+            "status": "baseline_acceptable",
+            "next_action": "accept_l32_operation_trial",
+        })
+    elif candidates:
+        request = L32OperationCandidateEvaluationRequest.model_validate({"candidates": candidates})
+        evaluation = evaluate_l32_operation_candidates(job_id, operation_id, request)
+        for candidate_result in evaluation.get("candidates", []):
+            if not isinstance(candidate_result, dict) or not isinstance(candidate_result.get("trial"), dict):
+                continue
+            candidate_result["improvement_vs_baseline"] = _l32_candidate_improvement(
+                full_trial, candidate_result["trial"],
+            )
+        recommended_candidate_id = evaluation.get("recommended_candidate_id")
+        evidence_candidate = next((
+            item for item in evaluation.get("candidates", [])
+            if isinstance(item, dict)
+            and item.get("sandbox_acceptable_before_inventory_binding") is True
+            and isinstance(item.get("evidence_request"), dict)
+        ), None)
+        diagnostic_candidate = max(
+            (
+                item for item in evaluation.get("candidates", [])
+                if isinstance(item, dict) and isinstance(item.get("diagnostic_score"), (int, float))
+            ),
+            key=lambda item: float(item.get("diagnostic_score") or 0),
+            default=None,
+        )
+        unresolved_groove = (
+            not recommended_candidate_id
+            and operation.type == "turn_grooving"
+            and diagnostic_candidate is not None
+            and int((diagnostic_candidate.get("quality_metrics") or {}).get("excess_stock_sample_count") or 0) > 0
+        )
+        if unresolved_groove:
+            requirements = proposal.setdefault("capability_requirements", [])
+            requirements.append({
+                "target_operation_id": operation.id,
+                "feature_ids": list(operation.feature_ids),
+                "required_strategy": "verified_contour_grooving_or_narrower_catalogued_insert",
+                "catalog_match": False,
+                "reason": "all_sandboxed_catalogue_grooving_envelopes_leave_residual_stock",
+                "next_action": "define_verified_contour_grooving_or_catalog_narrower_tool",
+            })
+        unresolved_nonrotational = (
+            not recommended_candidate_id
+            and operation.type in {
+                "pocket_roughing", "pocket_finishing",
+                "live_tool_contour_roughing", "live_tool_contour_finishing",
+            }
+        )
+        if unresolved_nonrotational:
+            requirements = proposal.setdefault("capability_requirements", [])
+            if not requirements:
+                requirements.append({
+                    "target_operation_id": operation.id,
+                    "feature_ids": list(operation.feature_ids),
+                    "required_strategy": (
+                        "sharp_corner_cleanup_or_accepted_internal_corner_radius"
+                        if operation.type.startswith("pocket_")
+                        else "multi_orientation_exterior_cleanup_or_smaller_verified_tool"
+                    ),
+                    "catalog_match": False,
+                    "reason": "all_exact_occ_sandbox_candidates_leave_residual_or_violate_target_protection",
+                    "next_action": "define_and_bind_verified_special_process",
+                })
+        payload.update({
+            "status": (
+                "tool_evidence_required" if evidence_candidate
+                else "capability_required"
+                if not recommended_candidate_id and proposal.get("capability_requirements")
+                else evaluation.get("status")
+            ),
+            "evaluation": evaluation,
+            "recommended_candidate_id": recommended_candidate_id,
+            "best_diagnostic_candidate_id": (
+                diagnostic_candidate.get("candidate_id") if diagnostic_candidate else None
+            ),
+            "tool_evidence_candidate_id": (
+                evidence_candidate.get("candidate_id") if evidence_candidate else None
+            ),
+            "evidence_request": (
+                evidence_candidate.get("evidence_request") if evidence_candidate else None
+            ),
+            "next_action": (
+                evaluation.get("next_action") if recommended_candidate_id
+                else "inspect_l32_candidate_tool_requirements" if evidence_candidate
+                else "define_verified_contour_grooving_or_catalog_narrower_tool"
+                if unresolved_groove
+                else "define_and_bind_verified_special_process"
+                if unresolved_nonrotational
+                else proposal.get("fallback_next_action")
+            ),
+        })
+    else:
+        payload.update({
+            "status": "observation_required",
+            "recommended_candidate_id": None,
+            "next_action": proposal.get("next_action"),
+        })
+    write_json(directory / "agent-l32-auto-repair.json", payload)
+    publish_job_event(
+        job_id, "harness_auto_repair",
+        f"{operation_id} 自动诊断并生成 {len(candidates)} 个安全修复候选", 85,
+        agent_node="harness_auto_repair", agent_title="工序失败自动诊断",
+        agent_kind="reasoning",
+        agent_status="completed" if payload.get("recommended_candidate_id") else "blocked",
+        operation_id=operation_id,
+        evidence=[
+            {"label": "候选数量", "value": len(candidates)},
+            {"label": "推荐候选", "value": payload.get("recommended_candidate_id") or "无"},
+            {"label": "下一动作", "value": payload.get("next_action")},
+        ],
+    )
+    return payload
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/operations/{operation_id}/candidates/apply")
+def apply_l32_operation_candidate(
+    job_id: str, operation_id: str, request: L32OperationCandidateSelectionRequest,
+) -> dict[str, object]:
+    """Apply one already-simulated candidate after explicit model confirmation."""
+    from .agent.l32_operation_trial import evidence_context_signature, operation_signature
+
+    if not request.confirmed:
+        raise HTTPException(status_code=422, detail="Candidate application requires confirmed=true")
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.analysis is None or job.plan is None:
+        raise HTTPException(status_code=409, detail="A completed L32 Harness process draft is required")
+    directory = job_directory(job_id)
+    evaluation = _optional_job_json(directory, "agent-l32-operation-candidates.json") or {}
+    selected = next((
+        item for item in evaluation.get("candidates", [])
+        if isinstance(item, dict) and item.get("candidate_id") == request.candidate_id
+    ), None)
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Evaluated repair candidate was not found")
+    if selected.get("eligible_for_application") is False:
+        raise HTTPException(
+            status_code=409,
+            detail=str(selected.get("application_blocker") or "Candidate is diagnostic-only"),
+        )
+    trial = selected.get("trial") or {}
+    if not trial.get("can_accept"):
+        raise HTTPException(status_code=409, detail="Candidate did not pass the deterministic trial gate")
+    if trial.get("status") == "warning" and not request.acknowledge_warning:
+        raise HTTPException(status_code=422, detail="Warning candidate requires explicit acknowledgement")
+    rotational_path = directory / "rotational-features.json"
+    snapshot_path = directory / "machine-configuration.json"
+    if not rotational_path.is_file() or not snapshot_path.is_file():
+        raise HTTPException(status_code=409, detail="Rotational geometry or machine configuration evidence is missing")
+    current_context = evidence_context_signature(
+        job,
+        RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8")),
+        load_machine_snapshot(snapshot_path),
+    )
+    operation = next((
+        item for setup in job.plan.setups for item in setup.operations if item.id == operation_id
+    ), None)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Operation was removed after candidate evaluation")
+    if evaluation.get("context_signature") != current_context:
+        raise HTTPException(status_code=409, detail="Geometry, stock or machine context changed; reevaluate candidates")
+    if evaluation.get("base_operation_signature") != operation_signature(operation):
+        raise HTTPException(status_code=409, detail="Operation changed after candidate evaluation")
+    target_operation_id = str(selected.get("target_operation_id") or operation_id)
+    target_operation = next((
+        item for setup in job.plan.setups for item in setup.operations if item.id == target_operation_id
+    ), None)
+    if target_operation is None:
+        raise HTTPException(status_code=404, detail="Candidate target operation no longer exists")
+    if target_operation_id != operation_id and (
+        (evaluation.get("base_target_signatures") or {}).get(target_operation_id)
+        != operation_signature(target_operation)
+    ):
+        raise HTTPException(status_code=409, detail="Candidate target operation changed after evaluation")
+    candidate_operation = type(target_operation).model_validate(selected.get("candidate_operation"))
+    if not candidate_operation.tool.catalog_match:
+        raise HTTPException(
+            status_code=409,
+            detail="Candidate tool must be bound to verified catalog inventory before application",
+        )
+    target_setup = next(setup for setup in job.plan.setups if target_operation in setup.operations)
+    target_setup.operations[target_setup.operations.index(target_operation)] = candidate_operation
+    saved = _save_manual_plan_change(job_id, job)
+    selection = {
+        "schema_version": "1.0.0", "job_id": job_id, "operation_id": operation_id,
+        "target_operation_id": target_operation_id,
+        "candidate_id": request.candidate_id, "status": "applied_for_retrial",
+        "rationale": request.rationale, "warning_acknowledged": request.acknowledge_warning,
+        "selected_trial_status": trial.get("status"),
+        "new_operation_signature": operation_signature(candidate_operation),
+        "next_action": "trial_l32_operation",
+        "release_status": "DRAFT", "production_ready": False,
+    }
+    write_json(directory / "agent-l32-operation-candidate-selection.json", selection)
+    publish_job_event(
+        job_id, "harness_candidate_apply",
+        f"{operation_id} 已应用修正候选 {request.candidate_id}，等待正式重试", 85,
+        agent_node="harness_candidate_apply", agent_title="应用工序修正候选",
+        agent_kind="decision", agent_status="completed", operation_id=operation_id,
+        evidence=[
+            {"label": "候选", "value": request.candidate_id},
+            {"label": "决策理由", "value": request.rationale},
+        ],
+    )
+    return {**selection, "operation": next(
+        item.model_dump(mode="json") for setup in saved.plan.setups for item in setup.operations
+        if item.id == target_operation_id
+    )}
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/plan/finalize")
+def finalize_harness_l32_process_plan(job_id: str) -> dict[str, object]:
+    """Close the Harness loop only after every operation and coverage target has evidence."""
+    from .agent.l32_operation_trial import (
+        enabled_operations, evidence_context_signature, reconcile_state, state_summary,
+    )
+
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.analysis is None or job.plan is None:
+        raise HTTPException(status_code=409, detail="A completed L32 Harness process draft is required")
+    directory = job_directory(job_id)
+    rotational_path = directory / "rotational-features.json"
+    snapshot_path = directory / "machine-configuration.json"
+    if not rotational_path.is_file() or not snapshot_path.is_file():
+        raise HTTPException(status_code=409, detail="Rotational geometry or machine configuration evidence is missing")
+    context_signature = evidence_context_signature(
+        job,
+        RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8")),
+        load_machine_snapshot(snapshot_path),
+    )
+    state = reconcile_state(
+        job, _optional_job_json(directory, "harness-l32-operation-state.json"), context_signature,
+    )
+    write_json(directory / "harness-l32-operation-state.json", state)
+    progress = state_summary(job, state)
+    operation_count = len(enabled_operations(job))
+    if operation_count == 0 or progress["accepted_count"] != operation_count:
+        return {
+            **progress,
+            "status": "blocked",
+            "reason": "unvalidated_operations",
+            "detail": "Every enabled operation must pass and be accepted before final validation.",
+            "next_action": "trial_l32_operation",
+        }
+    if (
+        progress.get("provisional_operation_ids")
+        or progress.get("unassigned_material_obligations")
+        or progress.get("outstanding_deferred_material_contracts")
+    ):
+        return {
+            **progress,
+            "status": "blocked",
+            "reason": "unresolved_material_obligations",
+            "detail": (
+                "Residual material responsibilities must be assigned, retrialed, and satisfied "
+                "before final plan validation."
+            ),
+            "next_action": "reset_and_retrial_provisional_operations",
+        }
+
+    # Only accepted deterministic evidence may promote semantic coverage.
+    job.plan.stock["verified_prismatic_feature_ids"] = progress.get(
+        "verified_prismatic_feature_ids", []
+    )
+    job.plan.stock["nonrotational_material_verified"] = bool(
+        progress.get("nonrotational_material_verified")
+    )
+    coverage = evaluate_plan_coverage(job.analysis, job.plan)
+    job.plan.coverage = coverage
+    save_job(directory, job)
+    write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+    if coverage.status != "complete":
+        uncovered = [
+            {
+                "id": target.id, "kind": target.kind, "label": target.label,
+                "state": target.state, "required_operation_types": target.required_operation_types,
+                "source_feature_ids": target.source_feature_ids,
+            }
+            for target in coverage.targets if target.state != "covered"
+        ]
+        result = {
+            **progress,
+            "status": "plan_incomplete",
+            "reason": "manufacturing_coverage_incomplete",
+            "coverage": {
+                "status": coverage.status, "score": coverage.score,
+                "covered_count": coverage.covered_count, "target_count": coverage.target_count,
+                "issues": coverage.issues, "capability_gaps": coverage.capability_gaps,
+                "uncovered_targets": uncovered[:50],
+            },
+            "next_action": "inspect_geometry_then_add_process_operation",
+        }
+        publish_job_event(
+            job_id, "harness_plan_finalize", "逐道试算已完成，但制造特征覆盖仍不完整", 90,
+            agent_node="harness_plan_finalize", agent_title="工艺方案收口门禁",
+            agent_kind="validation", agent_status="blocked",
+            evidence=[
+                {"label": "覆盖率", "value": coverage.score},
+                {"label": "未覆盖目标", "value": len(uncovered)},
+            ],
+        )
+        return result
+
+    validation = validate_l32_agent_plan(job_id)
+    passed = validation.get("status") == "passed"
+    result = {
+        **progress,
+        "status": "validated_draft" if passed else "blocked",
+        "reason": None if passed else "whole_plan_validation_failed",
+        "coverage": {
+            "status": coverage.status, "score": coverage.score,
+            "covered_count": coverage.covered_count, "target_count": coverage.target_count,
+        },
+        "whole_plan_validation": validation,
+        "next_action": "engineer_review" if passed else validation.get("next_action"),
+        "release_status": "DRAFT",
+        "production_ready": False,
+    }
+    write_json(directory / "harness-l32-plan-finalization.json", result)
+    return result
+
+
+def _run_l32_autonomous_process(
+    job_id: str, request: L32AutonomousProcessRequest,
+) -> dict[str, object]:
+    """Run the bounded plan -> trial -> repair -> accept -> finalize loop."""
+    from .agent.l32_autonomous_process import (
+        budget_exhausted, classify_blocker, finish_state, new_state,
+    )
+
+    started = time.monotonic()
+    limits = request.model_dump(mode="json")
+    state = new_state(job_id, limits)
+    directory = job_directory(job_id)
+    state_path = directory / "agent-l32-autonomous-process.json"
+
+    def persist() -> None:
+        state["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        write_json(state_path, state)
+
+    def use_tool(count: int = 1) -> None:
+        state["usage"]["tool_calls"] += count
+        persist()
+
+    def stop_for_budget() -> dict[str, object] | None:
+        reason = budget_exhausted(state, time.monotonic() - started)
+        if not reason:
+            return None
+        finish_state(
+            state, "engineer_review_required", next_action="resume_with_new_budget",
+            blocker={"reason": reason, "detail": "Autonomous execution stopped at its configured safety budget."},
+        )
+        persist()
+        return state
+
+    persist()
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        finish_state(
+            state, "capability_unavailable", next_action="select_supported_machine",
+            blocker={"reason": "unsupported_machine", "detail": "The autonomous executor currently supports Citizen L32 only."},
+        )
+        persist()
+        return state
+    if job.status != "completed" or job.analysis is None:
+        finish_state(
+            state, "engineer_review_required", next_action="complete_geometry_analysis",
+            blocker={"reason": "geometry_not_ready", "detail": "STEP geometry analysis is not complete."},
+        )
+        persist()
+        return state
+
+    enabled = [
+        operation for setup in (job.plan.setups if job.plan else [])
+        for operation in setup.operations if operation.enabled
+    ]
+    if request.rebuild_plan or job.plan is None or not enabled:
+        state["phase"] = "hierarchical_process_planning"
+        persist()
+        plan = build_process_plan(job.analysis, material=job.material, machine=job.machine)
+        plan.ai_planning = {
+            "planning_owner": "bounded_autonomous_agent",
+            "planning_mode": "hierarchical_plan_then_operation_evidence_loop",
+            "release_status": "DRAFT",
+            "model_calls": 0,
+            "note": "Deterministic geometry and strategy baseline; every enabled operation still requires trial evidence.",
+        }
+        job.plan = plan
+        for filename in (
+            "harness-l32-operation-state.json", "agent-l32-operation-trial.json",
+            "agent-l32-operation-candidates.json", "agent-l32-auto-repair.json",
+            "harness-l32-plan-finalization.json",
+        ):
+            (directory / filename).unlink(missing_ok=True)
+        provision_default_l32_planning_instance(job, directory)
+        reapply_bound_l32_machine_configuration(job, directory)
+        save_job(directory, job)
+        write_json(directory / "plan.json", plan.model_dump(mode="json"))
+        use_tool()
+
+    job = load_job(job_id)
+    assert job.plan is not None
+    stock_diameter = float(job.plan.stock.get("diameter_mm") or 0)
+    snapshot_path = directory / "machine-configuration.json"
+    state["manufacturability"] = {
+        "machine": "citizen-cincom-l32",
+        "stock_type": job.plan.stock.get("type"),
+        "stock_diameter_mm": stock_diameter,
+        "machine_configuration_bound": snapshot_path.is_file(),
+        "assessment": "supported_scope" if snapshot_path.is_file() and 0 < stock_diameter <= 38 else "outside_supported_scope",
+    }
+    if not snapshot_path.is_file() or stock_diameter <= 0 or stock_diameter > 38:
+        finish_state(
+            state, "capability_unavailable", next_action="bind_compatible_machine_or_change_stock_strategy",
+            blocker={
+                "reason": "l32_stock_or_machine_incompatible",
+                "detail": f"L32 requires a bound configuration and round stock within 38 mm; draft diameter is {stock_diameter:g} mm.",
+            },
+        )
+        persist()
+        return state
+
+    operations = [
+        operation for setup in job.plan.setups
+        for operation in sorted(setup.operations, key=lambda item: item.sequence)
+        if operation.enabled
+    ]
+    state["manufacturability"]["enabled_operation_count"] = len(operations)
+    if not operations:
+        finish_state(
+            state, "engineer_review_required", next_action="inspect_geometry_and_create_process_strategy",
+            blocker={"reason": "empty_process_plan", "detail": "No enabled operation could be derived from the current geometry."},
+        )
+        persist()
+        return state
+
+    accepted_state = _optional_job_json(directory, "harness-l32-operation-state.json") or {}
+    accepted_ids = [
+        str(item.get("operation_id")) for item in accepted_state.get("accepted", [])
+        if isinstance(item, dict) and item.get("operation_id")
+    ]
+    operation_index = 0
+    for operation in operations:
+        if operation_index < len(accepted_ids) and operation.id == accepted_ids[operation_index]:
+            state["operations"].append({
+                "operation_id": operation.id, "name": operation.name, "type": operation.type,
+                "trial_status": "accepted_previous_run", "can_accept": True,
+                "decision": "resumed_from_persisted_evidence",
+            })
+            operation_index += 1
+        else:
+            break
+    state["resumed_accepted_operation_count"] = operation_index
+    persist()
+    repair_attempts: dict[str, int] = {}
+    while operation_index < len(operations):
+        if stop_for_budget():
+            return state
+        job = load_job(job_id)
+        assert job.plan is not None
+        operation = next((
+            item for setup in job.plan.setups for item in setup.operations
+            if item.id == operations[operation_index].id and item.enabled
+        ), None)
+        if operation is None:
+            operations = [
+                item for setup in job.plan.setups
+                for item in sorted(setup.operations, key=lambda value: value.sequence) if item.enabled
+            ]
+            continue
+        state["phase"] = "operation_trial"
+        state["current_operation_id"] = operation.id
+        publish_job_event(
+            job_id, "autonomous_operation", f"自主智能体正在试算 {operation.id} {operation.name}",
+            45 + 40 * operation_index / max(len(operations), 1),
+            agent_node="autonomous_operation_trial", agent_title="逐工序规划、仿真与审核",
+            agent_kind="tool_call", agent_status="running", operation_id=operation.id,
+        )
+        try:
+            trial = trial_l32_operation_independently(job_id, operation.id)
+        except HTTPException as error:
+            finish_state(
+                state, "engineer_review_required", next_action="inspect_operation_blocker",
+                blocker={"operation_id": operation.id, "reason": "trial_api_error", "detail": str(error.detail)},
+            )
+            persist()
+            return state
+        use_tool()
+        state["usage"]["operation_trials"] += 1
+        record = {
+            "operation_id": operation.id, "name": operation.name, "type": operation.type,
+            "trial_status": trial.get("status"), "can_accept": trial.get("can_accept", False),
+            "reason": trial.get("reason"), "repair_attempts": repair_attempts.get(operation.id, 0),
+            "evidence": trial.get("evidence") or {},
+        }
+        state["operations"] = [
+            item for item in state["operations"] if item.get("operation_id") != operation.id
+        ] + [record]
+        persist()
+
+        if trial.get("can_accept"):
+            accept_l32_independent_operation_trial(
+                job_id, operation.id,
+                L32OperationTrialDecisionRequest(
+                    rationale="Autonomous deterministic gate passed; preserve evidence for the next operation.",
+                    acknowledge_warning=bool(trial.get("requires_warning_acknowledgement")),
+                ),
+            )
+            use_tool()
+            record["decision"] = "accepted_for_next_planning_step"
+            operation_index += 1
+            continue
+
+        attempts = repair_attempts.get(operation.id, 0)
+        if attempts >= request.max_repair_attempts_per_operation:
+            finish_state(
+                state, "engineer_review_required", next_action="review_failed_operation",
+                blocker={
+                    "operation_id": operation.id, "reason": "repair_budget_exhausted",
+                    "detail": str(trial.get("detail") or trial.get("reason") or "Operation trial failed."),
+                },
+            )
+            persist()
+            return state
+        state["phase"] = "operation_repair"
+        repair_attempts[operation.id] = attempts + 1
+        state["usage"]["repair_attempts"] += 1
+        repair = auto_evaluate_l32_operation_repairs(job_id, operation.id)
+        candidate_count = len(((repair.get("proposal") or {}).get("candidates") or []))
+        use_tool(max(1, candidate_count + 1))
+        record["repair_attempts"] = repair_attempts[operation.id]
+        record["repair_status"] = repair.get("status")
+        record["recommended_candidate_id"] = repair.get("recommended_candidate_id")
+        requirements = (repair.get("proposal") or {}).get("capability_requirements") or []
+        for requirement in requirements:
+            if requirement not in state["capability_requirements"]:
+                state["capability_requirements"].append(requirement)
+        candidate_id = repair.get("recommended_candidate_id")
+        if candidate_id:
+            recommended = next((
+                item for item in ((repair.get("evaluation") or {}).get("candidates") or [])
+                if isinstance(item, dict) and item.get("candidate_id") == candidate_id
+            ), {})
+            acknowledge_warning = bool(
+                (recommended.get("trial") or {}).get("requires_warning_acknowledgement")
+            )
+            apply_l32_operation_candidate(
+                job_id, operation.id,
+                L32OperationCandidateSelectionRequest(
+                    candidate_id=str(candidate_id),
+                    rationale="Autonomous repair candidate passed the isolated deterministic trial.",
+                    acknowledge_warning=acknowledge_warning, confirmed=True,
+                ),
+            )
+            use_tool()
+            record["repair_decision"] = "candidate_applied_for_formal_retrial"
+            persist()
+            continue
+
+        outcome = classify_blocker({
+            **repair,
+            "capability_requirements": requirements,
+            "reason": repair.get("status") or trial.get("reason"),
+        })
+        finish_state(
+            state, outcome,
+            next_action=str(repair.get("next_action") or "engineer_review"),
+            blocker={
+                "operation_id": operation.id,
+                "reason": repair.get("status") or trial.get("reason"),
+                "detail": str(trial.get("detail") or "No verified repair candidate passed."),
+            },
+        )
+        persist()
+        return state
+
+    state["phase"] = "whole_plan_validation"
+    finalization = finalize_harness_l32_process_plan(job_id)
+    use_tool()
+    state["coverage"] = finalization.get("coverage")
+    state["whole_plan_validation"] = finalization.get("whole_plan_validation")
+    if finalization.get("status") == "validated_draft":
+        finish_state(state, "verified_success", next_action="engineer_review_and_machine_level_validation")
+    else:
+        requirements = ((finalization.get("coverage") or {}).get("capability_gaps") or [])
+        state["capability_requirements"].extend(
+            item for item in requirements if item not in state["capability_requirements"]
+        )
+        outcome = "capability_unavailable" if requirements else "engineer_review_required"
+        finish_state(
+            state, outcome, next_action=str(finalization.get("next_action") or "engineer_review"),
+            blocker={
+                "reason": finalization.get("reason") or "whole_plan_validation_failed",
+                "detail": str(finalization.get("detail") or "The complete draft did not pass final validation."),
+            },
+        )
+    persist()
+    publish_job_event(
+        job_id, "autonomous_process_finished",
+        f"自主工艺执行结束：{state['outcome']}", 100,
+        agent_node="autonomous_process_result", agent_title="工艺规划最终结论",
+        agent_kind="decision", agent_status="completed",
+        evidence=[
+            {"label": "结论", "value": state["outcome"]},
+            {"label": "已试算工序", "value": state["usage"]["operation_trials"]},
+            {"label": "修复次数", "value": state["usage"]["repair_attempts"]},
+        ],
+    )
+    return state
+
+
+def _launch_l32_autonomous_process(
+    job_id: str, request: L32AutonomousProcessRequest,
+) -> dict[str, object]:
+    from .agent.l32_autonomous_process import new_state
+
+    with L32_AUTONOMOUS_PROCESS_LOCK:
+        if job_id in L32_AUTONOMOUS_PROCESS_JOBS:
+            raise HTTPException(status_code=409, detail="Autonomous L32 planning is already running")
+        L32_AUTONOMOUS_PROCESS_JOBS.add(job_id)
+    directory = job_directory(job_id)
+    state = new_state(job_id, request.model_dump(mode="json"))
+    write_json(directory / "agent-l32-autonomous-process.json", state)
+
+    def worker() -> None:
+        try:
+            _run_l32_autonomous_process(job_id, request)
+        except Exception as error:
+            failed = _optional_job_json(directory, "agent-l32-autonomous-process.json") or state
+            failed.update({
+                "status": "completed", "outcome": "engineer_review_required",
+                "phase": "finished", "finished_at": utc_now(),
+                "next_action": "inspect_executor_error",
+            })
+            failed.setdefault("blockers", []).append({
+                "reason": "executor_error", "detail": str(error)[-2000:],
+            })
+            write_json(directory / "agent-l32-autonomous-process.json", failed)
+        finally:
+            with L32_AUTONOMOUS_PROCESS_LOCK:
+                L32_AUTONOMOUS_PROCESS_JOBS.discard(job_id)
+
+    threading.Thread(
+        target=worker, name=f"l32-autonomous-{job_id[:8]}", daemon=True,
+    ).start()
+    return state
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/autonomous/start")
+def start_l32_autonomous_process(
+    job_id: str, request: L32AutonomousProcessRequest,
+) -> dict[str, object]:
+    load_job(job_id)
+    return _launch_l32_autonomous_process(job_id, request)
+
+
+@app.get("/api/v1/jobs/{job_id}/agent/l32/autonomous")
+def get_l32_autonomous_process(job_id: str) -> dict[str, object]:
+    load_job(job_id)
+    payload = _optional_job_json(job_directory(job_id), "agent-l32-autonomous-process.json")
+    if payload is None:
+        return {
+            "schema_version": "1.0.0", "job_id": job_id, "status": "not_started",
+            "outcome": None, "next_action": "start_autonomous_process",
+            "release_status": "DRAFT", "production_ready": False,
+        }
+    return payload
+
+
+@app.get("/api/v1/jobs/{job_id}/agent/l32/loop")
+def get_l32_agent_rolling_loop(job_id: str) -> dict[str, object]:
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="滚动工序闭环目前仅适用于 L32 任务")
+    payload = _optional_job_json(job_directory(job_id), "agent-l32-rolling-loop.json")
+    if not payload:
+        return {
+            "schema_version": "1.0.0", "job_id": job_id, "status": "not_started",
+            "release_status": "DRAFT", "production_ready": False,
+            "accepted_operation_ids": [], "accepted_count": 0,
+            "expected_operation_count": sum(
+                operation.enabled for setup in (job.plan.setups if job.plan else [])
+                for operation in setup.operations
+            ),
+            "current_operation": None, "next_operation_id": None,
+            "next_action": "advance_current_operation",
+        }
+    return _public_l32_rolling_loop(payload)
+
+
+@app.get("/api/v1/jobs/{job_id}/agent/l32/repair-options")
+def get_l32_agent_repair_options(job_id: str) -> dict[str, object]:
+    """Return compact, safety-gated repair candidates from the latest real validation."""
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="L32 修正候选仅适用于 L32 任务")
+    directory = job_directory(job_id)
+    incremental = _optional_job_json(directory, "agent-l32-incremental-trial.json") or {}
+    repair = incremental.get("repair") or {}
+    candidates = incremental.get("repair_candidates") or []
+    selection = _optional_job_json(directory, "agent-l32-repair-selection.json") or {}
+    operation_ids = {
+        operation.id for setup in (job.plan.setups if job.plan else [])
+        for operation in setup.operations if operation.enabled
+    }
+    selected_operation_id = str(selection.get("operation_id") or "")
+    if (
+        repair.get("diagnosis", {}).get("defect") == "missing_back_face_process"
+        and selection.get("status") == "applied_validated"
+        and selected_operation_id in operation_ids
+    ):
+        sweep = selection.get("sweep") or {}
+        sweep_check = sweep.get("check") or {}
+        operation_review = selection.get("operation_review") or {}
+        evidence = operation_review.get("evidence") or {}
+        return {
+            "schema_version": "1.0.0", "job_id": job_id,
+            "status": "resolved",
+            "diagnosis": repair.get("diagnosis") or {},
+            "decision": "applied_validated",
+            "next_action": selection.get("next_action") or "reset_and_advance_operation_loop",
+            "candidates": [],
+            "selected_repair": {
+                "candidate_id": selection.get("candidate_id"),
+                "operation_id": selected_operation_id,
+                "sweep_status": sweep.get("status"),
+                "target_contact_mm3": sweep_check.get("maximum_target_contact_mm3"),
+                "removed_volume_mm3": evidence.get("removed_volume_delta_mm3"),
+                "operation_review_status": operation_review.get("status"),
+                "remaining_evidence": selection.get("missing_evidence") or [],
+            },
+            "release_status": "DRAFT", "production_ready": False,
+        }
+    return {
+        "schema_version": "1.0.0", "job_id": job_id,
+        "status": repair.get("status") or "not_available",
+        "diagnosis": repair.get("diagnosis") or {},
+        "decision": repair.get("decision"),
+        "next_action": repair.get("next_action") or incremental.get("next_action"),
+        "candidates": [
+            {
+                "id": item.get("id"), "kind": item.get("kind"),
+                "operation_ids": item.get("operation_ids") or [],
+                "auto_applicable": bool(item.get("auto_applicable")),
+                "capability_available": item.get("capability_available"),
+                "validation_status": item.get("validation_status"),
+                "reason": item.get("reason"),
+                "required_evidence": item.get("required_evidence") or [],
+                "strategy_id": item.get("strategy_id"),
+                "intent": item.get("intent"),
+                "dependencies": item.get("dependencies") or [],
+                "validation_requirements": item.get("validation_requirements") or [],
+                "parameter_basis": item.get("parameter_basis") or {},
+            }
+            for item in candidates if isinstance(item, dict)
+        ],
+        "release_status": "DRAFT", "production_ready": False,
+    }
+
+
+def _check_back_live_face_sweep(
+    job_id: str, plan: ProcessPlan,
+) -> dict[str, object]:
+    directory = job_directory(job_id)
+    job = load_job(job_id)
+    source = directory / job.filename
+    if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
+        raise ValueError("背面动力刀具扫掠需要原始 STEP 实体")
+    rotational = RotationalFeatureAnalysis.model_validate_json(
+        (directory / "rotational-features.json").read_text(encoding="utf-8")
+    )
+    profile_id = str(plan.stock.get("rotational_profile_id") or "")
+    profile = next((item for item in rotational.profiles if item.id == profile_id), None)
+    axis = next((item for item in rotational.axes if profile and item.id == profile.axis_id), None)
+    if profile is None or axis is None or axis.review_state != "accepted":
+        raise ValueError("背面动力刀具扫掠需要已确认的回转轴与轮廓")
+    back_faces = operations_for_role(plan, "back_face_finish")
+    separations = operations_for_role(plan, "material_separation")
+    if len(back_faces) != 1 or len(separations) != 1:
+        raise ValueError("背面动力刀具扫掠需要唯一的背面精加工与材料分离工序")
+    operation = back_faces[0][1]
+    cutoff = separations[0][1]
+    if operation.type != "back_live_face_finishing":
+        raise ValueError("当前背面精加工策略不是动力刀具端面精加工")
+    parameters = {
+        "finished_back_z_mm": float(cutoff.parameters["finished_back_datum_z_mm"]),
+        "axial_stock_mm": float(operation.parameters["stock_allowance_mm"]),
+        "stock_radius_mm": float(plan.stock["diameter_mm"]) / 2,
+        "tool_diameter_mm": operation.tool.diameter_mm,
+        "step_over_mm": float(operation.parameters["step_over_mm"]),
+    }
+    signature = cached_preview_signature(
+        "l32-back-live-face-sweep-v1", source,
+        {"axis": axis.model_dump(mode="json"), "parameters": parameters},
+    )
+    cache_path = directory / f"l32-preview-cache-back-live-face-{signature[:20]}.json"
+    cached = read_cached_preview(cache_path, signature)
+    if isinstance(cached, dict):
+        return cached
+    completed = run_freecad_adapter(
+        FREECAD_CMD, APP_ROOT / "cam" / "l32_back_live_face_sweep.py",
+        [
+            source,
+            json.dumps(axis.model_dump(mode="json"), separators=(",", ":")),
+            json.dumps(parameters, separators=(",", ":")),
+        ],
+        timeout_seconds=180,
+    )
+    line = next(
+        item.split("CNC_BACK_LIVE_FACE_SWEEP ", 1)[1]
+        for item in completed.stdout.splitlines()
+        if "CNC_BACK_LIVE_FACE_SWEEP " in item
+    )
+    check = json.loads(line)
+    payload = {
+        "schema_version": "1.0.0", "job_id": job_id,
+        "operation_id": operation.id, "signature": signature,
+        "status": check.get("status"), "check": check,
+        "release_status": "DRAFT", "production_ready": False,
+    }
+    write_cached_preview(cache_path, signature, payload)
+    return payload
+
+
+@app.get("/api/v1/jobs/{job_id}/l32/back-live-face-sweep-check")
+def get_l32_back_live_face_sweep_check(job_id: str) -> dict[str, object]:
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or not job.plan:
+        raise HTTPException(status_code=409, detail="需要 L32 工艺方案")
+    try:
+        return _check_back_live_face_sweep(job_id, job.plan)
+    except subprocess.TimeoutExpired as error:
+        raise HTTPException(status_code=504, detail="背面动力刀具三维扫掠超时") from error
+    except (OSError, subprocess.CalledProcessError, StopIteration, ValueError, KeyError) as error:
+        raise HTTPException(status_code=422, detail=f"背面动力刀具三维扫掠失败: {error}") from error
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/repair-options/{candidate_id}/select")
+def select_l32_agent_repair_option(
+    job_id: str, candidate_id: str, confirmed: bool = False,
+) -> dict[str, object]:
+    """Select a bounded repair candidate; mutate the plan only after a deterministic gate."""
+    if not confirmed:
+        raise HTTPException(status_code=422, detail="修正候选必须显式确认")
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or not job.analysis or not job.plan:
+        raise HTTPException(status_code=409, detail="需要完整的 L32 任务上下文")
+    options = get_l32_agent_repair_options(job_id)
+    candidate = next((
+        item for item in options.get("candidates", [])
+        if isinstance(item, dict) and item.get("id") == candidate_id
+    ), None)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="修正候选不存在或已经过期")
+    directory = job_directory(job_id)
+    selection: dict[str, object] = {
+        "schema_version": "1.0.0", "job_id": job_id,
+        "candidate_id": candidate_id, "candidate": candidate,
+        "selected_at": utc_now(), "release_status": "DRAFT", "production_ready": False,
+    }
+    if candidate_id == "back_live_tool_face_finish":
+        snapshot = load_machine_snapshot(directory / "machine-configuration.json")
+        try:
+            strategy = get_process_strategy(candidate_id)
+            application = strategy.apply(
+                plan=job.plan, snapshot=snapshot, material_name=job.material,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=f"工艺策略不适用: {error}") from error
+        candidate_plan = application.plan
+        operation_id = application.operation_id
+        separation_id = application.role_bindings["material_separation"]
+        cutoff = next(
+            operation for setup in candidate_plan.setups for operation in setup.operations
+            if operation.id == separation_id
+        )
+        selection["strategy"] = application.candidate.model_dump(mode="json")
+        selection["role_bindings"] = application.role_bindings
+        selection["derived_parameters"] = application.derived_parameters
+
+        candidate_job = job.model_copy(deep=True)
+        candidate_job.plan = candidate_plan
+        apply_l32_machine_configuration(candidate_job, snapshot)
+        if not next(
+            item for setup in candidate_plan.setups for item in setup.operations
+            if item.id == operation_id
+        ).enabled:
+            raise HTTPException(status_code=409, detail="设备门禁未允许背面动力刀具工序")
+        try:
+            sweep = _check_back_live_face_sweep(job_id, candidate_plan)
+            if sweep.get("status") != "passed":
+                raise ValueError("三维 STEP 刀具扫掠未通过")
+            rotational = RotationalFeatureAnalysis.model_validate_json(
+                (directory / "rotational-features.json").read_text(encoding="utf-8")
+            )
+            profile = next((
+                item for item in rotational.profiles
+                if item.id == candidate_plan.stock.get("rotational_profile_id")
+                and item.review_state == "accepted"
+            ), None)
+            if profile is None:
+                raise ValueError("缺少已确认的正式回转轮廓")
+            z_values = [point.z for point in profile.points]
+            length = max(max(z_values) - min(z_values), 1.0)
+            request = WholePartDraftRequest(
+                machine_instance_id=snapshot.instance.id,
+                source_profile_id=profile.id,
+                stock_radius_mm=float(candidate_plan.stock["diameter_mm"]) / 2,
+                resolution_mm=0.1,
+                approach_z_mm=max(z_values) + 2,
+                pickoff_z_mm=min(max(z_values) - 0.2, float(cutoff.parameters["z_mm"]) + length * 0.6),
+                grip_length_mm=min(max(length * 0.3, 0.5), 8),
+                synchronization_rpm=1200,
+                sub_spindle_clamp_confirmed=True,
+            )
+            result = compile_whole_part_draft(
+                job_id, request, candidate_plan, profile, snapshot,
+            )
+        except (OSError, subprocess.CalledProcessError, StopIteration, ValueError, KeyError) as error:
+            raise HTTPException(status_code=422, detail=f"背面动力刀具候选验证失败: {error}") from error
+
+        # The candidate remains isolated from the persisted job until every
+        # deterministic and agent-facing operation gate has passed.  Candidate
+        # artifacts are useful evidence even when the final gate rejects it,
+        # but a failed audit must never leave the formal process plan half
+        # updated.
+        invalidate_cam_artifacts(directory)
+        write_json(directory / "turning-whole-program-ir.json", result.toolpath.model_dump(mode="json"))
+        write_json(directory / "turning-whole-program-timeline.json", result.timeline.model_dump(mode="json"))
+        write_json(directory / "turning-continuous-simulation.json", result.continuous_simulation.model_dump(mode="json"))
+        write_json(directory / "turning-whole-program-draft.json", result.model_dump(mode="json"))
+        write_json(directory / "l32-back-live-face-sweep.json", sweep)
+        # A repair candidate is accepted on its own evidence boundary.  Running
+        # the full sequential reviewer here would stop at any older warning
+        # (for example OP20 profile incompleteness) before it ever reaches the
+        # newly generated operation.  Keep the whole-program simulation as the
+        # shared material state, but review only the operation introduced by
+        # this repair.
+        candidate_result = result.model_copy(deep=True)
+        candidate_result.stages = [
+            stage for stage in result.stages if stage.operation_id == operation_id
+        ]
+        if len(candidate_result.stages) != 1:
+            raise HTTPException(status_code=422, detail=f"{operation_id} 工序阶段证据不完整")
+        execution = _run_l32_operation_execution_agent(job_id, candidate_job, candidate_result)
+        operation_record = next((
+            item for item in execution.get("records", []) if item.get("operation_id") == operation_id
+        ), {})
+        if operation_record.get("status") != "passed":
+            raise HTTPException(status_code=422, detail=f"{operation_id} 智能体工序审核未通过")
+        sweep_check = sweep.get("check") or {}
+        contract = evaluate_validation_contract(application.candidate, {
+            "machine_capability": ValidationOutcome(
+                validator="machine_capability", status="passed",
+                evidence={"capability": strategy.capability, "machine_instance_id": snapshot.instance.id},
+            ),
+            "operation_dependency": ValidationOutcome(
+                validator="operation_dependency",
+                status="passed" if float(cutoff.parameters.get("back_face_allowance_mm", 0)) > 0 else "failed",
+                evidence={"operation_id": cutoff.id, "retained_stock_mm": cutoff.parameters.get("back_face_allowance_mm")},
+            ),
+            "continuous_stock": ValidationOutcome(
+                validator="continuous_stock", status=result.continuous_simulation.status,
+                evidence={"source": "turning-continuous-simulation.json"},
+            ),
+            "tool_sweep": ValidationOutcome(
+                validator="tool_sweep", status=str(sweep.get("status") or "failed"),
+                evidence={"sample_count": sweep_check.get("cutter_sample_count")},
+            ),
+            "target_protection": ValidationOutcome(
+                validator="target_protection",
+                status="passed" if float(sweep_check.get("maximum_target_contact_mm3") or 0) <= 1e-9 else "failed",
+                evidence={"maximum_target_contact_mm3": sweep_check.get("maximum_target_contact_mm3")},
+            ),
+            "operation_evidence": ValidationOutcome(
+                validator="operation_evidence", status=operation_record.get("status", "failed"),
+                evidence={
+                    "operation_id": operation_id,
+                    "removed_volume_mm3": (operation_record.get("evidence") or {}).get("removed_volume_delta_mm3"),
+                },
+            ),
+        })
+        if contract.draft_status != "passed":
+            raise HTTPException(
+                status_code=422,
+                detail="工艺策略验证契约未通过: " + ", ".join(contract.missing_draft_evidence),
+            )
+        job.plan = candidate_plan
+        apply_l32_machine_configuration(job, snapshot)
+        save_job(directory, job)
+        selection.update({
+            "status": "applied_validated", "plan_modified": True,
+            "operation_id": operation_id, "sweep": sweep,
+            "operation_review": operation_record,
+            "validation_contract": contract.model_dump(mode="json"),
+            "missing_evidence": contract.missing_production_evidence,
+            "next_action": "reset_and_advance_operation_loop",
+        })
+        write_json(directory / "agent-l32-repair-selection.json", selection)
+        publish_job_event(
+            job_id, "l32_repair", "背面动力刀具修复已通过连续余料与三维扫掠验证", 99,
+            agent_node="validate_back_live_face_repair", agent_title="L32 背面端面修复",
+            agent_kind="validation", agent_status="completed",
+            operation_id=operation_id,
+            evidence=[
+                {"label": "三维扫掠", "value": sweep.get("status")},
+                {"label": "连续余料", "value": result.continuous_simulation.status},
+                {"label": "智能体审核", "value": operation_record.get("status")},
+            ],
+        )
+        return selection
+    if not candidate.get("auto_applicable"):
+        selection.update({
+            "status": "selected_pending_evidence",
+            "plan_modified": False,
+            "missing_evidence": candidate.get("required_evidence") or [],
+            "next_action": "collect_candidate_evidence",
+        })
+        write_json(directory / "agent-l32-repair-selection.json", selection)
+        publish_job_event(
+            job_id, "l32_repair", f"已选择修正候选 {candidate_id}，等待补充安全证据", 99,
+            agent_node="select_repair_candidate", agent_title="L32 工艺修正候选",
+            agent_kind="decision", agent_status="waiting",
+            evidence=[
+                {"label": "候选", "value": candidate_id},
+                {"label": "待补证据", "value": len(selection["missing_evidence"])},
+            ],
+        )
+        return selection
+
+    if candidate_id != "restore_op50_back_turning":
+        raise HTTPException(status_code=409, detail="该自动修正尚无确定性应用器")
+    if job.plan.stock.get("nonrotational_turning_limit_z_mm") is not None:
+        raise HTTPException(status_code=409, detail="背面非回转保护区禁止恢复 OP50 端面车削")
+    snapshot = load_machine_snapshot(directory / "machine-configuration.json")
+    if "back_turning" not in snapshot.validation.capabilities:
+        raise HTTPException(status_code=409, detail="绑定设备未确认 back_turning 能力")
+    rebuilt = build_process_plan(
+        job.analysis, material=job.material, machine=job.machine,
+        requirements=job.plan.manufacturing_requirements,
+    )
+    template = next((
+        operation.model_copy(deep=True)
+        for setup in rebuilt.setups for operation in setup.operations
+        if operation.id == "OP50"
+    ), None)
+    target_setup = next((setup for setup in job.plan.setups if setup.id == "SETUP-L32-SUB"), None)
+    if template is None or target_setup is None:
+        raise HTTPException(status_code=409, detail="无法从当前几何重建安全的 OP50 模板")
+    if not any(operation.id == "OP50" for operation in target_setup.operations):
+        target_setup.operations.append(template)
+        target_setup.operations.sort(key=lambda operation: operation.sequence)
+    apply_l32_machine_configuration(job, snapshot)
+    op50 = next(operation for operation in target_setup.operations if operation.id == "OP50")
+    if not op50.enabled:
+        raise HTTPException(status_code=409, detail="OP50 在设备与几何门禁后仍不可启用")
+    write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
+    save_job(directory, job)
+    invalidate_cam_artifacts(directory)
+    selection.update({
+        "status": "applied", "plan_modified": True,
+        "operation_id": "OP50", "next_action": "recompile_and_simulate",
+    })
+    write_json(directory / "agent-l32-repair-selection.json", selection)
+    return selection
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/loop/advance")
+def advance_l32_agent_rolling_loop(
+    job_id: str, reset: bool = False, refresh: bool = False,
+) -> dict[str, object]:
+    """Accept at most one L32 operation after checking real continuous-stock evidence."""
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32":
+        raise HTTPException(status_code=409, detail="滚动工序闭环目前仅适用于 L32 任务")
+    if job.status != "completed" or not job.analysis or not job.plan:
+        raise HTTPException(status_code=409, detail="需要已完成的几何分析与 L32 工艺草案")
+    with L32_ROLLING_LOOP_LOCK:
+        if job_id in L32_ROLLING_LOOP_JOBS:
+            raise HTTPException(status_code=409, detail="该任务正在推进滚动工序闭环")
+        L32_ROLLING_LOOP_JOBS.add(job_id)
+    directory = job_directory(job_id)
+    loop_path = directory / "agent-l32-rolling-loop.json"
+    try:
+        from .agent.l32_rolling_loop import advance_l32_rolling_loop, plan_signature
+
+        plan_payload = job.plan.model_dump(mode="json")
+        signature = plan_signature(plan_payload)
+        previous = _optional_job_json(directory, loop_path.name) or {}
+        cached_validation = previous.get("validation_cache") if isinstance(previous, dict) else None
+        cache_valid = (
+            not reset
+            and not refresh
+            and previous.get("plan_signature") == signature
+            and isinstance(cached_validation, dict)
+        )
+        if cache_valid:
+            validation = cached_validation
+        else:
+            validation = validate_l32_agent_plan(job_id)
+            if reset or previous.get("plan_signature") != signature:
+                previous = None
+
+        result = advance_l32_rolling_loop(
+            job_id=job_id,
+            plan=plan_payload,
+            validation=validation,
+            previous=previous,
+            reset=reset,
+        )
+        result["validation_cache"] = validation
+        result["evidence_reused"] = cache_valid
+        write_json(loop_path, result)
+        decision = result.get("decision") or {}
+        publish_job_event(
+            job_id, "l32_rolling_operation",
+            str(result.get("message") or "L32 滚动工序闭环已更新"),
+            min(99.0, 5.0 + 90.0 * float(result.get("accepted_count") or 0)
+                / max(float(result.get("expected_operation_count") or 1), 1.0)),
+            agent_node="rolling_operation_gate", agent_title="逐工序规划与仿真审核",
+            agent_kind="validation",
+            agent_status="completed" if decision.get("decision") == "accepted" else "blocked",
+            operation_id=decision.get("operation_id"),
+            evidence=[
+                {"label": "门禁结论", "value": decision.get("decision")},
+                {"label": "已接受工序", "value": result.get("accepted_count")},
+                {"label": "下一动作", "value": result.get("next_action")},
+            ],
+        )
+        return _public_l32_rolling_loop(result)
+    finally:
+        with L32_ROLLING_LOOP_LOCK:
+            L32_ROLLING_LOOP_JOBS.discard(job_id)
 
 
 @app.get("/api/v1/manufacturing-processes")
@@ -2773,6 +4929,64 @@ def _process_new_job(
         return job
 
 
+def _analyze_new_job(
+    job_id: str,
+    *,
+    progress_callback: Callable[..., None] | None = None,
+) -> JobResponse:
+    """Run deterministic geometry intake only; leave process planning to an external agent."""
+    job = load_job(job_id)
+    directory = job_directory(job_id)
+    source_path = directory / job.filename
+
+    def report(stage: str, message: str, percent: float, **details: object) -> None:
+        if progress_callback:
+            progress_callback(stage, message, percent, **details)
+
+    try:
+        report(
+            "geometry_analysis", "Harness 正在调用确定性 STEP 几何解析", 15,
+            agent_kind="tool_call", agent_status="running",
+            agent_title="读取并解析三维几何",
+        )
+        analysis = run_geometry_analyzer(
+            source_path, directory / "analysis.json", directory / "model.stl",
+        )
+        rotational = persist_rotational_analysis(directory, job, analysis)
+        job.analysis = analysis
+        job.model_url = f"/api/v1/jobs/{job_id}/files/model.stl"
+        job.status = "completed"
+        save_job(directory, job)
+        feature_count = sum(len(items) for items in (
+            analysis.planar_features, analysis.cylindrical_features,
+            analysis.prismatic_features, analysis.planar_machining_features,
+            analysis.internal_profile_features,
+        ))
+        report(
+            "geometry_analysis", "几何解析完成，等待 Harness 制定装夹与工序", 100,
+            agent_kind="tool_result", agent_status="completed",
+            agent_title="几何证据已就绪",
+            feature_count=feature_count,
+            rotational_status=rotational.status if rotational else None,
+            evidence=[
+                {"label": "制造特征", "value": feature_count},
+                {"label": "规划所有者", "value": "DeepSeek Harness"},
+            ],
+            viewer={"kind": "model", "url": job.model_url},
+        )
+        return job
+    except (subprocess.SubprocessError, OSError, ValueError) as error:
+        job.status = "failed"
+        details = getattr(error, "stderr", None) or str(error)
+        job.error = str(details)[-2000:]
+        save_job(directory, job)
+        report(
+            "error", job.error or "几何解析失败", 100,
+            agent_kind="error", agent_status="failed",
+        )
+        return job
+
+
 @app.post("/api/v1/jobs", response_model=JobResponse)
 async def create_job(
     step: UploadFile = File(...),
@@ -2783,6 +4997,11 @@ async def create_job(
     filename = Path(step.filename or "part.step").name
     if Path(filename).suffix.lower() not in {".step", ".stp"}:
         raise HTTPException(status_code=400, detail="Only STEP/STP files are supported")
+    if HARNESS_ONLY_MODE:
+        raise HTTPException(
+            status_code=409,
+            detail="请在 DeepSeek Harness 页面上传 STEP/STP；CNC 仅作为领域工具和仿真后端。",
+        )
     if device_id:
         try:
             machine = str(get_device(device_id)["name"])
@@ -2826,6 +5045,11 @@ async def start_job(
     filename = Path(step.filename or "part.step").name
     if Path(filename).suffix.lower() not in {".step", ".stp"}:
         raise HTTPException(status_code=400, detail="Only STEP/STP files are supported")
+    if HARNESS_ONLY_MODE:
+        raise HTTPException(
+            status_code=409,
+            detail="请在 DeepSeek Harness 页面上传 STEP/STP；CNC 仅作为领域工具和仿真后端。",
+        )
     if device_id:
         try:
             machine = str(get_device(device_id)["name"])
@@ -2876,6 +5100,60 @@ async def start_job(
             publish_job_progress("error", failed.error or "工艺生成失败", 100)
 
     threading.Thread(target=worker, name=f"job-plan-{job_id[:8]}", daemon=True).start()
+    return job
+
+
+@app.post("/api/v1/jobs/intake", response_model=JobResponse)
+async def intake_job_for_external_agent(
+    step: UploadFile = File(...),
+    material: str = Form("待确认"),
+    machine: str = Form("待确认"),
+    device_id: str | None = Form(None),
+) -> JobResponse:
+    """Upload and analyze STEP geometry without creating a process plan."""
+    filename = Path(step.filename or "part.step").name
+    if Path(filename).suffix.lower() not in {".step", ".stp"}:
+        raise HTTPException(status_code=400, detail="Only STEP/STP files are supported")
+    if device_id:
+        try:
+            machine = str(get_device(device_id)["name"])
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    job_id = uuid.uuid4().hex
+    directory = job_directory(job_id)
+    directory.mkdir(parents=True)
+    source_path = directory / filename
+    size = 0
+    with source_path.open("wb") as output:
+        while chunk := await step.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                shutil.rmtree(directory, ignore_errors=True)
+                raise HTTPException(status_code=413, detail="STEP file exceeds upload limit")
+            output.write(chunk)
+
+    job = JobResponse(
+        id=job_id, status="processing", filename=filename, created_at=utc_now(),
+        material=material, machine=machine, device_id=device_id,
+    )
+    save_job(directory, job)
+    with JOB_EVENT_CONDITION:
+        JOB_EVENT_LOGS[job_id] = []
+        write_json(directory / "planning-events.json", [])
+    progress = lambda stage, message, percent, **details: publish_job_event(
+        job_id, stage, message, percent, **details,
+    )
+    progress(
+        "uploading", "Harness 已上传三维模型，工艺规划尚未开始", 6,
+        agent_kind="tool_result", agent_status="completed",
+        evidence=[{"label": "规划所有者", "value": "DeepSeek Harness"}],
+    )
+
+    def worker() -> None:
+        _analyze_new_job(job_id, progress_callback=progress)
+
+    threading.Thread(target=worker, name=f"job-intake-{job_id[:8]}", daemon=True).start()
     return job
 
 
@@ -3044,6 +5322,10 @@ def _build_l32_agent_review_context(job_id: str) -> dict[str, object]:
             "confidence": profile.confidence,
             "review_state": profile.review_state,
             "review_reasons": profile.review_reasons,
+            "provisional_decision": (
+                profile.provisional_decision.model_dump(mode="json")
+                if profile.provisional_decision else None
+            ),
             "point_count": point_count,
             "z_min_mm": min(z_values) if z_values else 0,
             "z_max_mm": max(z_values) if z_values else 0,
@@ -3055,13 +5337,23 @@ def _build_l32_agent_review_context(job_id: str) -> dict[str, object]:
     blocker = str(trial.get("whole_program_blocker", ""))
     if not blocker and recommended_undercuts:
         blocker = f"候选轮廓包含 {len(recommended_undercuts)} 处轴向半径反转，标准纵向车刀可能无法连续到达。"
-    needs_review = bool(trial.get("status") == "blocked" or any(
-        profile.review_state == "review" for profile in rotational.profiles
-    ))
+    profile_waiting = any(profile.review_state == "review" for profile in rotational.profiles)
+    unresolved_trial_blocker = bool(
+        trial.get("status") == "blocked"
+        and trial.get("reason") not in {None, "profile_review_required"}
+    )
+    needs_review = profile_waiting or unresolved_trial_blocker
+    has_provisional = any(
+        profile.review_state == "ai_provisional" for profile in rotational.profiles
+    )
     return {
         "schema_version": "1.0.0",
         "job_id": job_id,
-        "status": "waiting_human" if needs_review else "ready",
+        "status": (
+            "waiting_human" if needs_review
+            else "ready_for_draft" if has_provisional
+            else "ready"
+        ),
         "title": "确认回转轮廓并选择修正策略" if needs_review else "回转轮廓已确认",
         "summary": (
             "智能体已保留通过的前序工序，只对阻断区域等待判断。确认后将重新编译并连续仿真。"
@@ -3073,7 +5365,14 @@ def _build_l32_agent_review_context(job_id: str) -> dict[str, object]:
         "passed_operation_count": sum(item.get("status") == "passed" for item in records),
         "profiles": profiles,
         "repair_candidates": candidates,
-        "next_action": trial.get("next_action", "confirm_profile" if needs_review else "retry_validation"),
+        "next_action": (
+            trial.get("next_action")
+            if unresolved_trial_blocker
+            else "inspect_or_provisionally_decide_profile" if profile_waiting
+            else "initialize_process_draft" if has_provisional and job.plan is None
+            else "trial_l32_operation" if has_provisional
+            else "retry_validation"
+        ),
         "production_ready": False,
     }
 
@@ -3081,6 +5380,99 @@ def _build_l32_agent_review_context(job_id: str) -> dict[str, object]:
 @app.get("/api/v1/jobs/{job_id}/agent/l32/review")
 def get_l32_agent_review(job_id: str) -> dict[str, object]:
     return _build_l32_agent_review_context(job_id)
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/l32/profile-provisional-decision")
+def provisionally_decide_l32_agent_profile(
+    job_id: str, request: L32AIProfileDecisionRequest,
+) -> dict[str, object]:
+    """Authorize a bounded profile region for reversible DRAFT-only AI trials."""
+    job = load_job(job_id)
+    if job.device_id != "citizen-cincom-l32" or job.analysis is None:
+        raise HTTPException(status_code=409, detail="AI profile decisions require a completed L32 geometry analysis")
+    directory = job_directory(job_id)
+    path = directory / "rotational-features.json"
+    if not path.is_file():
+        raise HTTPException(status_code=409, detail="Rotational analysis is not available")
+    rotational = RotationalFeatureAnalysis.model_validate_json(path.read_text(encoding="utf-8"))
+    profile = next((item for item in rotational.profiles if item.id == request.profile_id), None)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Rotational profile not found")
+    if profile.review_state == "accepted":
+        raise HTTPException(status_code=409, detail="A human-accepted profile cannot be downgraded to an AI provisional decision")
+    if profile.review_state == "excluded":
+        raise HTTPException(status_code=409, detail="An excluded profile cannot be provisionally authorized")
+    if profile.extraction_method != "exact_section":
+        raise HTTPException(status_code=422, detail="AI provisional use requires an exact-section profile")
+
+    profile_z_min = min(point.z for point in profile.points)
+    profile_z_max = max(point.z for point in profile.points)
+    tolerance = 1e-6
+    if request.z_min_mm < profile_z_min - tolerance or request.z_max_mm > profile_z_max + tolerance:
+        raise HTTPException(status_code=422, detail="AI provisional scope lies outside the extracted profile")
+    if request.scope == "full" and (
+        abs(request.z_min_mm - profile_z_min) > tolerance
+        or abs(request.z_max_mm - profile_z_max) > tolerance
+    ):
+        raise HTTPException(status_code=422, detail="Full AI provisional scope must match the complete extracted profile")
+    try:
+        scoped = clip_rotational_profile(profile, request.z_min_mm, request.z_max_mm)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    radii = [point.radius for point in scoped.points]
+    decision = AIProvisionalProfileDecision(
+        scope=request.scope,
+        z_min_mm=min(point.z for point in scoped.points),
+        z_max_mm=max(point.z for point in scoped.points),
+        diameter_min_mm=2 * min(radii),
+        diameter_max_mm=2 * max(radii),
+        confidence=request.confidence,
+        rationale=request.rationale,
+        evidence_refs=list(dict.fromkeys(request.evidence_refs)),
+    )
+    profile.review_state = "ai_provisional"
+    profile.provisional_decision = decision
+    reason = "AI bounded this exact-section profile for reversible DRAFT-only trials"
+    if reason not in profile.review_reasons:
+        profile.review_reasons.append(reason)
+    axis = next((item for item in rotational.axes if item.id == profile.axis_id), None)
+    if axis is not None and axis.review_state != "accepted":
+        axis.review_state = "ai_provisional"
+        if reason not in axis.review_reasons:
+            axis.review_reasons.append(reason)
+
+    job.analysis.rotational_profile_reviews[profile.id] = "ai_provisional"
+    job.analysis.rotational_profile_decisions[profile.id] = decision.model_dump(mode="json")
+    write_json(directory / "analysis.json", job.analysis.model_dump(mode="json"))
+    write_json(path, rotational.model_dump(mode="json"))
+    write_json(
+        directory / "agent-l32-profile-decisions.json",
+        {
+            "schema_version": "1.0.0", "job_id": job_id,
+            "decisions": job.analysis.rotational_profile_decisions,
+            "release_status": "DRAFT", "production_ready": False,
+        },
+    )
+    save_job(directory, job)
+    invalidate_cam_artifacts(directory)
+    publish_job_event(
+        job_id, "l32_profile_ai_provisional",
+        f"AI provisionally authorized bounded profile {profile.id} for DRAFT trials",
+        42, agent_node="ai_profile_review", agent_title="AI bounded profile decision",
+        agent_kind="ai_review", agent_status="completed",
+        evidence=[
+            {"label": "profile", "value": profile.id},
+            {"label": "scope", "value": request.scope},
+            {"label": "Z", "value": [decision.z_min_mm, decision.z_max_mm]},
+        ],
+        viewer={"kind": "features", "feature_ids": [profile.id]},
+    )
+    context = _build_l32_agent_review_context(job_id)
+    context["decision_status"] = "ai_provisional"
+    context["authorized_profile_id"] = profile.id
+    context["authorized_scope"] = decision.model_dump(mode="json")
+    context["next_action"] = "initialize_process_draft" if job.plan is None else "trial_l32_operation"
+    return context
 
 
 @app.post("/api/v1/jobs/{job_id}/agent/l32/profile-decision")
@@ -3239,6 +5631,32 @@ def get_job_agent_workspace(job_id: str) -> dict[str, object]:
         directory=directory,
         events=events,
     )
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/model-view")
+def render_job_agent_model_view(job_id: str) -> dict[str, object]:
+    """Render deterministic model views without running an AI review."""
+    job = load_job(job_id)
+    if job.status != "completed" or not job.analysis:
+        raise HTTPException(status_code=409, detail="需要已完成的几何分析")
+    directory = job_directory(job_id)
+    model_path = directory / "model.stl"
+    if not model_path.is_file():
+        raise HTTPException(status_code=409, detail="任务缺少可渲染的 STL 模型")
+    from .agent.perception import render_model_evidence
+    try:
+        views = render_model_evidence(model_path, directory)
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {
+        "job_id": job_id,
+        "source": "model.stl",
+        "generated_by": "deterministic_stl_renderer",
+        "views": {
+            name: f"/api/v1/jobs/{job_id}/files/{path.name}"
+            for name, path in views.items()
+        },
+    }
 
 
 @app.post("/api/v1/jobs/{job_id}/agent/perceive")
@@ -3420,6 +5838,60 @@ def get_job(job_id: str, response: Response) -> JobResponse:
         # Stored plans predate newer geometry targets; refresh the read-only
         # coverage response without rewriting the user's operations or binding.
         job.plan.coverage = evaluate_plan_coverage(job.analysis, job.plan)
+    return job
+
+
+@app.post("/api/v1/jobs/{job_id}/agent/plan/initialize", response_model=JobResponse)
+def initialize_harness_process_draft(job_id: str) -> JobResponse:
+    """Create stock/setup scaffolding only; Harness owns every operation decision."""
+    job = load_job(job_id)
+    if job.status != "completed" or job.analysis is None:
+        raise HTTPException(status_code=409, detail="几何分析尚未完成")
+    if job.plan is not None:
+        owner = (job.plan.ai_planning or {}).get("planning_owner")
+        if owner == "deepseek_harness":
+            return job
+        raise HTTPException(status_code=409, detail="任务已经存在非 Harness 工艺方案，不能覆盖")
+
+    plan = build_process_plan(job.analysis, material=job.material, machine=job.machine)
+    for setup in plan.setups:
+        setup.operations = []
+    plan.title = f"Harness 自主工艺草案 · {job.filename}"
+    plan.estimated_minutes = 0
+    plan.automation_status = "review"
+    plan.blocking_reasons = ["Harness 尚未逐道建立并验证工序"]
+    plan.warnings = [
+        "该方案由 DeepSeek Harness 从空白工序序列开始构建，当前仅包含确定性毛坯与装夹脚手架。",
+    ]
+    plan.assumptions = [
+        *plan.assumptions,
+        "装夹脚手架来自确定性几何与设备约束，具体工序由 Harness 逐道决策。",
+    ]
+    plan.ai_planning = {
+        "planning_owner": "deepseek_harness",
+        "planning_mode": "operation_by_operation",
+        "baseline_operations_imported": False,
+        "release_status": "DRAFT",
+    }
+    plan.coverage = evaluate_plan_coverage(job.analysis, plan)
+    plan.manufacturing_route = build_manufacturing_route(job.analysis, plan)
+    plan.knowledge_assessment = assess_plan_knowledge(job.analysis, plan)
+    job.plan = plan
+    directory = job_directory(job_id)
+    provision_default_l32_planning_instance(job, directory)
+    save_job(directory, job)
+    write_json(directory / "plan.json", plan.model_dump(mode="json"))
+    publish_job_event(
+        job_id, "harness_plan", "Harness 已建立空白工艺草案，等待逐道规划", 40,
+        agent_node="harness_initialize_plan", agent_title="建立工艺决策工作区",
+        agent_kind="decision", agent_status="completed",
+        evidence=[
+            {"label": "装夹数", "value": len(plan.setups)},
+            {"label": "初始工序数", "value": 0},
+            {"label": "规划所有者", "value": "DeepSeek Harness"},
+        ],
+        viewer={"kind": "model", "url": job.model_url},
+    )
     return job
 
 
@@ -4584,6 +7056,8 @@ def get_job_file(job_id: str, filename: str) -> FileResponse:
         "agent-perception.json", "agent-perception-contact-sheet.png", "agent-operation-trial.json",
         "agent-view-isometric.png", "agent-view-front.png", "agent-view-right.png", "agent-view-top.png",
         "agent-remediation.json",
+        "agent-l32-execution.json", "agent-l32-incremental-trial.json", "agent-l32-rolling-loop.json",
+        "agent-l32-profile-decisions.json", "agent-l32-autonomous-process.json",
         "ai-plan.json", "cam.FCStd", "program.nc", "toolpath.json", "cam-manifest.json", "verification.json",
         "simulation.json", "collision.json", "remediation.json", "remediation-history.json",
         "turning-toolpath-ir.json", "turning-simulation.json", "turning-verification.json", "turning-reachability.json", "turning-draft.json",
@@ -4768,6 +7242,30 @@ def _feature_type(job: JobResponse, feature_id: str) -> str | None:
     planar_machining = next((item for item in job.analysis.planar_machining_features if item.id == feature_id), None)
     if planar_machining:
         return "planar_surface"
+    rotational_path = job_directory(job.id) / "rotational-features.json"
+    if rotational_path.is_file():
+        try:
+            rotational = RotationalFeatureAnalysis.model_validate_json(
+                rotational_path.read_text(encoding="utf-8"),
+            )
+            profile = next((item for item in rotational.profiles if item.id == feature_id), None)
+            if profile is not None:
+                return "inner_rotational_profile" if profile.side == "inner" else "outer_rotational_profile"
+            turning_feature = next((item for item in rotational.features if item.id == feature_id), None)
+            if turning_feature is not None:
+                if turning_feature.kind == "external_groove_candidate":
+                    return "od_groove"
+                if turning_feature.kind == "internal_groove_candidate":
+                    return "id_groove"
+                if turning_feature.kind == "thread_form_candidate":
+                    return "internal_thread" if turning_feature.thread_side == "internal" else "external_thread"
+                if turning_feature.kind == "cutoff_boundary":
+                    return "cutoff_plane"
+                if turning_feature.kind in {"inner_bore", "inner_taper"}:
+                    return "inner_rotational_profile"
+                return "outer_rotational_profile"
+        except (OSError, ValueError):
+            pass
     # L32 accepted rotational entities are stored outside GeometryAnalysis.
     # Only IDs already referenced by the formal plan are eligible here; a
     # client cannot invent an RP/TPF identifier to bypass geometry checks.
@@ -4802,6 +7300,15 @@ def _validate_operation_geometry(job: JobResponse, definition, feature_ids: list
         raise HTTPException(status_code=422, detail=f"所选几何不适用于{definition.name}: {actual}")
 
 
+def _validate_reference_profile(job: JobResponse, profile_id: str | None) -> None:
+    if profile_id is None:
+        return
+    if _feature_type(job, profile_id) not in {
+        "outer_rotational_profile", "inner_rotational_profile",
+    }:
+        raise HTTPException(status_code=422, detail="reference_profile_id must reference a rotational profile")
+
+
 def _save_manual_plan_change(job_id: str, job: JobResponse) -> JobResponse:
     directory = job_directory(job_id)
     invalidate_cam_artifacts(directory)
@@ -4823,13 +7330,20 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
         definition = get_operation_definition(request.definition_id)
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
-    l32_turning_draft = (
+    l32_agent_draft = (
         job.device_id == "citizen-cincom-l32"
-        and definition.engine.provider == "turning"
+        and (
+            definition.engine.provider == "turning"
+            or definition.id in {
+                "pocket_roughing", "pocket_finishing",
+                "live_tool_contour_roughing", "live_tool_contour_finishing",
+            }
+        )
     )
-    if not definition.manual_enabled and not l32_turning_draft:
+    if not definition.manual_enabled and not l32_agent_draft:
         raise HTTPException(status_code=409, detail=f"{definition.name}尚未通过当前执行引擎验证")
     _validate_operation_geometry(job, definition, request.feature_ids)
+    _validate_reference_profile(job, request.reference_profile_id)
     try:
         tool = get_tool(request.tool_id or definition.tool.default_tool_id)
         if tool.kind not in definition.tool.accepts:
@@ -4847,19 +7361,39 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
         operation = create_operation_instance(
             id=f"OP{next_sequence}", sequence=next_sequence, type=definition.id,
             name=request.name or definition.name, feature_ids=request.feature_ids, tool=tool,
-            parameters=request.parameters, rationale=["制造工程师从工序库手动创建"],
-            confidence=1.0, status="proposed", source="manual",
-            channel_id=neighbour.channel_id if l32_turning_draft and neighbour else None,
-            spindle_id=neighbour.spindle_id if l32_turning_draft and neighbour else None,
-            workpiece_side=neighbour.workpiece_side if l32_turning_draft and neighbour else None,
+            parameters=request.parameters,
+            rationale=request.rationale or [
+                "Harness 基于当前几何、设备和已验证工序状态提出"
+                if request.source == "recommendation"
+                else "制造工程师从工序库手动创建"
+            ],
+            confidence=0.8 if request.source == "recommendation" else 1.0,
+            status="proposed", source=request.source,
+            channel_id=request.channel_id or (neighbour.channel_id if l32_agent_draft and neighbour else None),
+            spindle_id=request.spindle_id or (neighbour.spindle_id if l32_agent_draft and neighbour else None),
+            workpiece_side=request.workpiece_side or (neighbour.workpiece_side if l32_agent_draft and neighbour else None),
         )
+        operation.reference_profile_id = request.reference_profile_id
         apply_cutting_parameters(operation, resolve_material(job.material), resolve_machine(job.machine))
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     setup.operations.insert(insert_index,operation)
     for index,item in enumerate(setup.operations,1):
         item.sequence = index*10
-    return _save_manual_plan_change(job_id, job)
+    saved = _save_manual_plan_change(job_id, job)
+    if request.source == "recommendation":
+        publish_job_event(
+            job_id, "harness_plan", f"Harness 已提出工序 {operation.id} · {operation.name}", 50,
+            agent_node="harness_add_operation", agent_title="逐道建立工序",
+            agent_kind="decision", agent_status="completed", operation_id=operation.id,
+            evidence=[
+                {"label": "工序类型", "value": operation.type},
+                {"label": "刀具", "value": operation.tool.id},
+                {"label": "几何引用", "value": operation.feature_ids},
+            ],
+            viewer={"kind": "operation", "operation_id": operation.id, "mode": "意图"},
+        )
+    return saved
 
 
 @app.patch("/api/v1/jobs/{job_id}/setups/{setup_id}/operations/{operation_id}", response_model=JobResponse)
@@ -4880,6 +7414,9 @@ def update_manual_operation(job_id: str, setup_id: str, operation_id: str, reque
         if request.feature_ids is not None:
             _validate_operation_geometry(job, definition, request.feature_ids)
             operation.feature_ids = request.feature_ids
+        if request.reference_profile_id is not None:
+            _validate_reference_profile(job, request.reference_profile_id)
+            operation.reference_profile_id = request.reference_profile_id
         if request.tool_id is not None:
             tool = get_tool(request.tool_id)
             if tool.kind not in definition.tool.accepts:

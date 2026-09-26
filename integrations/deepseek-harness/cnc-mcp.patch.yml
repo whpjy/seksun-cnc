@@ -1,0 +1,16 @@
+# Add this insert block to the same Harness patch that configures the model.
+# Set CNC_MCP_CWD to this repository's apps/api directory before starting dsh.
+- insert:
+    - id: mcp-seksun-cnc
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: cnc
+        transport: stdio
+        command: python
+        args: ['-m', 'app.cnc_mcp']
+        cwd: !!js process.env.CNC_MCP_CWD
+        env:
+          CNC_API_BASE_URL: http://127.0.0.1:8090
+          CNC_MCP_IMPORT_ROOTS: !!js process.env.CNC_MCP_IMPORT_ROOTS
+        toolCallTimeoutMs: 300000
+        failOnStartupError: true

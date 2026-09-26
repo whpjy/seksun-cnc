@@ -741,7 +741,9 @@ def test_external_groove_requires_review_and_generates_multi_plunge_draft(
     assert draft.status_code == 200
     commands = draft.json()["toolpath"]["channels"][0]["commands"]
     groove_cuts = [item for item in commands if item["type"] == "feed_move"]
-    assert len(groove_cuts) == 12
+    # Exact groove-envelope mode varies the plunge depth with the local profile.
+    # This fixture needs three axial positions with two radial pecks each.
+    assert len(groove_cuts) == 6
     assert {item["parameters"]["axial_width_mm"] for item in groove_cuts} == {2.0}
     assert draft.json()["verification"]["metrics"]["maximum_overcut_mm"] == 0
 
@@ -1116,6 +1118,91 @@ def test_agent_profile_review_context_and_explicit_decision(tmp_path, monkeypatc
     persisted = main.load_job(job_id)
     assert persisted.analysis is not None
     assert persisted.analysis.rotational_profile_reviews[profile_id] == "accepted"
+
+
+def test_ai_can_provisionally_authorize_exact_profile_without_production_release(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "a2" * 16
+    directory = tmp_path / job_id
+    directory.mkdir()
+    analysis = regional_shaft_analysis()
+    analysis.rotational_profile_reviews["RP-OUTER-1"] = "review"
+    main.save_job(directory, JobResponse(
+        id=job_id, status="completed", filename="regional.step",
+        created_at="2026-09-26T00:00:00+00:00", material="S45C",
+        machine="Citizen Cincom L32", device_id="citizen-cincom-l32",
+        analysis=analysis, plan=None,
+    ))
+    rotational = infer_rotational_features(analysis)
+    profile = next(item for item in rotational.profiles if item.id == "RP-OUTER-1")
+    assert profile.extraction_method == "exact_section"
+    assert profile.review_state == "review"
+    main.write_json(directory / "rotational-features.json", rotational.model_dump(mode="json"))
+
+    response = client.post(
+        f"/api/v1/jobs/{job_id}/agent/l32/profile-provisional-decision",
+        json={
+            "profile_id": profile.id, "scope": "partial",
+            "z_min_mm": -10, "z_max_mm": 0, "confidence": 0.82,
+            "rationale": "Exact section is bounded to the front machining region for reversible trials.",
+            "evidence_refs": ["rotational-features.json#RP-OUTER-1", "view:isometric"],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["decision_status"] == "ai_provisional"
+    assert body["status"] == "ready_for_draft"
+    assert body["next_action"] == "initialize_process_draft"
+    assert body["production_ready"] is False
+    persisted = main.load_job(job_id)
+    assert persisted.plan is None
+    assert persisted.analysis is not None
+    assert persisted.analysis.rotational_profile_reviews[profile.id] == "ai_provisional"
+    decision = persisted.analysis.rotational_profile_decisions[profile.id]
+    assert decision["scope"] == "partial"
+    assert decision["production_ready"] is False
+    stored = RotationalFeatureAnalysis.model_validate_json(
+        (directory / "rotational-features.json").read_text(encoding="utf-8"),
+    )
+    stored_profile = next(item for item in stored.profiles if item.id == profile.id)
+    assert stored_profile.review_state == "ai_provisional"
+    assert stored_profile.provisional_decision is not None
+    assert (directory / "agent-l32-profile-decisions.json").is_file()
+
+
+def test_ai_provisional_profile_scope_must_stay_inside_exact_extraction(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    job_id = "a3" * 16
+    directory = tmp_path / job_id
+    directory.mkdir()
+    analysis = regional_shaft_analysis()
+    analysis.rotational_profile_reviews["RP-OUTER-1"] = "review"
+    main.save_job(directory, JobResponse(
+        id=job_id, status="completed", filename="regional.step",
+        created_at="2026-09-26T00:00:00+00:00", material="S45C",
+        machine="Citizen Cincom L32", device_id="citizen-cincom-l32",
+        analysis=analysis, plan=None,
+    ))
+    rotational = infer_rotational_features(analysis)
+    main.write_json(directory / "rotational-features.json", rotational.model_dump(mode="json"))
+
+    response = client.post(
+        f"/api/v1/jobs/{job_id}/agent/l32/profile-provisional-decision",
+        json={
+            "profile_id": "RP-OUTER-1", "scope": "partial",
+            "z_min_mm": -30, "z_max_mm": 0, "confidence": 0.8,
+            "rationale": "This deliberately exceeds the extracted region and must be rejected.",
+            "evidence_refs": ["rotational-features.json#RP-OUTER-1"],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "outside the extracted profile" in response.json()["detail"]
 
 
 def test_rotational_child_feature_review_persists_and_invalidates_cam(tmp_path, monkeypatch) -> None:

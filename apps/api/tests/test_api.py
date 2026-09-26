@@ -57,7 +57,8 @@ def test_unknown_device_library_item_returns_404() -> None:
     assert response.status_code == 404
 
 
-def test_job_start_rejects_unknown_device_before_processing() -> None:
+def test_job_start_rejects_unknown_device_before_processing(monkeypatch) -> None:
+    monkeypatch.setattr(main, "HARNESS_ONLY_MODE", False)
     response = client.post(
         "/api/v1/jobs/start",
         files={"step": ("part.step", b"STEP", "application/octet-stream")},
@@ -70,6 +71,7 @@ def test_job_start_rejects_unknown_device_before_processing() -> None:
 
 def test_create_job_accepts_step_without_drawing(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    monkeypatch.setattr(main, "HARNESS_ONLY_MODE", False)
     monkeypatch.setattr(main, "_process_new_job", lambda job_id: main.load_job(job_id))
 
     response = client.post(
@@ -86,6 +88,7 @@ def test_create_job_accepts_step_without_drawing(tmp_path, monkeypatch) -> None:
 
 def test_start_job_accepts_step_without_drawing(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    monkeypatch.setattr(main, "HARNESS_ONLY_MODE", False)
     monkeypatch.setattr(
         main, "threading",
         SimpleNamespace(Thread=lambda **_kwargs: SimpleNamespace(start=lambda: None)),
@@ -104,6 +107,74 @@ def test_start_job_accepts_step_without_drawing(tmp_path, monkeypatch) -> None:
     directory = tmp_path / payload["id"]
     assert (directory / "part.stp").read_bytes() == b"STEP"
     assert not (directory / "drawing.pdf").exists()
+
+
+def test_harness_only_mode_rejects_legacy_planning_upload(monkeypatch) -> None:
+    monkeypatch.setattr(main, "HARNESS_ONLY_MODE", True)
+
+    response = client.post(
+        "/api/v1/jobs/start",
+        files={"step": ("part.stp", b"STEP", "application/step")},
+    )
+
+    assert response.status_code == 409
+    assert "DeepSeek Harness" in response.json()["detail"]
+
+
+def test_harness_intake_upload_does_not_start_process_planning(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        main, "threading",
+        SimpleNamespace(Thread=lambda **_kwargs: SimpleNamespace(start=lambda: None)),
+    )
+
+    response = client.post(
+        "/api/v1/jobs/intake",
+        files={"step": ("agent-part.stp", b"STEP", "application/step")},
+        data={"device_id": "citizen-cincom-l32"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "processing"
+    assert payload["plan"] is None
+    events = json.loads((tmp_path / payload["id"] / "planning-events.json").read_text(encoding="utf-8"))
+    assert events[-1]["evidence"][0]["value"] == "DeepSeek Harness"
+
+
+def test_harness_initializes_empty_operation_draft(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    analysis = GeometryAnalysis.model_validate({
+        "schema_version": "0.5.0", "source_file": "part.step",
+        "topology": {"solids": 1, "faces": 6, "edges": 12},
+        "measurements": {"volume": 100, "surface_area": 160, "bounding_box": {
+            "minimum": {"x": 0, "y": 0, "z": 0},
+            "maximum": {"x": 10, "y": 10, "z": 10},
+            "size": {"x": 10, "y": 10, "z": 10},
+        }},
+        "planar_features": [{
+            "id": "PF-1", "area": 100, "center": {"x": 5, "y": 5, "z": 10},
+            "normal": {"x": 0, "y": 0, "z": 1},
+        }],
+        "cylindrical_features": [], "prismatic_features": [],
+    })
+    job_id = "a" * 32
+    directory = tmp_path / job_id
+    directory.mkdir()
+    main.save_job(directory, JobResponse(
+        id=job_id, status="completed", filename="part.step", created_at=main.utc_now(),
+        material="6061-T6", machine="VMC850", analysis=analysis,
+        model_url=f"/api/v1/jobs/{job_id}/files/model.stl",
+    ))
+
+    response = client.post(f"/api/v1/jobs/{job_id}/agent/plan/initialize")
+
+    assert response.status_code == 200
+    plan = response.json()["plan"]
+    assert plan["ai_planning"]["planning_owner"] == "deepseek_harness"
+    assert plan["ai_planning"]["baseline_operations_imported"] is False
+    assert sum(len(setup["operations"]) for setup in plan["setups"]) == 0
+    assert plan["coverage"]["production_ready"] is False
 
 
 def test_planning_waits_for_archived_cam_validation_before_completion(tmp_path, monkeypatch) -> None:

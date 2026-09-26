@@ -9,6 +9,12 @@
 
 面向机加工工艺规划的可审查 AI CAPP 原型。
 
+DeepSeek Harness 的 CNC MCP 工具接入与安全边界见 [docs/deepseek-harness-cnc-mcp.md](docs/deepseek-harness-cnc-mcp.md)。
+
+当前正式产品采用 Harness 唯一入口：所有 STEP/STP 在 Harness 上传并由 Harness/Qwen
+逐道规划，CNC 仅作为领域工具、仿真和安全门禁后端。架构边界见
+[docs/harness-only-architecture.md](docs/harness-only-architecture.md)。
+
 ```text
 STEP → OCCT 几何/特征分析 → 规则式工艺规划 → 人工审查 → FreeCAD Path → GRBL G-code
 ```
@@ -157,3 +163,5 @@ v0.4 的 10 个真实 STEP 批量结果保存在本地 `.seksun-cnc/batch-result
 依赖与许可证边界见 [OPEN_SOURCE.md](OPEN_SOURCE.md)。
 
 二维图纸、制造要求统一契约及 STEP AP242 PMI 接入路线见 [docs/drawing-pmi-integration.md](docs/drawing-pmi-integration.md)。
+
+智能体的加工意图、语义工序角色、策略注册与验证契约见 [docs/cnc-process-strategy-framework.md](docs/cnc-process-strategy-framework.md)。

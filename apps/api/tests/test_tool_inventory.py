@@ -1,10 +1,18 @@
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
+import pytest
 
 from app import main
 from app.l32_configuration import snapshot_l32_instance
 from app.machine_models import MachineInstance
 from app.main import app
-from app.tool_inventory import ToolInventoryInput, physical_tool_fit_for_groove, record_physical_tool
+from app.tool_inventory import (
+    ToolInventoryInput,
+    bind_verified_inventory_tool,
+    inventory_binding_evidence_request,
+    physical_tool_fit_for_groove,
+    record_physical_tool,
+)
 from app.catalogs import get_tool
 
 
@@ -57,3 +65,99 @@ def test_groove_width_screening_requires_measured_active_external_tool():
     assert not physical_tool_fit_for_groove(record,0.7)
     assert not physical_tool_fit_for_groove(record.model_copy(update={"active":False}),0.9)
     assert not physical_tool_fit_for_groove(record.model_copy(update={"measured_cutting_width_mm":None}),0.9)
+
+
+def test_verified_full_radius_inventory_can_bind_engineering_candidate():
+    source = ToolInventoryInput(
+        inventory_id="FULL-R-04",
+        custom_name="Measured 0.4 mm full-radius grooving tool",
+        custom_kind="grooving",
+        measured_cutting_width_mm=0.4,
+        measured_nose_radius_mm=0.2,
+        groove_profile="full_radius",
+        axial_contouring_supported=True,
+        capability_verified_by="process-engineer",
+        capability_verification_reference="inspection-report-2026-09-26",
+    )
+    record = record_physical_tool("L32-01", source, None)
+
+    assert record.verification_state == "capability_verified"
+    bound = bind_verified_inventory_tool(
+        record, get_tool("ENGINEERING-GROOVE-FULL-R-0.4"),
+    )
+    assert bound.catalog_match is True
+    assert bound.inventory_id == "FULL-R-04"
+    assert bound.id == "INV-FULL-R-04"
+    assert bound.groove_profile == "full_radius"
+    assert bound.axial_contouring_supported is True
+
+
+def test_axial_contouring_inventory_requires_measured_capability_evidence():
+    with pytest.raises(ValidationError):
+        ToolInventoryInput(
+            inventory_id="UNVERIFIED",
+            custom_name="Unverified contour tool",
+            custom_kind="grooving",
+            measured_cutting_width_mm=0.4,
+            measured_nose_radius_mm=0.2,
+            groove_profile="full_radius",
+            axial_contouring_supported=True,
+        )
+
+
+def test_verified_inventory_binding_rejects_geometry_mismatch():
+    source = ToolInventoryInput(
+        inventory_id="FULL-R-06",
+        custom_name="Measured 0.6 mm full-radius grooving tool",
+        custom_kind="grooving",
+        measured_cutting_width_mm=0.6,
+        measured_nose_radius_mm=0.3,
+        groove_profile="full_radius",
+        axial_contouring_supported=True,
+        capability_verified_by="process-engineer",
+        capability_verification_reference="inspection-report-06",
+    )
+    record = record_physical_tool("L32-01", source, None)
+
+    with pytest.raises(ValueError, match="width"):
+        bind_verified_inventory_tool(
+            record, get_tool("ENGINEERING-GROOVE-FULL-R-0.4"),
+        )
+
+
+def test_binding_evidence_request_lists_exact_missing_physical_evidence():
+    request = inventory_binding_evidence_request(
+        get_tool("ENGINEERING-GROOVE-FULL-R-0.4"), [],
+    )
+
+    assert request["status"] == "user_evidence_required"
+    assert request["next_action"] == "request_user_tool_measurement"
+    fields = {item["field"]: item for item in request["required_evidence"]}
+    assert fields["measured_cutting_width_mm"]["expected_value"] == 0.4
+    assert fields["measured_nose_radius_mm"]["expected_value"] == 0.2
+    assert fields["axial_contouring_supported"]["expected_value"] is True
+    assert "capability_verified_by" in fields
+    assert "capability_verification_reference" in fields
+
+
+def test_binding_evidence_request_returns_compatible_inventory_without_questions():
+    source = ToolInventoryInput(
+        inventory_id="FULL-R-04",
+        custom_name="Measured full radius tool",
+        custom_kind="grooving",
+        measured_cutting_width_mm=0.4,
+        measured_nose_radius_mm=0.2,
+        groove_profile="full_radius",
+        axial_contouring_supported=True,
+        capability_verified_by="engineer",
+        capability_verification_reference="inspection-42",
+    )
+    record = record_physical_tool("L32-01", source, None)
+
+    request = inventory_binding_evidence_request(
+        get_tool("ENGINEERING-GROOVE-FULL-R-0.4"), [record],
+    )
+
+    assert request["status"] == "ready_to_bind"
+    assert request["next_action"] == "bind_l32_candidate_inventory_tool"
+    assert request["compatible_inventory"][0]["inventory_id"] == "FULL-R-04"

@@ -51,7 +51,10 @@ DEVICES: list[dict[str, object]] = [
             }
             for definition in OPERATION_DEFINITIONS
             if definition.engine.provider != "turning"
-            and definition.id not in {"live_tool_contour_roughing", "live_tool_contour_finishing"}
+            and definition.id not in {
+                "live_tool_contour_roughing", "live_tool_contour_finishing",
+                "back_live_face_finishing",
+            }
         ],
         "system_integration": {
             "status": "supported",
@@ -208,6 +211,7 @@ def _synchronize_l32_catalog_record() -> None:
         "drilling", "edge_chamfer", "engraving",
         "slot_roughing", "slot_finishing", "pocket_roughing", "pocket_finishing",
         "live_tool_contour_roughing", "live_tool_contour_finishing",
+        "back_live_face_finishing",
     }
     record["operation_bindings"] = [
         {"operation_id": definition.id, "status": "adapting"}

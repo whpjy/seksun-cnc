@@ -132,6 +132,60 @@ def build_agent_workspace(
                 "ai_verdict": ((trial.get("ai") or {}).get("review") or {}).get("verdict"),
                 "production_ready": False,
             }
+        rolling_path = directory / "agent-l32-rolling-loop.json"
+        if rolling_path.is_file():
+            rolling = json.loads(rolling_path.read_text(encoding="utf-8"))
+            orchestration["rolling_loop"] = {
+                "status": rolling.get("status"),
+                "accepted_operation_ids": rolling.get("accepted_operation_ids") or [],
+                "accepted_count": rolling.get("accepted_count") or 0,
+                "expected_operation_count": rolling.get("expected_operation_count") or 0,
+                "current_operation": rolling.get("current_operation"),
+                "next_operation_id": rolling.get("next_operation_id"),
+                "next_action": rolling.get("next_action"),
+                "message": rolling.get("message"),
+                "production_ready": False,
+            }
+        autonomous_path = directory / "agent-l32-autonomous-process.json"
+        if autonomous_path.is_file():
+            autonomous = json.loads(autonomous_path.read_text(encoding="utf-8"))
+            orchestration["autonomous_process"] = {
+                "status": autonomous.get("status"),
+                "outcome": autonomous.get("outcome"),
+                "phase": autonomous.get("phase"),
+                "current_operation_id": autonomous.get("current_operation_id"),
+                "usage": autonomous.get("usage") or {},
+                "operations": autonomous.get("operations") or [],
+                "blockers": autonomous.get("blockers") or [],
+                "capability_requirements": autonomous.get("capability_requirements") or [],
+                "next_action": autonomous.get("next_action"),
+                "release_status": "DRAFT",
+                "production_ready": False,
+            }
+        incremental_path = directory / "agent-l32-incremental-trial.json"
+        if incremental_path.is_file():
+            incremental = json.loads(incremental_path.read_text(encoding="utf-8"))
+            repair = incremental.get("repair") or {}
+            candidates = incremental.get("repair_candidates") or []
+            if repair or candidates:
+                orchestration["repair"] = {
+                    "status": repair.get("status") or "not_available",
+                    "decision": repair.get("decision"),
+                    "next_action": repair.get("next_action") or incremental.get("next_action"),
+                    "diagnosis": repair.get("diagnosis") or {},
+                    "candidates": [
+                        {
+                            "id": item.get("id"),
+                            "kind": item.get("kind"),
+                            "auto_applicable": bool(item.get("auto_applicable")),
+                            "capability_available": item.get("capability_available"),
+                            "validation_status": item.get("validation_status"),
+                            "reason": item.get("reason"),
+                            "required_evidence": item.get("required_evidence") or [],
+                        }
+                        for item in candidates[:4] if isinstance(item, dict)
+                    ],
+                }
     active = (
         events[-1] if events and job_status in {"completed", "failed"}
         else next(

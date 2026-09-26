@@ -11,7 +11,7 @@ from .machine_models import MachineConfigurationSnapshot
 from .models import Operation
 from .rotational_features import RotationalProfile, clip_rotational_profile
 from .toolpath_ir import ToolpathProgram
-from .turning_simulation import TurningSimulationResult, simulate_turning_stock
+from .turning_simulation import TurningSimulationResult, TurningStockSample, simulate_turning_stock
 from .turning_verification import TurningVerificationResult, verify_turning_profile
 from .turning_reachability import TurningReachabilityResult, assess_turning_reachability
 from .threading_verification import ThreadingVerificationResult, verify_threading_cycle
@@ -28,6 +28,7 @@ class TurningDraftRequest(BaseModel):
     resolution_mm: float = Field(default=0.1, gt=0, le=2)
     radial_clearance_mm: float = Field(default=2, gt=0, le=20)
     axial_clearance_mm: float = Field(default=2, gt=0, le=20)
+    initial_samples: list[TurningStockSample] | None = None
 
     @model_validator(mode="after")
     def validate_stock(self) -> "TurningDraftRequest":
@@ -85,7 +86,10 @@ def compile_turning_draft(
     if request.profile is not None and request.profile.review_state != "accepted":
         raise ValueError("rotational profile must be accepted before draft generation")
     if request.profile is not None:
-        if request.profile.id not in request.operation.feature_ids:
+        if (
+            request.operation.reference_profile_id != request.profile.id
+            and request.profile.id not in request.operation.feature_ids
+        ):
             raise ValueError("operation traceability does not reference the supplied profile")
         if any(
             point.z < request.z_min_mm - 1e-9 or point.z > request.z_max_mm + 1e-9
@@ -161,6 +165,7 @@ def compile_turning_draft(
         z_min_mm=request.z_min_mm,
         z_max_mm=request.z_max_mm,
         resolution_mm=request.resolution_mm,
+        initial_samples=request.initial_samples,
     )
     verification = None
     thread_verification = None

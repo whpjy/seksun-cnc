@@ -13,9 +13,10 @@ services:
       CNC_MAX_UPLOAD_MB: "200"
       CNC_CORS_ORIGINS: http://localhost:5174,http://localhost:3001
       CNC_PUBLIC_BASE_URL: ${CNC_PUBLIC_BASE_URL:-}
+      CNC_HARNESS_ONLY: ${CNC_HARNESS_ONLY:-true}
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       QWEN_BASE_URL: ${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
-      QWEN_MODEL: ${QWEN_MODEL:-qwen3.8-max-0902}
+      QWEN_MODEL: ${QWEN_MODEL:-qwen3.8-flash}
       QWEN_TIMEOUT_SECONDS: ${QWEN_TIMEOUT_SECONDS:-120}
       QWEN_PLANNING_THINKING: ${QWEN_PLANNING_THINKING:-false}
       CNC_AGENT_MODE: ${CNC_AGENT_MODE:-active}
@@ -38,6 +39,7 @@ services:
         VITE_APP_NAME: ${VITE_APP_NAME:-NEXUS CNC}
         VITE_PAGE_TITLE: ${VITE_PAGE_TITLE:-智能工艺规划}
         VITE_APP_LOGO_TEXT: ${VITE_APP_LOGO_TEXT:-N}
+        VITE_HARNESS_URL: ${VITE_HARNESS_URL:-http://127.0.0.1:3080}
     depends_on:
       - api
     ports:

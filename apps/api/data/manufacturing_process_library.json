@@ -3571,6 +3571,13 @@
     }
   ],
   "cam_operation_mapping": {
+    "turn_facing": "GX-C-01",
+    "turn_od_roughing": "GX-C-01",
+    "turn_id_roughing": "GX-C-01",
+    "turn_od_finishing": "GX-C-03",
+    "turn_id_finishing": "GX-C-03",
+    "turn_threading": "GX-C-06",
+    "axial_drilling": "GX-C-11",
     "face_milling": "GX-C-07",
     "profile_roughing": "GX-C-07",
     "internal_profile_roughing": "GX-C-07",

@@ -38,6 +38,10 @@ type Props = {
   trialAvailable?: boolean;
   trialPending?: boolean;
   trialError?: string | null;
+  onAdvanceOperation?: () => void;
+  rollingAvailable?: boolean;
+  rollingPending?: boolean;
+  rollingError?: string | null;
   onClose?: () => void;
 };
 
@@ -166,6 +170,10 @@ export function AgentWorkspacePanel({
   trialAvailable = false,
   trialPending = false,
   trialError,
+  onAdvanceOperation,
+  rollingAvailable = false,
+  rollingPending = false,
+  rollingError,
   onClose,
 }: Props) {
   const [tab, setTab] = useState<"conversation" | "files">("conversation");
@@ -240,6 +248,42 @@ export function AgentWorkspacePanel({
         })}
       </div>
 
+      {orchestration?.rolling_loop && (
+        <section className={`agent-rolling-window is-${orchestration.rolling_loop.status || "not_started"}`}>
+          <div>
+            <span>逐工序验证窗口</span>
+            <strong>{orchestration.rolling_loop.current_operation?.operation_id || orchestration.rolling_loop.next_operation_id || "等待开始"}</strong>
+          </div>
+          <p>{orchestration.rolling_loop.message || "每次只接受一道具有刀路与连续材料仿真证据的工序。"}</p>
+          <footer>
+            <span>已接受 {orchestration.rolling_loop.accepted_count ?? 0}/{orchestration.rolling_loop.expected_operation_count ?? 0}</span>
+            <span>{orchestration.rolling_loop.status === "plan_blocked" ? "上游方案待补全" : orchestration.rolling_loop.status === "blocked" ? "当前工序阻断" : orchestration.rolling_loop.status === "completed" ? "逐项完成" : "等待下一步"}</span>
+          </footer>
+        </section>
+      )}
+
+      {orchestration?.rolling_loop?.status === "plan_blocked" && orchestration.repair && (
+        <section className="agent-repair-options">
+          <header>
+            <div><AlertTriangle size={15} /><span>工艺方案需要修正</span></div>
+            <small>{orchestration.repair.diagnosis?.defect || "待诊断"}</small>
+          </header>
+          <p>阻断来自上游工艺方案，不代表当前工序仿真失败。智能体已生成受安全门约束的修复候选。</p>
+          <div className="agent-repair-options__list">
+            {(orchestration.repair.candidates || []).map((candidate) => (
+              <article key={candidate.id || candidate.kind}>
+                <div>
+                  <strong>{candidate.id || "未命名候选"}</strong>
+                  <span>{candidate.auto_applicable ? "可自动验证" : "需要工程确认"}</span>
+                </div>
+                {candidate.reason && <p>{candidate.reason}</p>}
+                {!!candidate.required_evidence?.length && <small>待补证据：{candidate.required_evidence.join("、")}</small>}
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
+
       <nav className="agent-conversation-tabs">
         <button type="button" className={tab === "conversation" ? "active" : ""} onClick={() => setTab("conversation")}><BrainCircuit size={16} />对话与执行</button>
         <button type="button" className={tab === "files" ? "active" : ""} onClick={() => setTab("files")}><Database size={16} />文件与证据 <span>{visibleArtifacts.length}</span></button>
@@ -309,9 +353,10 @@ export function AgentWorkspacePanel({
         <div><span>下一步</span><strong>{ACTION_LABELS[orchestration?.next_action || ""] || (live ? "智能体继续推理" : "可继续审查")}</strong></div>
         <div className="agent-next-action__buttons">
           {onPerceive && <button type="button" disabled={perceptionPending} onClick={onPerceive}><ScanSearch size={15} />{perceptionPending ? "观察中" : "观察模型"}</button>}
+          {onAdvanceOperation && rollingAvailable && <button type="button" disabled={rollingPending} onClick={onAdvanceOperation}><Play size={15} />{rollingPending ? "验证中" : ["blocked", "plan_blocked"].includes(orchestration?.rolling_loop?.status || "") ? "重新验证当前工序" : "验证下一工序"}</button>}
           {onTrial && trialAvailable && <button type="button" disabled={trialPending} onClick={onTrial}><Play size={15} />{trialPending ? "验证中" : "试运行"}</button>}
         </div>
-        {(perceptionError || trialError) && <p><AlertTriangle size={13} />{perceptionError || trialError}</p>}
+        {(perceptionError || rollingError || trialError) && <p><AlertTriangle size={13} />{perceptionError || rollingError || trialError}</p>}
       </footer>
     </section>
   );

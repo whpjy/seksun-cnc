@@ -45,6 +45,7 @@ TOOL_DEFINITIONS = [
     {"id": "TURN-ID-MICRO-F", "name": "内孔尖肩微小刀尖精车刀", "kind": "turning_id", "diameter_mm": 0.1, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.1, "stickout_mm": 25, "holder_diameter_mm": 6, "nose_radius_mm": 0.05, "insert_shape": "DCGT-MICRO", "hand": "right", "orientation_code": 2},
     {"id": "TURN-GROOVE-2", "name": "2 mm 切槽刀", "kind": "grooving", "diameter_mm": 2.0, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 2.0, "stickout_mm": 20, "holder_diameter_mm": 16, "cutting_width_mm": 2.0, "hand": "neutral", "orientation_code": 4},
     {"id": "TURN-GROOVE-0.8", "name": "0.8 mm 窄槽刀", "kind": "grooving", "diameter_mm": 0.8, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.8, "stickout_mm": 16, "holder_diameter_mm": 10, "cutting_width_mm": 0.8, "hand": "neutral", "orientation_code": 4},
+    {"id": "ENGINEERING-GROOVE-FULL-R-0.4", "name": "0.4 mm 全圆弧轮廓切槽刀（工程候选）", "kind": "grooving", "diameter_mm": 0.4, "flute_count": 1, "max_rpm": 8000, "catalog_match": False, "flute_length_mm": 0.4, "stickout_mm": 16, "holder_diameter_mm": 10, "nose_radius_mm": 0.2, "cutting_width_mm": 0.4, "hand": "neutral", "orientation_code": 4, "groove_profile": "full_radius", "axial_contouring_supported": True},
     {"id": "TURN-ID-GROOVE-1", "name": "1 mm 内孔切槽刀", "kind": "internal_grooving", "diameter_mm": 1.0, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 1.0, "stickout_mm": 25, "holder_diameter_mm": 6, "cutting_width_mm": 1.0, "hand": "right", "orientation_code": 2},
     {"id": "TURN-THREAD-60", "name": "60°螺纹车刀", "kind": "threading", "diameter_mm": 0.2, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.2, "stickout_mm": 20, "holder_diameter_mm": 16, "nose_radius_mm": 0.1, "insert_shape": "60deg", "hand": "right", "orientation_code": 3},
     {"id": "TURN-CUTOFF-2", "name": "2 mm 切断刀", "kind": "cutoff", "diameter_mm": 2.0, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 2.0, "stickout_mm": 25, "holder_diameter_mm": 16, "cutting_width_mm": 2.0, "hand": "neutral", "orientation_code": 4},
@@ -76,6 +77,9 @@ def resolve_machine(value: str) -> MachineProfile:
 
 
 def enrich_tool(tool: Tool) -> Tool:
+    exact_match = next((item for item in TOOL_DEFINITIONS if item["id"] == tool.id), None)
+    if exact_match is not None:
+        return Tool.model_validate(exact_match)
     match = min(
         (item for item in TOOL_DEFINITIONS if item["kind"] == tool.kind),
         key=lambda item: abs(float(item["diameter_mm"]) - tool.diameter_mm),

@@ -1164,6 +1164,68 @@ export type AgentWorkspace = {
       ai_verdict?: string;
       production_ready?: false;
     };
+    rolling_loop?: {
+      status?: "not_started" | "ready" | "plan_blocked" | "blocked" | "completed";
+      accepted_operation_ids?: string[];
+      accepted_count?: number;
+      expected_operation_count?: number;
+      current_operation?: {
+        operation_id?: string;
+        operation_name?: string;
+        operation_type?: string;
+        setup_id?: string;
+      } | null;
+      next_operation_id?: string | null;
+      next_action?: string;
+      message?: string;
+      production_ready?: false;
+    };
+    autonomous_process?: {
+      status?: "not_started" | "running" | "completed";
+      outcome?: "verified_success" | "engineer_review_required" | "capability_unavailable" | null;
+      phase?: string;
+      current_operation_id?: string | null;
+      usage?: {
+        tool_calls?: number;
+        operation_trials?: number;
+        repair_attempts?: number;
+        model_calls?: number;
+        model_tokens?: number;
+      };
+      operations?: Array<{
+        operation_id?: string;
+        name?: string;
+        type?: string;
+        trial_status?: string;
+        can_accept?: boolean;
+        decision?: string;
+        repair_status?: string;
+      }>;
+      blockers?: Array<{ operation_id?: string; reason?: string; detail?: string }>;
+      capability_requirements?: Array<Record<string, unknown>>;
+      next_action?: string;
+      release_status?: "DRAFT";
+      production_ready?: false;
+    };
+    repair?: {
+      status?: string;
+      decision?: string;
+      next_action?: string;
+      diagnosis?: {
+        defect?: string;
+        failed_operations?: string[];
+        safety_gate?: string;
+      };
+      candidates?: Array<{
+        id?: string;
+        kind?: string;
+        auto_applicable?: boolean;
+        capability_available?: boolean;
+        validation_status?: string;
+        reason?: string;
+        required_evidence?: string[];
+      }>;
+    };
   } | null;
   events: AgentTraceEvent[];
   artifacts: AgentArtifact[];
