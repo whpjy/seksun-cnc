@@ -83,6 +83,29 @@ def test_l32_manual_turning_operation_can_be_inserted_with_machine_context(tmp_p
     assert [item["sequence"] for item in operations]==list(range(10,10*len(operations)+1,10))
 
 
+def test_harness_operation_id_is_unique_across_setup_local_sequences() -> None:
+    analysis = shaft_analysis()
+    plan = build_process_plan(analysis, "S45C", "Citizen Cincom L32")
+    job = JobResponse(
+        id="f" * 32, status="completed", filename="shaft.step",
+        created_at=main.utc_now(), material="S45C", machine="Citizen Cincom L32",
+        device_id="citizen-cincom-l32", analysis=analysis, plan=plan,
+    )
+    # Reproduce the old failure shape: OP30 lives in another setup but its
+    # setup-local sequence has been renumbered back to 10.
+    all_operations = [item for setup in plan.setups for item in setup.operations]
+    all_operations[0].id = "OP10"
+    all_operations[0].sequence = 10
+    all_operations[1].id = "OP20"
+    all_operations[1].sequence = 20
+    all_operations[2].id = "OP30"
+    all_operations[2].sequence = 10
+    for setup in plan.setups:
+        setup.operations = [item for item in setup.operations if item in all_operations[:3]]
+
+    assert main._next_operation_id(job) == "OP40"
+
+
 def regional_shaft_analysis() -> GeometryAnalysis:
     source = shaft_analysis(radius=10)
     source.cylindrical_features[0].id = "HF-REGIONAL"
@@ -375,6 +398,22 @@ def test_l32_od_turning_stops_before_nonrotational_protrusion(tmp_path, monkeypa
     assert external.covered_by == ["OP34-NR-R", "OP36-NR-F"]
     assert external.required_operation_types == [
         "live_tool_contour_finishing", "live_tool_contour_roughing",
+    ]
+    derived_plan = plan.model_copy(deep=True)
+    for setup in derived_plan.setups:
+        for operation in setup.operations:
+            if operation.type in {"live_tool_contour_roughing", "live_tool_contour_finishing"}:
+                operation.feature_ids = ["REGION-NONROTATIONAL-OUTER-1"]
+    derived_plan.stock["nonrotational_material_verified"] = True
+    derived_coverage = main.evaluate_plan_coverage(analysis, derived_plan)
+    derived_target = next(
+        target for target in derived_coverage.targets
+        if target.id.startswith("TARGET-NONROTATIONAL-OUTER-")
+    )
+    assert derived_target.state == "covered"
+    assert derived_target.covered_by == ["OP34-NR-R", "OP36-NR-F"]
+    assert derived_target.source_feature_ids == [
+        "REGION-NONROTATIONAL-OUTER-1", "RP-OUTER-1",
     ]
     # Older stored jobs have no such target yet. A read must expose the new
     # geometry blocker without mutating the stored plan or machine binding.
@@ -1718,6 +1757,18 @@ def test_excluded_rotational_profile_is_not_reported_as_covered() -> None:
     plan.coverage = main.evaluate_plan_coverage(analysis, plan)
 
     assert plan.coverage.targets[-1].state == "uncovered"
+
+
+def test_ai_provisional_rotational_profile_remains_review_not_uncovered() -> None:
+    analysis = shaft_analysis()
+    plan = build_process_plan(analysis, "S45C", "Citizen Cincom L32")
+    plan.stock["profile_review_state"] = "ai_provisional"
+
+    coverage = main.evaluate_plan_coverage(analysis, plan)
+    target = next(item for item in coverage.targets if item.id == "TARGET-RP-OUTER-1")
+
+    assert target.state == "review"
+    assert coverage.production_ready is False
 
 
 def test_generic_cam_endpoint_is_blocked_for_l32(tmp_path, monkeypatch) -> None:

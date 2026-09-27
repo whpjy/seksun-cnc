@@ -1180,6 +1180,12 @@ export type AgentWorkspace = {
       message?: string;
       production_ready?: false;
     };
+    independent_operation_trials?: {
+      status?: "in_progress" | "completed";
+      accepted_operation_ids?: string[];
+      accepted_count?: number;
+      production_ready?: false;
+    };
     autonomous_process?: {
       status?: "not_started" | "running" | "completed";
       outcome?: "verified_success" | "engineer_review_required" | "capability_unavailable" | null;

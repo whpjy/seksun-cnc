@@ -152,7 +152,7 @@ def evaluate_plan_coverage(
             and rotational_scope_complete
         ):
             state = "covered"
-        elif review_state == "review":
+        elif review_state in {"review", "ai_provisional"}:
             state = "review"
         else:
             state = "uncovered"
@@ -167,8 +167,13 @@ def evaluate_plan_coverage(
         ))
         if plan.stock.get("nonrotational_turning_limit_z_mm") is not None:
             required = {"live_tool_contour_roughing", "live_tool_contour_finishing"}
+            derived_region_id = "REGION-NONROTATIONAL-OUTER-1"
             matching = [
-                operation for operation in by_feature.get(profile_id, [])
+                operation for operation in operations
+                if (
+                    profile_id in operation.feature_ids
+                    or derived_region_id in operation.feature_ids
+                )
                 if operation.type in required
             ]
             region = plan.stock.get("nonrotational_region_z_mm")
@@ -187,7 +192,12 @@ def evaluate_plan_coverage(
                 ),
                 required_operation_types=sorted(required),
                 covered_by=[operation.id for operation in matching],
-                source_feature_ids=[profile_id] if profile_id else [],
+                # The region is the legal machining reference.  Keep the
+                # parent profile as supporting provenance without requiring an
+                # incompatible profile binding on live-tool operations.
+                source_feature_ids=[
+                    item for item in (derived_region_id, profile_id) if item
+                ],
             ))
 
     bounds = analysis.measurements.get("bounding_box")

@@ -859,7 +859,14 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
     if not source.is_file() or source.suffix.lower() not in {".stp", ".step"}:
         raise HTTPException(status_code=404, detail="Original STEP source is unavailable")
 
-    operations = [item for setup in job.plan.setups for item in setup.operations]
+    operations = [
+        item.model_copy(update={
+            "channel_id": item.channel_id or ("sub" if setup.id == "SETUP-L32-SUB" else "main"),
+            "spindle_id": item.spindle_id or ("sub" if setup.id == "SETUP-L32-SUB" else "main"),
+            "workpiece_side": item.workpiece_side or ("back" if setup.id == "SETUP-L32-SUB" else "front"),
+        })
+        for setup in job.plan.setups for item in setup.operations
+    ]
     rotational_path = directory / "rotational-features.json"
     if not rotational_path.is_file():
         raise HTTPException(status_code=404, detail="Exact rotational feature analysis is unavailable")
@@ -870,8 +877,29 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
         (profile for profile in rotational.profiles if profile.id == job.plan.stock.get("rotational_profile_id")),
         None,
     )
-    if source_profile is None or source_profile.review_state != "accepted":
-        raise HTTPException(status_code=422, detail="Accepted outer rotational profile is unavailable")
+    profile_is_draft_authorized = bool(
+        source_profile is not None
+        and source_profile.review_state == "ai_provisional"
+        and source_profile.provisional_decision is not None
+        and source_profile.extraction_method == "exact_section"
+    )
+    if source_profile is None or (
+        source_profile.review_state != "accepted" and not profile_is_draft_authorized
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Accepted or AI-provisionally authorized exact outer profile is unavailable",
+        )
+    playback_authorization = {
+        "profile_id": source_profile.id,
+        "state": source_profile.review_state,
+        "scope": (
+            source_profile.provisional_decision.scope
+            if source_profile.provisional_decision else "full"
+        ),
+        "draft_playback_only": source_profile.review_state == "ai_provisional",
+        "production_ready": False,
+    }
     profile_min = min(point.z for point in source_profile.points)
     profile_max = max(point.z for point in source_profile.points)
     region = job.plan.stock.get("nonrotational_region_z_mm")
@@ -984,7 +1012,11 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
                 })
 
     if not stages:
-        return {"schema_version": "1.0.0", "operations": []}
+        return {
+            "schema_version": "1.1.0", "operations": [],
+            "playback_authorization": playback_authorization,
+            "production_ready": False,
+        }
     axis = rotational.axes[0]
     context = {
         "axis_origin": axis.origin.model_dump(mode="json"),
@@ -1007,9 +1039,12 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
         "back_faces": back_faces,
         "pockets": pockets,
     }
-    stages_json = json.dumps({"stages": stages, "context": context}, separators=(",", ":"))
+    stages_json = json.dumps(
+        {"stages": stages, "context": context, "playback_authorization": playback_authorization},
+        separators=(",", ":"),
+    )
     signature = hashlib.sha256(
-        f"material-binary-v12:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
+        f"material-binary-v13:{source.stat().st_mtime_ns}:".encode("utf-8") + stages_json.encode("utf-8")
     ).hexdigest()
     manifest_path = directory / "l32-material-snapshots.json"
     stages_path = directory / "l32-material-stages.json"
@@ -1061,7 +1096,12 @@ def get_l32_material_snapshots(job_id: str) -> dict[str, object]:
             raise HTTPException(status_code=504, detail="L32 material snapshots timed out") from error
         except (OSError, subprocess.CalledProcessError, StopIteration, ValueError, KeyError) as error:
             raise HTTPException(status_code=502, detail=f"L32 material snapshots failed: {error}") from error
-        payload = {"schema_version": "1.0.0", "signature": signature, **result}
+        payload = {
+            "schema_version": "1.1.0", "signature": signature,
+            "playback_authorization": playback_authorization,
+            "production_ready": False,
+            **result,
+        }
         write_json(manifest_path, payload)
         return payload
 
@@ -5346,6 +5386,19 @@ def _build_l32_agent_review_context(job_id: str) -> dict[str, object]:
     has_provisional = any(
         profile.review_state == "ai_provisional" for profile in rotational.profiles
     )
+    review_title = (
+        "确认回转轮廓并选择修正策略"
+        if needs_review else
+        "AI 临时授权轮廓" if has_provisional else
+        "回转轮廓已人工确认"
+    )
+    review_summary = (
+        "智能体已保留通过的前序工序，只对阻断区域等待判断。确认后将重新编译并连续仿真。"
+        if needs_review else
+        "当前精确轮廓仅获得 AI 临时授权，可用于 DRAFT 试算，但不得解释为人工确认或生产放行。"
+        if has_provisional else
+        "当前回转轮廓已经人工确认，可用于下一轮 DRAFT 验证。"
+    )
     return {
         "schema_version": "1.0.0",
         "job_id": job_id,
@@ -5354,11 +5407,8 @@ def _build_l32_agent_review_context(job_id: str) -> dict[str, object]:
             else "ready_for_draft" if has_provisional
             else "ready"
         ),
-        "title": "确认回转轮廓并选择修正策略" if needs_review else "回转轮廓已确认",
-        "summary": (
-            "智能体已保留通过的前序工序，只对阻断区域等待判断。确认后将重新编译并连续仿真。"
-            if needs_review else "当前回转轮廓已经人工确认，可用于下一轮 DRAFT 验证。"
-        ),
+        "title": review_title,
+        "summary": review_summary,
         "recommended_profile_id": recommended.id if recommended else None,
         "blocker": blocker,
         "failed_operations": [str(item.get("operation_id")) for item in failed],
@@ -7230,6 +7280,13 @@ def _find_setup(job: JobResponse, setup_id: str):
 def _feature_type(job: JobResponse, feature_id: str) -> str | None:
     if not job.analysis:
         return None
+    if (
+        feature_id == "REGION-NONROTATIONAL-OUTER-1"
+        and job.plan is not None
+        and isinstance(job.plan.stock.get("nonrotational_region_z_mm"), list)
+        and len(job.plan.stock["nonrotational_region_z_mm"]) == 2
+    ):
+        return "solid"
     planar = next((item for item in job.analysis.planar_features if item.id == feature_id), None)
     if planar:
         return "planar_face"
@@ -7322,6 +7379,30 @@ def _save_manual_plan_change(job_id: str, job: JobResponse) -> JobResponse:
     return job
 
 
+def _next_operation_id(job: JobResponse) -> str:
+    """Allocate a stable, plan-wide operation ID.
+
+    Operation ``sequence`` is local to a setup and is renumbered after an
+    insertion.  It therefore cannot be used as a global ID generator: doing so
+    produced multiple ``OP30`` records as Harness appended operations to the
+    sub-spindle setup.  IDs are intentionally independent from display order.
+    """
+    used = {
+        operation.id
+        for setup in (job.plan.setups if job.plan else [])
+        for operation in setup.operations
+    }
+    numeric_ids = [
+        int(operation_id[2:])
+        for operation_id in used
+        if operation_id.startswith("OP") and operation_id[2:].isdigit()
+    ]
+    candidate = ((max(numeric_ids, default=0) // 10) + 1) * 10
+    while f"OP{candidate}" in used:
+        candidate += 10
+    return f"OP{candidate}"
+
+
 @app.post("/api/v1/jobs/{job_id}/setups/{setup_id}/operations", response_model=JobResponse)
 def create_manual_operation(job_id: str, setup_id: str, request: OperationCreateRequest) -> JobResponse:
     job = load_job(job_id)
@@ -7348,8 +7429,8 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
         tool = get_tool(request.tool_id or definition.tool.default_tool_id)
         if tool.kind not in definition.tool.accepts:
             raise ValueError(f"刀具类型 {tool.kind} 不适用于 {definition.name}")
-        existing = [operation for item in job.plan.setups for operation in item.operations] if job.plan else []
-        next_sequence = max((operation.sequence for operation in existing), default=0) + 10
+        operation_id = _next_operation_id(job)
+        next_sequence = (len(setup.operations) + 1) * 10
         insert_index = len(setup.operations)
         neighbour = setup.operations[-1] if setup.operations else None
         if request.insert_after_operation_id is not None:
@@ -7359,7 +7440,7 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
             insert_index = after_index+1
             neighbour = setup.operations[after_index]
         operation = create_operation_instance(
-            id=f"OP{next_sequence}", sequence=next_sequence, type=definition.id,
+            id=operation_id, sequence=next_sequence, type=definition.id,
             name=request.name or definition.name, feature_ids=request.feature_ids, tool=tool,
             parameters=request.parameters,
             rationale=request.rationale or [
@@ -7369,9 +7450,21 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
             ],
             confidence=0.8 if request.source == "recommendation" else 1.0,
             status="proposed", source=request.source,
-            channel_id=request.channel_id or (neighbour.channel_id if l32_agent_draft and neighbour else None),
-            spindle_id=request.spindle_id or (neighbour.spindle_id if l32_agent_draft and neighbour else None),
-            workpiece_side=request.workpiece_side or (neighbour.workpiece_side if l32_agent_draft and neighbour else None),
+            channel_id=request.channel_id or (
+                neighbour.channel_id if l32_agent_draft and neighbour and neighbour.channel_id
+                else "sub" if l32_agent_draft and setup.id == "SETUP-L32-SUB"
+                else "main" if l32_agent_draft else None
+            ),
+            spindle_id=request.spindle_id or (
+                neighbour.spindle_id if l32_agent_draft and neighbour and neighbour.spindle_id
+                else "sub" if l32_agent_draft and setup.id == "SETUP-L32-SUB"
+                else "main" if l32_agent_draft else None
+            ),
+            workpiece_side=request.workpiece_side or (
+                neighbour.workpiece_side if l32_agent_draft and neighbour and neighbour.workpiece_side
+                else "back" if l32_agent_draft and setup.id == "SETUP-L32-SUB"
+                else "front" if l32_agent_draft else None
+            ),
         )
         operation.reference_profile_id = request.reference_profile_id
         apply_cutting_parameters(operation, resolve_material(job.material), resolve_machine(job.machine))

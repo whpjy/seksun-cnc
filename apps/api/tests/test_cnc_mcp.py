@@ -4,8 +4,9 @@ from pathlib import Path
 import httpx
 
 from app.cnc_mcp import (
-    CncApiClient, CncApiError, resolve_step_import, summarize_geometry,
-    summarize_job, summarize_progress, summarize_tool_inventory,
+    CncApiClient, CncApiError, attach_cnc_evidence_contract, resolve_step_import,
+    summarize_geometry, summarize_job, summarize_operation_catalog, summarize_progress,
+    summarize_tool_inventory,
 )
 
 
@@ -45,8 +46,9 @@ def test_summarize_geometry_omits_visual_edges_and_profile_points() -> None:
     job = {"id": "abc", "analysis": {
         "topology": {"faces": 20}, "measurements": {"volume": 10},
         "visual_edges": [[{"x": 1, "y": 2, "z": 3}]],
+        "planar_features": [{"id": "PF-1", "review_state": "accepted"}],
         "cylindrical_features": [{"id": "HF-1", "kind": "hole", "diameter": 4}],
-    }}
+    }, "plan": {"stock": {"nonrotational_region_z_mm": [-4.5, -1.05]}}}
     rotational = {"profiles": [{
         "id": "RP-1", "side": "outer", "confidence": 0.9, "review_state": "review",
         "points": [{"z": -2, "radius": 3}, {"z": 4, "radius": 5}],
@@ -56,8 +58,55 @@ def test_summarize_geometry_omits_visual_edges_and_profile_points() -> None:
 
     assert "visual_edges" not in json.dumps(result)
     assert result["feature_counts"]["cylindrical_features"] == 1
+    assert result["features"]["planar_features"][0]["id"] == "PF-1"
     assert result["rotational_profiles"][0]["point_count"] == 2
     assert result["rotational_profiles"][0]["z_range_mm"] == [-2.0, 4.0]
+    assert result["derived_regions"] == [{
+        "id": "REGION-NONROTATIONAL-OUTER-1",
+        "kind": "nonrotational_outer_region",
+        "geometry_type": "solid",
+        "z_range_mm": [-4.5, -1.05],
+        "purpose": "live_tool_contour_roughing_or_finishing",
+    }]
+
+
+def test_operation_catalog_only_exposes_l32_executable_options_with_legal_refs() -> None:
+    payload = {
+        "schema_version": "1.0.0",
+        "definitions": [
+            {
+                "id": "surface_3d", "name": "3D surface", "manual_enabled": False,
+                "geometry": {"accepts": ["solid"], "minimum_selection": 1},
+                "tool": {}, "parameters": [], "engine": {"provider": "freecad"},
+            },
+            {
+                "id": "live_tool_contour_roughing", "name": "Live rough",
+                "manual_enabled": False,
+                "geometry": {"accepts": ["solid", "planar_face"], "minimum_selection": 1},
+                "tool": {}, "parameters": [], "engine": {"provider": "freecad"},
+            },
+            {
+                "id": "turn_od_roughing", "name": "Turn rough", "manual_enabled": False,
+                "geometry": {"accepts": ["outer_rotational_profile"], "minimum_selection": 1},
+                "tool": {}, "parameters": [], "engine": {"provider": "turning"},
+            },
+        ],
+    }
+    job = {
+        "id": "job-1", "device_id": "citizen-cincom-l32",
+        "analysis": {"planar_features": [{"id": "PF-1"}]},
+        "plan": {"stock": {"nonrotational_region_z_mm": [-4.5, -1.05]}},
+    }
+    rotational = {"profiles": [{"id": "RP-OUTER-1", "side": "outer"}]}
+
+    result = summarize_operation_catalog(payload, job, rotational)
+
+    assert [item["id"] for item in result["definitions"]] == [
+        "live_tool_contour_roughing", "turn_od_roughing",
+    ]
+    live = result["definitions"][0]
+    assert live["valid_geometry_refs"][0]["id"] == "REGION-NONROTATIONAL-OUTER-1"
+    assert "surface_3d" in result["unavailable_definition_ids"]
 
 
 def test_cnc_api_client_surfaces_bounded_api_error() -> None:
@@ -167,3 +216,21 @@ def test_summarize_tool_inventory_keeps_measurement_and_capability_evidence() ->
     assert result["tools"][0]["measured_nose_radius_mm"] == 0.2
     assert result["tools"][0]["capability_verification_reference"] == "inspection-42"
     assert "notes" not in result["tools"][0]
+
+
+def test_cnc_evidence_contract_forbids_workspace_artifact_search() -> None:
+    result = attach_cnc_evidence_contract(
+        {"job_id": "job-1", "status": "no_candidate_passed"},
+        follow_up_tools=["inspect_l32_operation_trial_state", "observe_model"],
+    )
+
+    assert result["job_id"] == "job-1"
+    contract = result["evidence_access"]
+    assert contract["current_response_is_decision_grade"] is True
+    assert contract["backend_artifacts_are_workspace_files"] is False
+    assert contract["backend_artifacts_are_mcp_resources"] is False
+    assert "list_mcp_resources" in contract["prohibited_recovery_methods"]
+    assert "search_dot_dsh_for_job_files" in contract["prohibited_recovery_methods"]
+    assert contract["allowed_follow_up_tools"] == [
+        "inspect_l32_operation_trial_state", "observe_model",
+    ]

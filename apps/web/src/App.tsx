@@ -552,6 +552,9 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
   onNew: () => void;
   onHistory: () => void;
 }) {
+  const harnessParams = new URLSearchParams(window.location.search);
+  const embeddedInHarness = harnessParams.get("embed") === "harness";
+  const harnessFocus = harnessParams.get("focus") ?? "model";
   const streamRef = useRef<EventSource | null>(null);
   const [previewJob, setPreviewJob] = useState(initialJob);
   const [progressEvents, setProgressEvents] = useState<PlanningProgressEvent[]>([
@@ -716,6 +719,58 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
     setActiveAgentEvent(event);
   };
 
+  if (embeddedInHarness) {
+    const harnessViewMode = harnessFocus === "toolpath" || harnessFocus === "simulation"
+      ? harnessFocus === "simulation" ? "仿真" : "刀路"
+      : harnessFocus === "process" ? "工艺" : "特征";
+    const harnessToolpath = harnessFocus === "toolpath" || harnessFocus === "simulation" ? focusedToolpath : EMPTY_TOOLPATH_SEGMENTS;
+    const harnessStageLabel = harnessFocus === "simulation" ? "加工验证"
+      : harnessFocus === "toolpath" ? "刀路证据"
+        : harnessFocus === "process" ? "工艺规划"
+          : harnessFocus === "features" ? "制造特征" : "零件模型";
+    return <main className="processing-harness-evidence">
+      <section className="viewport panel processing-harness-viewport">
+        {previewJob.model_url
+          ? <ModelViewer
+              modelUrl={apiUrl(previewJob.model_url)}
+              features={harnessFocus === "model" ? [] : previewFeatures}
+              selectedFeatureIds={harnessFocus === "features" ? focusedFeatureIds : []}
+              onSelectFeature={IGNORE_FEATURE_SELECTION}
+              viewMode={harnessViewMode}
+              toolpathSegments={harnessToolpath}
+              simulation={harnessFocus === "simulation" ? previewCam?.simulation ?? null : null}
+              activeOperationId={harnessToolpath.length ? focusedOperationId : undefined}
+              animateToolpath={harnessFocus === "simulation" && harnessToolpath.length > 0}
+              showFeatureAnnotations={harnessFocus === "features" && focusedFeatureIds.length === 1}
+              showFeatureSummary={false}
+              compositionInsetLeftRatio={0}
+            />
+          : <div className="processing-model-placeholder"><LoaderCircle className="spin" size={28} /><strong>正在构建三维预览</strong><small>STEP 拓扑解析完成后自动显示模型</small></div>}
+
+        <header className="harness-canvas-status processing">
+          <div className="harness-live-indicator live"><i />智能体实时同步</div>
+          <div className="harness-canvas-title"><small>{harnessStageLabel}</small><strong>{focusedOperationId ? `${focusedOperationId} · ${focusedOperation?.name ?? "当前工序"}` : activeAgentEvent?.title ?? activeAgentEvent?.message ?? "正在理解零件"}</strong></div>
+          <div className="harness-release-state review"><span>{Math.round(latestProgress?.percent ?? 6)}% · {previewFeatures.length} 项特征</span><strong>{plannedOperations.length ? `${plannedOperations.length} 道工序草案` : "等待工艺草案"}</strong></div>
+        </header>
+
+        <aside className="processing-harness-activity">
+          <span className="agent-scene-live-dot" />
+          <div><small>{activeAgentEvent?.subgraph ?? activeAgentEvent?.stage ?? "intake"}</small><strong>{activeAgentEvent?.title ?? activeAgentEvent?.message ?? "正在接收制造任务"}</strong><p>{activeAgentEvent?.summary ?? activeAgentEvent?.detail ?? "模型和制造证据会随着 CNC 工具调用自动更新。"}</p></div>
+        </aside>
+
+        {(harnessFocus === "toolpath" || harnessFocus === "simulation") && <aside className={`processing-harness-evidence-state ${harnessToolpath.length || previewCam?.simulation ? "ready" : "waiting"}`}>
+          {harnessToolpath.length || previewCam?.simulation ? <Check size={16} /> : <LoaderCircle className="spin" size={16} />}
+          <div><strong>{harnessToolpath.length || previewCam?.simulation ? "已有可视化证据" : "等待真实加工证据"}</strong><span>{harnessToolpath.length ? `${harnessToolpath.length} 段刀路已载入` : "当前只显示零件模型，不代表仿真结果"}</span></div>
+        </aside>}
+
+        <footer className="processing-harness-metrics">
+          <span><b>{previewFeatures.length}</b>制造特征</span><span><b>{plannedOperations.length}</b>候选工序</span><span><b>{focusedToolpath.length}</b>刀路段</span><span><b>{previewCam?.simulation.operation_snapshots?.length ?? 0}</b>仿真记录</span>
+        </footer>
+        {error && <div className="planning-workbench-error floating"><AlertTriangle size={15} /><span>{error}</span></div>}
+      </section>
+    </main>;
+  }
+
   return <main className="workbench processing-workbench agent-studio">
     <header className="topbar app-header">
       <div className="brand compact"><span>{APP_LOGO_TEXT}</span>{APP_NAME}</div>
@@ -766,12 +821,22 @@ function ProcessingWorkbench({ initialJob, onCompleted, onNew, onHistory }: {
 }
 
 function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initialJob: Job; onNew: () => void; onHistory: () => void; readOnly?: boolean }) {
+  const harnessParams = new URLSearchParams(window.location.search);
+  const embeddedInHarness = harnessParams.get("embed") === "harness";
+  const harnessFocus = harnessParams.get("focus") ?? "model";
+  const initialHarnessMode = harnessFocus === "features" || harnessFocus === "model"
+    ? "特征"
+    : harnessFocus === "toolpath"
+      ? "刀路"
+      : harnessFocus === "simulation"
+        ? "仿真"
+        : "工艺";
   const [job, setJob] = useState(initialJob);
   const jobSnapshotRef = useRef(JSON.stringify(initialJob));
   const operationPopoverRef = useRef<HTMLElement>(null);
   const [selectedOperation, setSelectedOperation] = useState<Operation | null>(null);
   const [selectedFeatureIds, setSelectedFeatureIds] = useState<string[]>([]);
-  const [activeMode, setActiveMode] = useState("工艺");
+  const [activeMode, setActiveMode] = useState(embeddedInHarness ? initialHarnessMode : "工艺");
   const [generatingCam, setGeneratingCam] = useState(false);
   const [loadingCam, setLoadingCam] = useState(readOnly);
   const [camResult, setCamResult] = useState<CamResult | null>(null);
@@ -804,7 +869,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [operationBusy, setOperationBusy] = useState(false);
   const [solidBusy, setSolidBusy] = useState(false);
   const [parameterEdits, setParameterEdits] = useState<Record<string, Record<string, string | number | boolean>>>({});
-  const [leftWorkbenchPanel, setLeftWorkbenchPanel] = useState<"features" | "process" | "agent" | null>("agent");
+  const [leftWorkbenchPanel, setLeftWorkbenchPanel] = useState<"features" | "process" | "agent" | null>(embeddedInHarness ? null : "agent");
   const [agentWorkspace, setAgentWorkspace] = useState<AgentWorkspace | null>(null);
   const [selectedAgentArtifact, setSelectedAgentArtifact] = useState<AgentArtifact | null>(null);
   const [perceptionPending, setPerceptionPending] = useState(false);
@@ -874,7 +939,6 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   useEffect(() => {
     let cancelled = false;
     let refreshing = false;
-    const embeddedInHarness = new URLSearchParams(window.location.search).get("embed") === "harness";
     const refreshJob = async () => {
       if (refreshing) return;
       refreshing = true;
@@ -919,7 +983,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       window.removeEventListener("focus", refreshJob);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
-  }, [initialJob.id]);
+  }, [embeddedInHarness, initialJob.id]);
 
   const refreshAgentWorkspace = useCallback(async () => {
     try {
@@ -991,7 +1055,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }, [refreshAgentWorkspace]);
 
   useEffect(() => {
-    if (agentWorkspace?.orchestration?.autonomous_process?.status !== "running") return;
+    if (!embeddedInHarness && agentWorkspace?.orchestration?.autonomous_process?.status !== "running") return;
     let cancelled = false;
     const refreshAutonomous = async () => {
       await refreshAgentWorkspace();
@@ -1009,7 +1073,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
       cancelled = true;
       window.clearInterval(handle);
     };
-  }, [agentWorkspace?.orchestration?.autonomous_process?.status, initialJob.id, refreshAgentWorkspace]);
+  }, [agentWorkspace?.orchestration?.autonomous_process?.status, embeddedInHarness, initialJob.id, refreshAgentWorkspace]);
 
   const operations = useMemo(
     () => job.plan?.setups.flatMap((setup) => setup.operations) ?? [],
@@ -2120,6 +2184,53 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     if (mode === "仿真" && isL32 && selectedOperation) void previewL32Operation(selectedOperation);
   };
 
+  const harnessAcceptedOperationIds = new Set([
+    ...(agentWorkspace?.orchestration?.rolling_loop?.accepted_operation_ids ?? []),
+    ...(agentWorkspace?.orchestration?.independent_operation_trials?.accepted_operation_ids ?? []),
+    ...(agentWorkspace?.orchestration?.autonomous_process?.operations ?? [])
+      .filter((operation) => operation.can_accept || operation.decision === "accept" || operation.trial_status === "accepted")
+      .flatMap((operation) => operation.operation_id ? [operation.operation_id] : []),
+  ]);
+  const harnessBlockedOperationIds = new Set([
+    ...(agentWorkspace?.orchestration?.autonomous_process?.operations ?? [])
+      .filter((operation) => operation.decision === "blocked" || operation.decision === "reject" || operation.trial_status === "blocked")
+      .flatMap((operation) => operation.operation_id ? [operation.operation_id] : []),
+    ...(agentWorkspace?.orchestration?.autonomous_process?.blockers ?? [])
+      .flatMap((blocker) => blocker.operation_id ? [blocker.operation_id] : []),
+  ]);
+  const harnessReportedOperationId = agentWorkspace?.orchestration?.autonomous_process?.current_operation_id
+    ?? agentWorkspace?.orchestration?.rolling_loop?.current_operation?.operation_id
+    ?? agentWorkspace?.orchestration?.current_operation_id
+    ?? activeAgentEvent?.viewer?.operation_id
+    ?? null;
+  const harnessAgentIsRunning = agentWorkspace?.orchestration?.autonomous_process?.status === "running"
+    || activeAgentEvent?.status === "running";
+  const harnessCurrentOperationId = harnessAgentIsRunning ? harnessReportedOperationId : null;
+  const harnessOperationState = (operation: Operation) => {
+    if (harnessCurrentOperationId === operation.id) return "running";
+    if (harnessBlockedOperationIds.has(operation.id) || operation.generation_state === "failed") return "blocked";
+    if (harnessAcceptedOperationIds.has(operation.id) || simulatedOperationIds.has(operation.id)) return "accepted";
+    return "pending";
+  };
+
+  useEffect(() => {
+    if (!embeddedInHarness || operations.length === 0) return;
+    const accepted = operations.filter((operation) => harnessAcceptedOperationIds.has(operation.id) || simulatedOperationIds.has(operation.id));
+    const preferredId = harnessCurrentOperationId
+      ?? (harnessFocus === "simulation" || harnessFocus === "toolpath" ? accepted.at(-1)?.id : null)
+      ?? selectedOperation?.id
+      ?? operations[0].id;
+    const preferred = operations.find((operation) => operation.id === preferredId) ?? operations[0];
+    if (selectedOperation?.id !== preferred.id) {
+      setSelectedOperation(preferred);
+      setSelectedFeatureIds(preferred.feature_ids);
+      setPlaybackResetToken((current) => current + 1);
+    }
+    setShowOperationViewSwitch(false);
+    setStockSelected(false);
+    setActiveMode(initialHarnessMode);
+  }, [agentWorkspace?.active_event_id, embeddedInHarness, harnessFocus, harnessCurrentOperationId, initialHarnessMode, operations, selectedOperation?.id, simulatedOperationIds]);
+
   const chooseFeature = (id: string) => {
     setStockSelected(false);
     setActiveMode("特征");
@@ -2722,8 +2833,8 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   }
 
   return (
-    <main className="workbench">
-      <header className="topbar app-header">
+    <main className={`workbench ${embeddedInHarness ? "harness-evidence-workbench" : ""}`}>
+      {!embeddedInHarness && <header className="topbar app-header">
         <div className="brand compact"><span>{APP_LOGO_TEXT}</span>{APP_NAME}</div>
         <div className="project-title"><small>当前零件</small><strong>{job.filename}</strong></div>
         <div className="top-meta">
@@ -2739,7 +2850,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
           <button className="header-command-button" onClick={onHistory}><History size={14} />历史记录</button>
           <div className="admin-identity" title="当前用户"><UserRound size={14} /><strong>admin</strong><ChevronDown size={13} /></div>
         </div>
-      </header>
+      </header>}
       {showProcessDesigner && catalogs && <ProcessDesigner
         job={job}
         catalogs={catalogs}
@@ -2832,12 +2943,12 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
         </section>
       </div>}
 
-      <section className={`workspace workbench-workspace ${leftWorkbenchPanel ? "left-panel-open" : ""} ${leftWorkbenchPanel === "agent" ? "agent-review-mode" : ""}`}>
-        <nav className="workbench-panel-switcher" aria-label="工作区面板">
+      <section className={`workspace workbench-workspace ${embeddedInHarness ? "harness-evidence-canvas" : ""} ${leftWorkbenchPanel ? "left-panel-open" : ""} ${leftWorkbenchPanel === "agent" ? "agent-review-mode" : ""}`}>
+        {!embeddedInHarness && <nav className="workbench-panel-switcher" aria-label="工作区面板">
           <button type="button" className={leftWorkbenchPanel === "features" ? "active" : ""} aria-pressed={leftWorkbenchPanel === "features"} onClick={() => { const opening = leftWorkbenchPanel !== "features"; setLeftWorkbenchPanel(opening ? "features" : null); setShowOperationViewSwitch(false); setShowOperationDetails(false); setEditingOperationDetails(false); setStockSelected(false); if (opening) { setActiveMode("特征"); setIsolatedFeatureId(null); setSelectedFeatureIds([]); } }}><CircleDot size={15} /><span>制造特征</span></button>
           <button type="button" className={leftWorkbenchPanel === "process" ? "active" : ""} aria-pressed={leftWorkbenchPanel === "process"} onClick={() => { const closing = leftWorkbenchPanel === "process"; setLeftWorkbenchPanel(closing ? null : "process"); setShowOperationDetails(false); setEditingOperationDetails(false); if (closing) { setShowOperationViewSwitch(false); setStockSelected(false); } }}><Layers3 size={15} /><span>工艺路线</span></button>
           <button type="button" className={leftWorkbenchPanel === "agent" ? "active" : ""} aria-pressed={leftWorkbenchPanel === "agent"} onClick={() => { const closing = leftWorkbenchPanel === "agent"; setLeftWorkbenchPanel(closing ? null : "agent"); setShowOperationDetails(false); setEditingOperationDetails(false); }}><Bot size={15} /><span>AI 智能体</span></button>
-        </nav>
+        </nav>}
 
         {leftWorkbenchPanel && <aside className="workbench-sidebar floating-workbench-panel">
           {leftWorkbenchPanel === "features" && <section className="feature-tree panel accordion-panel manufacturing-feature-panel expanded">
@@ -3033,6 +3144,73 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             compositionInsetRightRatio={leftWorkbenchPanel ? 0.04 : 0}
             showFeatureAnnotations={leftWorkbenchPanel === "features" && isolatedFeatureId !== null}
           />}
+          {embeddedInHarness && <>
+            <header className="harness-canvas-status">
+              <div className={`harness-live-indicator ${job.status === "completed" ? "complete" : "live"}`}><i />{job.status === "completed" ? "规划记录" : "智能体实时同步"}</div>
+              <div className="harness-canvas-title">
+                <small>{harnessFocus === "simulation" ? "加工验证" : harnessFocus === "toolpath" ? "运动证据" : harnessFocus === "process" ? "工艺路线" : harnessFocus === "features" ? "制造语义" : "零件模型"}</small>
+                <strong>{selectedOperation ? `${selectedOperation.id} · ${selectedOperation.name}` : job.filename}</strong>
+              </div>
+              <div className={`harness-release-state ${coverage?.production_ready ? "ready" : coverage?.status ?? "review"}`}>
+                <span>{coverage ? `${coverage.covered_count}/${coverage.target_count} 特征覆盖` : `${operations.length} 道工序`}</span>
+                <strong>{coverage?.production_ready ? "可进入工程复核" : coverage?.status === "complete" ? "覆盖完成 · 待放行" : "草案 · 尚未完成"}</strong>
+              </div>
+            </header>
+
+            {harnessFocus === "process" && <section className="harness-route-result">
+              <header><div><small>FINAL PROCESS ROUTE</small><strong>智能体工艺路线</strong></div><span>{job.plan.setups.length} 次装夹 · {operations.length} 道工序</span></header>
+              <div className="harness-route-list">
+                {job.plan.setups.map((setup, setupIndex) => <section key={setup.id}>
+                  <div className="harness-setup-label"><b>装夹 {setupIndex + 1}</b><span>{setup.name}</span><small>{setup.machine_name ?? setup.fixture}</small></div>
+                  {setup.operations.map((operation) => {
+                    const state = harnessOperationState(operation);
+                    return <button type="button" key={operation.id} className={`${state} ${selectedOperation?.id === operation.id ? "selected" : ""}`} onClick={() => {
+                      setSelectedOperation(operation);
+                      setSelectedFeatureIds(operation.feature_ids);
+                      setActiveMode("工艺");
+                    }}>
+                      <i />
+                      <span><b>{operation.id}</b><strong>{operation.name}</strong><small>{operation.tool.name}</small></span>
+                      <em>{state === "accepted" ? "已验证" : state === "running" ? "验证中" : state === "blocked" ? "受阻" : "待验证"}</em>
+                    </button>;
+                  })}
+                </section>)}
+              </div>
+              <footer className={coverage?.status ?? "review"}>
+                <ShieldCheck size={16} />
+                <div><strong>{coverage?.production_ready ? "全部制造目标已有证据" : `仍有 ${coverage?.unresolved_count ?? 0} 项制造目标待解决`}</strong><span>{coverage?.issues?.[0] ?? coverage?.capability_gaps?.[0] ?? "每道工序的刀路、仿真和审核结果会持续归档。"}</span></div>
+              </footer>
+            </section>}
+
+            {(harnessFocus === "toolpath" || harnessFocus === "simulation") && <aside className="harness-evidence-card">
+              <small>{harnessFocus === "simulation" ? "SIMULATION EVIDENCE" : "TOOLPATH EVIDENCE"}</small>
+              <strong>{harnessFocus === "simulation" ? "逐工序加工验证" : "刀路运动轨迹"}</strong>
+              <p>{simulationGenerating
+                ? "正在求解刀路、材料去除和安全检查。"
+                : harnessFocus === "simulation" && !visibleSimulation && !visibleTurningStage && visibleMaterialSnapshots.urls.length === 0 && visibleToolpathSegments.length === 0
+                  ? "当前工序还没有可回放的仿真证据，画布不会用静态模型冒充加工结果。"
+                  : harnessFocus === "simulation"
+                    ? `${visibleMaterialSnapshots.stages.length || visibleToolpathSegments.length} 条可视化证据已载入，可使用底部播放控件回放。`
+                    : `${visibleToolpathSegments.length} 段运动轨迹已载入。`}</p>
+              {activeSimulationSummary && <div>{activeSimulationSummary.metrics.slice(0, 2).map((metric) => <span key={metric.label}>{metric.label} <b>{metric.value}</b></span>)}</div>}
+            </aside>}
+
+            <nav className="harness-operation-dock" aria-label="逐工序验证路线">
+              <div className="harness-dock-heading"><span>工序验证链</span><strong>{harnessAcceptedOperationIds.size}/{operations.length}</strong></div>
+              <div className="harness-dock-operations">
+                {operations.map((operation) => {
+                  const state = harnessOperationState(operation);
+                  return <button type="button" key={operation.id} className={`${state} ${selectedOperation?.id === operation.id ? "selected" : ""}`} title={`${operation.id} ${operation.name}`} onClick={() => {
+                    setSelectedOperation(operation);
+                    setSelectedFeatureIds(operation.feature_ids);
+                    setPlaybackResetToken((current) => current + 1);
+                    setActiveMode(initialHarnessMode);
+                    if (initialHarnessMode === "仿真" && isL32) void previewL32Operation(operation);
+                  }}><i /><b>{operation.id}</b><span>{operation.name}</span></button>;
+                })}
+              </div>
+            </nav>
+          </>}
           {leftWorkbenchPanel === "agent" && selectedAgentArtifact && <AgentArtifactViewer artifact={selectedAgentArtifact} apiUrl={apiUrl} onClose={() => setSelectedAgentArtifact(null)} />}
           {leftWorkbenchPanel === "agent" && isL32 && l32AgentReview?.status === "waiting_human" && !selectedAgentArtifact && <L32AgentReviewPanel context={l32AgentReview} pending={l32AgentReviewPending} error={l32AgentReviewError} onDecision={(profileId, state) => void decideL32Profile(profileId, state)} />}
           {leftWorkbenchPanel === "agent" && l32AgentReview?.status !== "waiting_human" && <>
@@ -3071,7 +3249,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             </div>
             <footer><i />{activeMode === "工艺" ? selectedFeatures.length ? `真实特征区域 · ${selectedFeatures.length} 项` : "根据工序参数推算加工区域" : activeMode === "刀路" ? loadingCam ? "正在加载刀路数据" : `${visibleToolpathSegments.length} 段运动轨迹` : "材料去除过程与安全校验"}</footer>
           </section>}
-          <nav className="inspection-rail" aria-label="工程检查与工艺工具">
+          {!embeddedInHarness && <nav className="inspection-rail" aria-label="工程检查与工艺工具">
             <button className={`inspection-card tool ${showResourceLibrary ? "active" : ""}`} onClick={() => { setInspectionPanel(null); setDeviceInfoId(null); setShowResourceLibrary(true); }} title="打开工序库">
               <Library size={19} />
               <strong>工序库</strong>
@@ -3087,7 +3265,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               <strong>刀具库</strong>
               <small>现场刀具</small>
             </button>}
-          </nav>
+          </nav>}
           {inspectionPanel === "tools" && <section ref={inspectionPanelRef} className="tool-library-container"><ToolLibraryPanel machineInstanceId={job.machine_instance_id} catalogTools={catalogs?.tools ?? []} apiUrl={apiUrl} onClose={() => setInspectionPanel(null)} readOnly={readOnly} /></section>}
           {!readOnly && activeMode === "刀路" && !isL32 && <button className="viewport-generate-button" disabled={automationBlocked || generatingCam || applyingRemediation} onClick={generateCam} title={automationBlocked ? "当前工艺不完整，暂时无法生成刀路" : undefined}>
             {generatingCam || applyingRemediation ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}

@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import main
@@ -11,7 +12,10 @@ from app.l32_configuration import snapshot_l32_instance
 from app.machine_models import MachineInstance
 from app.models import GeometryAnalysis, JobResponse, Operation, PrismaticFeature
 from app.planner import build_process_plan
-from app.rotational_features import RotationalProfile, RotationalProfilePoint, infer_rotational_features
+from app.rotational_features import (
+    AIProvisionalProfileDecision, RotationalProfile, RotationalProfilePoint,
+    infer_rotational_features,
+)
 
 
 client = TestClient(main.app)
@@ -261,8 +265,9 @@ def test_default_l32_instance_enables_supported_backside_operations(
     assert all(operation.enabled for operation in back_operations)
 
 
+@pytest.mark.parametrize("profile_state", ["accepted", "ai_provisional"])
 def test_material_snapshots_support_fully_rotational_plan_and_skip_backside_stages(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, profile_state,
 ) -> None:
     monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
     job_id = "e" * 32
@@ -270,8 +275,26 @@ def test_material_snapshots_support_fully_rotational_plan_and_skip_backside_stag
     directory.mkdir()
     analysis = _regional_analysis()
     rotational = infer_rotational_features(analysis)
+    source_profile = next(item for item in rotational.profiles if item.side == "outer")
+    source_profile.review_state = profile_state
+    if profile_state == "ai_provisional":
+        z_values = [point.z for point in source_profile.points]
+        radii = [point.radius for point in source_profile.points]
+        source_profile.provisional_decision = AIProvisionalProfileDecision(
+            scope="partial", z_min_mm=min(z_values), z_max_mm=max(z_values),
+            diameter_min_mm=2 * min(radii), diameter_max_mm=2 * max(radii),
+            confidence=0.8, rationale="test DRAFT playback",
+            evidence_refs=["test:exact-section"],
+        )
     plan = build_process_plan(analysis, "S45C", "Citizen Cincom L32")
     plan.stock.pop("nonrotational_region_z_mm", None)
+    # Harness drafts created before the setup-context fix may have omitted the
+    # side/channel on the first operations. Playback must infer them from the setup.
+    for setup in plan.setups:
+        for operation in setup.operations:
+            operation.workpiece_side = None
+            operation.channel_id = None
+            operation.spindle_id = None
     job = JobResponse(
         id=job_id,
         status="completed",
@@ -311,6 +334,8 @@ def test_material_snapshots_support_fully_rotational_plan_and_skip_backside_stag
     response = client.get(f"/api/v1/jobs/{job_id}/l32/material-snapshots")
 
     assert response.status_code == 200, response.text
+    assert response.json()["playback_authorization"]["state"] == profile_state
+    assert response.json()["production_ready"] is False
     operation_ids = [item["operation_id"] for item in response.json()["operations"]]
     assert "OP20" in operation_ids
     assert not {"OP50", "OP55-BACK", "OP58-BACK"} & set(operation_ids)

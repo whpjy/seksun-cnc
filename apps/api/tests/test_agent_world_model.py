@@ -276,3 +276,25 @@ def test_workspace_exposes_plan_blocker_repair_candidates(tmp_path: Path) -> Non
     assert workspace["orchestration"]["rolling_loop"]["status"] == "plan_blocked"
     assert workspace["orchestration"]["repair"]["diagnosis"]["defect"] == "missing_back_face_process"
     assert workspace["orchestration"]["repair"]["candidates"][0]["capability_available"] is True
+
+
+def test_workspace_exposes_independent_harness_operation_evidence(tmp_path: Path) -> None:
+    world = sample_world()
+    (tmp_path / "agent-world-model.json").write_text(
+        world.model_dump_json(indent=2), encoding="utf-8",
+    )
+    (tmp_path / "harness-l32-operation-state.json").write_text(json.dumps({
+        "schema_version": "1.1.0",
+        "accepted": [
+            {"operation_id": "OP10"},
+            {"operation_id": "OP20"},
+        ],
+    }), encoding="utf-8")
+
+    workspace = build_agent_workspace(
+        job_id=world.job_id, job_status="completed", directory=tmp_path, events=[],
+    )
+
+    independent = workspace["orchestration"]["independent_operation_trials"]
+    assert independent["accepted_operation_ids"] == ["OP10", "OP20"]
+    assert independent["accepted_count"] == 2

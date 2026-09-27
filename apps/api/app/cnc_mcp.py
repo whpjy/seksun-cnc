@@ -145,7 +145,11 @@ def summarize_job(job: dict[str, Any]) -> dict[str, Any]:
         {
             "id": setup.get("id"),
             "name": setup.get("name"),
-            "workpiece_side": setup.get("workpiece_side"),
+            "workpiece_side": (
+                setup.get("workpiece_side")
+                or ("back" if setup.get("id") == "SETUP-L32-SUB" else "front")
+                if job.get("device_id") == "citizen-cincom-l32" else None
+            ),
             "operation_count": len(setup.get("operations") or []),
         }
         for setup in plan.get("setups", [])
@@ -210,7 +214,7 @@ def summarize_geometry(job: dict[str, Any], rotational: dict[str, Any] | None) -
             for item in analysis.get(name, [])[:100]
         ]
         for name in (
-            "cylindrical_features", "prismatic_features",
+            "planar_features", "cylindrical_features", "prismatic_features",
             "planar_machining_features", "internal_profile_features",
         )
     }
@@ -229,6 +233,18 @@ def summarize_geometry(job: dict[str, Any], rotational: dict[str, Any] | None) -
             "radius_range_mm": [min(radius_values), max(radius_values)] if radius_values else None,
             "warnings": (profile.get("warnings") or [])[:10],
         })
+    derived_regions = []
+    nonrotational_region = ((job.get("plan") or {}).get("stock") or {}).get(
+        "nonrotational_region_z_mm"
+    )
+    if isinstance(nonrotational_region, list) and len(nonrotational_region) == 2:
+        derived_regions.append({
+            "id": "REGION-NONROTATIONAL-OUTER-1",
+            "kind": "nonrotational_outer_region",
+            "geometry_type": "solid",
+            "z_range_mm": sorted(float(value) for value in nonrotational_region),
+            "purpose": "live_tool_contour_roughing_or_finishing",
+        })
     return {
         "job_id": job.get("id"),
         "topology": analysis.get("topology") or {},
@@ -236,7 +252,113 @@ def summarize_geometry(job: dict[str, Any], rotational: dict[str, Any] | None) -
         "feature_counts": {key: len(value) for key, value in feature_groups.items()},
         "features": feature_groups,
         "rotational_profiles": profiles,
+        "derived_regions": derived_regions,
         "evidence_policy": "结构化几何是确定性证据；视觉结论必须通过 observe_model 交叉检查。",
+    }
+
+
+def collect_geometry_references(
+    job: dict[str, Any], rotational: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Build the exact geometry vocabulary accepted by operation creation."""
+    analysis = job.get("analysis") or {}
+    references: dict[str, dict[str, Any]] = {}
+
+    def add(identifier: Any, geometry_type: str, kind: Any = None, state: Any = None) -> None:
+        if identifier:
+            references[str(identifier)] = {
+                "id": str(identifier), "geometry_type": geometry_type,
+                "kind": kind, "review_state": state,
+            }
+
+    for item in analysis.get("planar_features") or []:
+        add(item.get("id"), "planar_face", "planar_face", item.get("review_state"))
+    for item in analysis.get("cylindrical_features") or []:
+        kind = item.get("kind")
+        add(item.get("id"), "cylindrical_hole" if kind == "hole" else "cylindrical_face", kind, item.get("review_state"))
+    for item in analysis.get("prismatic_features") or []:
+        add(item.get("id"), f"prismatic_{item.get('kind')}", item.get("kind"), item.get("review_state"))
+    for item in analysis.get("planar_machining_features") or []:
+        add(item.get("id"), "planar_surface", item.get("kind"), item.get("review_state"))
+    for item in analysis.get("internal_profile_features") or []:
+        add(item.get("id"), "internal_profile", item.get("kind"), item.get("review_state"))
+    for item in (rotational or {}).get("profiles") or []:
+        add(
+            item.get("id"),
+            "inner_rotational_profile" if item.get("side") == "inner" else "outer_rotational_profile",
+            item.get("side"), item.get("review_state"),
+        )
+    rotational_types = {
+        "external_groove_candidate": "od_groove",
+        "internal_groove_candidate": "id_groove",
+        "cutoff_boundary": "cutoff_plane",
+        "inner_bore": "inner_rotational_profile",
+        "inner_taper": "inner_rotational_profile",
+    }
+    for item in (rotational or {}).get("features") or []:
+        kind = item.get("kind")
+        geometry_type = rotational_types.get(kind, "outer_rotational_profile")
+        if kind == "thread_form_candidate":
+            geometry_type = "internal_thread" if item.get("thread_side") == "internal" else "external_thread"
+        add(item.get("id"), geometry_type, kind, item.get("review_state"))
+
+    stock = ((job.get("plan") or {}).get("stock") or {})
+    region = stock.get("nonrotational_region_z_mm")
+    if isinstance(region, list) and len(region) == 2:
+        references["REGION-NONROTATIONAL-OUTER-1"] = {
+            "id": "REGION-NONROTATIONAL-OUTER-1",
+            "geometry_type": "solid",
+            "kind": "nonrotational_outer_region",
+            "review_state": "derived_from_exact_step_and_stock_partition",
+            "z_range_mm": sorted(float(value) for value in region),
+        }
+    return list(references.values())
+
+
+def summarize_operation_catalog(
+    payload: dict[str, Any], job: dict[str, Any], rotational: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return only operations executable by the current agent loop and their legal geometry IDs."""
+    l32 = job.get("device_id") == "citizen-cincom-l32"
+    l32_nonrotational = {
+        "pocket_roughing", "pocket_finishing",
+        "live_tool_contour_roughing", "live_tool_contour_finishing",
+    }
+    references = collect_geometry_references(job, rotational)
+    definitions = []
+    unavailable = []
+    for item in payload.get("definitions") or []:
+        if not isinstance(item, dict):
+            continue
+        engine = item.get("engine") or {}
+        agent_supported = (
+            engine.get("provider") == "turning" or item.get("id") in l32_nonrotational
+        ) if l32 else bool(item.get("manual_enabled"))
+        accepts = set((item.get("geometry") or {}).get("accepts") or [])
+        compatible = [reference for reference in references if reference["geometry_type"] in accepts]
+        minimum = int((item.get("geometry") or {}).get("minimum_selection") or 1)
+        if not agent_supported or len(compatible) < minimum:
+            unavailable.append(item.get("id"))
+            continue
+        if item.get("id") in {"live_tool_contour_roughing", "live_tool_contour_finishing"}:
+            compatible.sort(key=lambda value: value["id"] != "REGION-NONROTATIONAL-OUTER-1")
+        definitions.append({
+            "id": item.get("id"), "name": item.get("name"),
+            "category": item.get("category"), "maturity": item.get("maturity"),
+            "geometry": item.get("geometry"), "tool": item.get("tool"),
+            "parameters": item.get("parameters"), "engine": engine,
+            "valid_geometry_refs": compatible,
+            "selection_rule": "feature_ids must be copied exactly from valid_geometry_refs[].id",
+        })
+    return {
+        "schema_version": payload.get("schema_version"),
+        "job_id": job.get("id"),
+        "definitions": definitions,
+        "unavailable_definition_ids": unavailable,
+        "catalog_rule": (
+            "Only definitions[] may be passed to add_process_operation. Never invent a geometry ID, "
+            "and never call an unavailable definition."
+        ),
     }
 
 
@@ -311,6 +433,41 @@ def summarize_tool_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def attach_cnc_evidence_contract(
+    payload: dict[str, Any],
+    *,
+    follow_up_tools: list[str],
+) -> dict[str, Any]:
+    """Tell the agent how CNC evidence may be consumed and recovered.
+
+    Artifact filenames written by the API are backend implementation details.  They
+    are deliberately not mounted in the Harness workspace and are not MCP
+    resources.  Making this contract part of every evidence-bearing result keeps
+    the model from wasting turns guessing local ``.dsh`` or job artifact paths.
+    """
+    result = dict(payload)
+    result["evidence_access"] = {
+        "authoritative_source": "cnc_mcp_tool_results",
+        "current_response_is_decision_grade": True,
+        "backend_artifacts_are_workspace_files": False,
+        "backend_artifacts_are_mcp_resources": False,
+        "local_file_search_required": False,
+        "prohibited_recovery_methods": [
+            "list_mcp_resources",
+            "read_mcp_resource",
+            "search_workspace_for_job_files",
+            "search_dot_dsh_for_job_files",
+            "read_agent_l32_json_artifacts",
+        ],
+        "allowed_follow_up_tools": follow_up_tools,
+        "recovery_rule": (
+            "If more evidence is needed, call one of allowed_follow_up_tools with the same job_id. "
+            "Never search the Harness filesystem or MCP resources for CNC job JSON."
+        ),
+    }
+    return result
+
+
 mcp = FastMCP(
     "Seksun CNC",
     instructions=(
@@ -343,6 +500,12 @@ mcp = FastMCP(
         "若无候选通过，则修改候选、删除工序或补充观察，不能继续新增工序。"
         "没有任务编号时先 open_job_context，再按需 "
         "inspect_geometry/observe_model。inspect_l32_operation_trial_state 可恢复逐道规划进度。"
+        "CNC 任务证据只存在于 CNC API 和本 MCP 工具返回值中；后端产物文件名只是内部实现引用，"
+        "不是 Harness 工作区文件，也不是 MCP resource。严禁为读取 CNC 证据调用 list_mcp_resources、"
+        "read_mcp_resource，或在工作区、.dsh、jobs 目录中搜索 agent-l32*.json。"
+        "若当前返回值不足，只能携带相同 job_id 调用 inspect_l32_operation_trial_state、"
+        "inspect_job_and_geometry、observe_model 或当前结果 evidence_access.allowed_follow_up_tools 中列出的 CNC 工具。"
+        "Never search local files or MCP resources for CNC job evidence. "
         "旧的完整草案可使用 advance_l32_operation 逐道审核，"
         "新草案全部逐道接受后调用 finalize_harness_process_plan 检查覆盖率和整件连续仿真。"
         "返回 blocked 或 plan_blocked 后必须停止，并调用 inspect_l32_repair_options。"
@@ -417,23 +580,24 @@ def initialize_process_draft(job_id: str = "") -> dict[str, Any]:
 
 
 @mcp.tool()
-def inspect_operation_catalog() -> dict[str, Any]:
-    """读取可供 Harness 选择的工序定义、几何约束、默认刀具和参数边界。"""
-    payload = _client().json("GET", "/api/v1/operation-library")
+def inspect_operation_catalog(job_id: str = "") -> dict[str, Any]:
+    """读取当前任务真正可执行的工序，以及每种工序可直接复制的合法几何 ID。"""
+    resolved, _ = _resolve_job_id(job_id)
+    api = _client()
+    payload = api.json("GET", "/api/v1/operation-library")
     if not isinstance(payload, dict):
         raise CncApiError("工序库响应格式无效")
-    definitions = []
-    for item in payload.get("definitions", []):
-        if not isinstance(item, dict):
-            continue
-        definitions.append({
-            "id": item.get("id"), "name": item.get("name"),
-            "category": item.get("category"), "maturity": item.get("maturity"),
-            "manual_enabled": item.get("manual_enabled"),
-            "geometry": item.get("geometry"), "tool": item.get("tool"),
-            "parameters": item.get("parameters"), "engine": item.get("engine"),
-        })
-    return {"schema_version": payload.get("schema_version"), "definitions": definitions}
+    job = api.json("GET", f"/api/v1/jobs/{resolved}")
+    if not isinstance(job, dict):
+        raise CncApiError("任务响应格式无效")
+    rotational = None
+    if job.get("device_id") == "citizen-cincom-l32":
+        try:
+            value = api.json("GET", f"/api/v1/jobs/{resolved}/files/rotational-features.json")
+            rotational = value if isinstance(value, dict) else None
+        except CncApiError:
+            rotational = None
+    return summarize_operation_catalog(payload, job, rotational)
 
 
 @mcp.tool()
@@ -454,7 +618,8 @@ def add_process_operation(
 ) -> dict[str, Any]:
     """由 Harness 向 DRAFT 增加一道候选工序；只建意图，不代表刀路或仿真通过。"""
     resolved, _ = _resolve_job_id(job_id)
-    job = _client().json("GET", f"/api/v1/jobs/{resolved}")
+    api = _client()
+    job = api.json("GET", f"/api/v1/jobs/{resolved}")
     if not isinstance(job, dict):
         raise CncApiError("Invalid job response")
     setups = (job.get("plan") or {}).get("setups") or []
@@ -468,11 +633,45 @@ def add_process_operation(
             f"Unknown setup_id {setup_id!r}. Valid setup IDs for job {resolved}: {valid}. "
             "Copy an exact setups[].id returned by initialize_process_draft or inspect_job_and_geometry."
         )
+    library = api.json("GET", "/api/v1/operation-library")
+    if not isinstance(library, dict):
+        raise CncApiError("工序库响应格式无效")
+    rotational = None
+    if job.get("device_id") == "citizen-cincom-l32":
+        try:
+            value = api.json("GET", f"/api/v1/jobs/{resolved}/files/rotational-features.json")
+            rotational = value if isinstance(value, dict) else None
+        except CncApiError:
+            rotational = None
+    catalog = summarize_operation_catalog(library, job, rotational)
+    option = next((item for item in catalog["definitions"] if item["id"] == definition_id), None)
+    if option is None:
+        available = [item["id"] for item in catalog["definitions"]]
+        raise CncApiError(
+            f"工序 {definition_id!r} 对当前任务不可执行。不要用其他参数重试该工序；"
+            f"请从 inspect_operation_catalog 返回的 definitions 中选择：{available}"
+        )
+    valid_geometry_ids = [item["id"] for item in option["valid_geometry_refs"]]
+    invalid_geometry_ids = [item for item in feature_ids if item not in valid_geometry_ids]
+    if invalid_geometry_ids:
+        raise CncApiError(
+            f"几何引用 {invalid_geometry_ids} 对工序 {definition_id} 无效。不要猜测 SOLID/BODY/FACE ID；"
+            f"只能复制以下 valid_geometry_refs：{valid_geometry_ids}"
+        )
     body: dict[str, Any] = {
         "definition_id": definition_id, "feature_ids": feature_ids,
         "parameters": parameters, "source": "recommendation",
         "rationale": rationale or ["Harness 按当前几何和制造状态逐道规划"],
     }
+    if job.get("device_id") == "citizen-cincom-l32":
+        default_context = (
+            {"channel_id": "sub", "spindle_id": "sub", "workpiece_side": "back"}
+            if setup_id == "SETUP-L32-SUB"
+            else {"channel_id": "main", "spindle_id": "main", "workpiece_side": "front"}
+        )
+        channel_id = channel_id or default_context["channel_id"]
+        spindle_id = spindle_id or default_context["spindle_id"]
+        workpiece_side = workpiece_side or default_context["workpiece_side"]
     for key, value in {
         "tool_id": tool_id, "name": name,
         "insert_after_operation_id": insert_after_operation_id,
@@ -482,7 +681,7 @@ def add_process_operation(
     }.items():
         if value:
             body[key] = value
-    payload = _client().json(
+    payload = api.json(
         "POST", f"/api/v1/jobs/{resolved}/setups/{setup_id}/operations", json=body,
     )
     if not isinstance(payload, dict):
@@ -502,7 +701,12 @@ def trial_l32_operation(operation_id: str, job_id: str = "") -> dict[str, Any]:
     )
     if not isinstance(payload, dict):
         raise CncApiError("单道 L32 工序试算响应格式无效")
-    return payload
+    return attach_cnc_evidence_contract(payload, follow_up_tools=[
+        "accept_l32_operation_trial",
+        "auto_repair_l32_operation",
+        "inspect_l32_operation_trial_state",
+        "observe_model",
+    ])
 
 
 @mcp.tool()
@@ -532,7 +736,14 @@ def inspect_l32_operation_trial_state(job_id: str = "") -> dict[str, Any]:
     )
     if not isinstance(payload, dict):
         raise CncApiError("L32 单道工序状态响应格式无效")
-    return payload
+    return attach_cnc_evidence_contract(payload, follow_up_tools=[
+        "trial_l32_operation",
+        "accept_l32_operation_trial",
+        "auto_repair_l32_operation",
+        "observe_model",
+        "add_process_operation",
+        "finalize_harness_process_plan",
+    ])
 
 
 @mcp.tool()
@@ -550,7 +761,14 @@ def evaluate_l32_operation_candidates(
     )
     if not isinstance(payload, dict):
         raise CncApiError("L32 工序修正候选试算响应格式无效")
-    return payload
+    return attach_cnc_evidence_contract(payload, follow_up_tools=[
+        "apply_l32_operation_candidate",
+        "inspect_l32_candidate_tool_requirements",
+        "inspect_l32_operation_trial_state",
+        "observe_model",
+        "evaluate_l32_operation_candidates",
+        "remove_process_operation",
+    ])
 
 
 @mcp.tool()
@@ -563,7 +781,14 @@ def auto_repair_l32_operation(operation_id: str, job_id: str = "") -> dict[str, 
     )
     if not isinstance(payload, dict):
         raise CncApiError("L32 automatic repair response is invalid")
-    return payload
+    return attach_cnc_evidence_contract(payload, follow_up_tools=[
+        "apply_l32_operation_candidate",
+        "inspect_l32_candidate_tool_requirements",
+        "inspect_l32_operation_trial_state",
+        "observe_model",
+        "evaluate_l32_operation_candidates",
+        "remove_process_operation",
+    ])
 
 
 @mcp.tool()

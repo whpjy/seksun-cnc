@@ -146,6 +146,20 @@ def build_agent_workspace(
                 "message": rolling.get("message"),
                 "production_ready": False,
             }
+        independent_state_path = directory / "harness-l32-operation-state.json"
+        if independent_state_path.is_file():
+            independent = json.loads(independent_state_path.read_text(encoding="utf-8"))
+            accepted = independent.get("accepted") or []
+            orchestration["independent_operation_trials"] = {
+                "status": "completed" if accepted else "in_progress",
+                "accepted_operation_ids": [
+                    str(item.get("operation_id"))
+                    for item in accepted
+                    if isinstance(item, dict) and item.get("operation_id")
+                ],
+                "accepted_count": len(accepted),
+                "production_ready": False,
+            }
         autonomous_path = directory / "agent-l32-autonomous-process.json"
         if autonomous_path.is_file():
             autonomous = json.loads(autonomous_path.read_text(encoding="utf-8"))
