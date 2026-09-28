@@ -10,6 +10,7 @@
 | `mcp__cnc__inspect_job_progress` | 读取模型解析、规划阶段和错误；可短暂等待 | 否 |
 | `mcp__cnc__initialize_process_draft` | 创建只有毛坯/装夹、没有任何工序的 Harness DRAFT | 确定性初始化 |
 | `mcp__cnc__inspect_operation_catalog` | 读取工序定义、几何约束、默认刀具和参数边界 | 否 |
+| `mcp__cnc__inspect_tool_catalog` | 按刀具类型和最大刃宽读取目录刀具与工程模板；不等同于实体库存 | 否 |
 | `mcp__cnc__add_process_operation` | 由 Harness 每次向草案增加一道候选工序 | 更新 DRAFT |
 | `mcp__cnc__trial_l32_operation` | 独立编译下一道 L32 工序，并从上一道已接受的真实余料状态继续仿真 | 是 |
 | `mcp__cnc__auto_repair_l32_operation` | 根据失败证据自动生成安全修复候选并在隔离沙箱中逐一试算 | 是 |
@@ -24,7 +25,7 @@
 | `mcp__cnc__open_job_context` | 绑定任务上下文；省略编号时选择最近完成的本地任务 | 否 |
 | `mcp__cnc__inspect_job` | 读取任务、覆盖率和工序清单 | 否 |
 | `mcp__cnc__inspect_geometry` | 读取制造特征和回转轮廓摘要 | 否 |
-| `mcp__cnc__inspect_machine` | 读取绑定机床快照与刀具库存 | 否 |
+| `mcp__cnc__inspect_machine` | 读取绑定机床快照与目录资源默认可用策略 | 否 |
 | `mcp__cnc__observe_model` | 把真实 STL 的四视图作为图片交给多模态模型 | 仅渲染 |
 | `mcp__cnc__inspect_validation` | 读取已有逐工序验证和阻断证据 | 否 |
 | `mcp__cnc__validate_l32_plan` | 编译当前 L32 草案并执行逐工序连续材料仿真与审核 | 是 |
@@ -34,6 +35,12 @@
 | `mcp__cnc__select_l32_repair_candidate` | 显式确认一个修复候选；只有通过确定性门禁的候选才允许修改 DRAFT 方案 | 视候选而定 |
 
 所有验证结果固定标记为 `DRAFT` 且 `production_ready=false`。仿真通过不等于完成整机碰撞、后处理器认证或生产放行。
+
+系统采用“目录资源默认可用”策略：CNC 目录与工程候选中的机床、刀具、刀柄、筒夹和装夹资源均可直接进入规划、候选试算和确定性验证。Harness 不查询库存数量，不要求实测刀具或刀位绑定，也不因缺少现场资源记录向用户提问。碰撞、过切、残料、可达性、几何歧义和整件连续材料仿真仍是独立门禁，不能因资源默认可用而跳过。
+
+任务初始化前调用 `inspect_machine` 时会直接返回默认 L32 目录模板；初始化草案后，后端自动为任务生成对应的 L32 配置快照，不需要用户执行机床实例绑定。
+
+当前制造商证据已结构化写入 `/api/v1/catalogs`：Citizen L32 样本记录主轴与动力刀转速、ER11/ER16 和模块基础能力；东芝/Tungaloy 钻削目录记录 DSM/DSM-CP Ø0.1–Ø3 mm 微钻系列；车削目录记录 JTTER/JTTEL 1.2 mm 窄槽刀系列；工具系统目录记录 ER16 夹持范围。每个新增目录项保留来源文档和页码。
 
 ## 启动
 

@@ -769,7 +769,7 @@ def build_process_plan(
     warnings = [
         *blocking_reasons,
         "碰撞预检采用刀具/刀柄圆柱包络与平口钳禁入区，结果仍需制造工程师复核。",
-        "转速与进给已按内置材料/刀具/机床参数计算，仍需结合真实刀具伸出和机床刚性复核。",
+        "转速与进给已按内置材料、刀具和机床参数计算；资源按目录默认可用。",
         *parameter_warnings,
     ]
     source_solids = int(analysis.topology.get("source_solids", 1))

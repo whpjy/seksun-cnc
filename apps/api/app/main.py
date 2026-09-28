@@ -2369,6 +2369,25 @@ def _public_l32_rolling_loop(payload: dict[str, object]) -> dict[str, object]:
     return {key: value for key, value in payload.items() if key != "validation_cache"}
 
 
+def _l32_coverage_progress(job: JobResponse) -> dict[str, object]:
+    """Expose plan completeness independently from accepted-operation progress.
+
+    A rolling loop can validate every operation currently present while the plan
+    still misses manufacturing targets. Keeping those counters separate avoids
+    presenting a partial route such as ``2/2`` as a completed process plan.
+    """
+    coverage = job.plan.coverage if job.plan else None
+    target_count = int(coverage.target_count) if coverage else 0
+    covered_count = int(coverage.covered_count) if coverage else 0
+    return {
+        "coverage_status": coverage.status if coverage else "not_evaluated",
+        "coverage_target_count": target_count,
+        "coverage_covered_count": covered_count,
+        "coverage_remaining_count": max(target_count - covered_count, 0),
+        "plan_complete": bool(coverage and coverage.status in {"complete", "review"}),
+    }
+
+
 def _l32_nonrotational_trial_evidence(
     job_id: str, operation: Operation, *, job: JobResponse | None = None,
 ) -> dict[str, object] | None:
@@ -2912,18 +2931,16 @@ def evaluate_l32_operation_candidates(
             )
             public = public_trial_result(trial)
             ranking = _l32_candidate_rank(trial)
-            if not candidate_operation.tool.catalog_match:
-                sandbox_acceptable = bool(ranking["eligible_for_application"])
-                ranking.update({
-                    "rank_score": 0.0,
-                    "eligible_for_application": False,
-                    "application_blocker": "candidate_tool_is_not_bound_to_verified_catalog_inventory",
-                    "sandbox_acceptable_before_inventory_binding": sandbox_acceptable,
-                    "evidence_request": inventory_binding_evidence_request(
-                        candidate_operation.tool,
-                        _load_tool_inventory(job.machine_instance_id) if job.machine_instance_id else [],
-                    ),
-                })
+            ranking.update({
+                "application_scope": "draft_simulation_only",
+                "catalog_source": (
+                    "validated_catalog"
+                    if candidate_operation.tool.catalog_match
+                    else "engineering_template"
+                ),
+                "resource_availability": "assumed_available",
+                "physical_inventory_binding_required": False,
+            })
             record = {
                 "candidate_id": candidate.id,
                 "rationale": candidate.rationale,
@@ -2957,12 +2974,6 @@ def evaluate_l32_operation_candidates(
         ),
     )
     recommended = next((item for item in ranked if item.get("eligible_for_application") is True), None)
-    inventory_binding_candidate = next((
-        item for item in ranked
-        if item.get("sandbox_acceptable_before_inventory_binding") is True
-        and item.get("application_blocker")
-        == "candidate_tool_is_not_bound_to_verified_catalog_inventory"
-    ), None)
     payload = {
         "schema_version": "1.0.0", "job_id": job_id, "operation_id": operation_id,
         "base_operation_signature": operation_signature(base_operation),
@@ -2973,7 +2984,6 @@ def evaluate_l32_operation_candidates(
         "candidates": results,
         "next_action": (
             "apply_l32_operation_candidate" if recommended
-            else "inspect_l32_candidate_tool_requirements" if inventory_binding_candidate
             else "observe_or_propose_new_candidates"
         ),
         "release_status": "DRAFT", "production_ready": False,
@@ -3144,7 +3154,6 @@ def bind_l32_candidate_inventory_tool(
     evaluation.update({
         "status": (
             "candidate_available" if recommended
-            else "tool_evidence_required" if inventory_binding_candidate
             else "no_candidate_passed"
         ),
         "recommended_candidate_id": recommended.get("candidate_id") if recommended else None,
@@ -3230,12 +3239,6 @@ def auto_evaluate_l32_operation_repairs(job_id: str, operation_id: str) -> dict[
                 full_trial, candidate_result["trial"],
             )
         recommended_candidate_id = evaluation.get("recommended_candidate_id")
-        evidence_candidate = next((
-            item for item in evaluation.get("candidates", [])
-            if isinstance(item, dict)
-            and item.get("sandbox_acceptable_before_inventory_binding") is True
-            and isinstance(item.get("evidence_request"), dict)
-        ), None)
         diagnostic_candidate = max(
             (
                 item for item in evaluation.get("candidates", [])
@@ -3276,15 +3279,15 @@ def auto_evaluate_l32_operation_repairs(job_id: str, operation_id: str) -> dict[
                     "required_strategy": (
                         "sharp_corner_cleanup_or_accepted_internal_corner_radius"
                         if operation.type.startswith("pocket_")
-                        else "multi_orientation_exterior_cleanup_or_smaller_verified_tool"
+                    else "multi_orientation_exterior_cleanup_or_smaller_catalog_tool"
                     ),
                     "catalog_match": False,
                     "reason": "all_exact_occ_sandbox_candidates_leave_residual_or_violate_target_protection",
-                    "next_action": "define_and_bind_verified_special_process",
+                    "next_action": "define_and_simulate_special_process",
                 })
         payload.update({
             "status": (
-                "tool_evidence_required" if evidence_candidate
+                evaluation.get("status") if recommended_candidate_id
                 else "capability_required"
                 if not recommended_candidate_id and proposal.get("capability_requirements")
                 else evaluation.get("status")
@@ -3294,18 +3297,11 @@ def auto_evaluate_l32_operation_repairs(job_id: str, operation_id: str) -> dict[
             "best_diagnostic_candidate_id": (
                 diagnostic_candidate.get("candidate_id") if diagnostic_candidate else None
             ),
-            "tool_evidence_candidate_id": (
-                evidence_candidate.get("candidate_id") if evidence_candidate else None
-            ),
-            "evidence_request": (
-                evidence_candidate.get("evidence_request") if evidence_candidate else None
-            ),
             "next_action": (
                 evaluation.get("next_action") if recommended_candidate_id
-                else "inspect_l32_candidate_tool_requirements" if evidence_candidate
                 else "define_verified_contour_grooving_or_catalog_narrower_tool"
                 if unresolved_groove
-                else "define_and_bind_verified_special_process"
+                else "define_and_simulate_special_process"
                 if unresolved_nonrotational
                 else proposal.get("fallback_next_action")
             ),
@@ -3394,9 +3390,12 @@ def apply_l32_operation_candidate(
         raise HTTPException(status_code=409, detail="Candidate target operation changed after evaluation")
     candidate_operation = type(target_operation).model_validate(selected.get("candidate_operation"))
     if not candidate_operation.tool.catalog_match:
-        raise HTTPException(
-            status_code=409,
-            detail="Candidate tool must be bound to verified catalog inventory before application",
+        candidate_operation.parameters.update({
+            "draft_tool_assumption": True,
+            "resource_availability": "assumed_available",
+        })
+        candidate_operation.rationale.append(
+            "Engineering tool template is available under the catalog-resource assumption."
         )
     target_setup = next(setup for setup in job.plan.setups if target_operation in setup.operations)
     target_setup.operations[target_setup.operations.index(target_operation)] = candidate_operation
@@ -3407,6 +3406,9 @@ def apply_l32_operation_candidate(
         "candidate_id": request.candidate_id, "status": "applied_for_retrial",
         "rationale": request.rationale, "warning_acknowledged": request.acknowledge_warning,
         "selected_trial_status": trial.get("status"),
+        "application_scope": selected.get("application_scope", "draft_simulation_only"),
+        "resource_availability": "assumed_available",
+        "physical_inventory_binding_required": False,
         "new_operation_signature": operation_signature(candidate_operation),
         "next_action": "trial_l32_operation",
         "release_status": "DRAFT", "production_ready": False,
@@ -3489,7 +3491,7 @@ def finalize_harness_l32_process_plan(job_id: str) -> dict[str, object]:
     job.plan.coverage = coverage
     save_job(directory, job)
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
-    if coverage.status != "complete":
+    if coverage.status == "incomplete":
         uncovered = [
             {
                 "id": target.id, "kind": target.kind, "label": target.label,
@@ -3498,18 +3500,40 @@ def finalize_harness_l32_process_plan(job_id: str) -> dict[str, object]:
             }
             for target in coverage.targets if target.state != "covered"
         ]
+        next_target = uncovered[0] if uncovered else None
         result = {
             **progress,
             "status": "plan_incomplete",
             "reason": "manufacturing_coverage_incomplete",
+            "terminal": False,
+            "completion_allowed": False,
+            "must_continue_planning": True,
             "coverage": {
                 "status": coverage.status, "score": coverage.score,
                 "covered_count": coverage.covered_count, "target_count": coverage.target_count,
                 "issues": coverage.issues, "capability_gaps": coverage.capability_gaps,
                 "uncovered_targets": uncovered[:50],
             },
-            "next_action": "inspect_geometry_then_add_process_operation",
+            "next_target": next_target,
+            "continuation": {
+                "remaining_target_count": len(uncovered),
+                "accepted_operation_count": progress.get("accepted_count", 0),
+                "instruction": (
+                    "The current operations are validated, but the process route is incomplete. "
+                    "Select the first uncovered target, add and validate the missing operation types, "
+                    "then call finalize_harness_process_plan again. Do not conclude the task."
+                ),
+                "allowed_actions": [
+                    "inspect_operation_catalog",
+                    "add_process_operation",
+                    "trial_l32_operation",
+                    "auto_repair_l32_operation",
+                    "remove_process_operation",
+                ],
+            },
+            "next_action": "add_next_uncovered_operation",
         }
+        write_json(directory / "harness-l32-plan-finalization.json", result)
         publish_job_event(
             job_id, "harness_plan_finalize", "逐道试算已完成，但制造特征覆盖仍不完整", 90,
             agent_node="harness_plan_finalize", agent_title="工艺方案收口门禁",
@@ -3523,16 +3547,27 @@ def finalize_harness_l32_process_plan(job_id: str) -> dict[str, object]:
 
     validation = validate_l32_agent_plan(job_id)
     passed = validation.get("status") == "passed"
+    review_required = coverage.status == "review"
     result = {
         **progress,
-        "status": "validated_draft" if passed else "blocked",
+        "status": (
+            "validated_draft_with_review" if passed and review_required
+            else "validated_draft" if passed
+            else "blocked"
+        ),
         "reason": None if passed else "whole_plan_validation_failed",
         "coverage": {
             "status": coverage.status, "score": coverage.score,
             "covered_count": coverage.covered_count, "target_count": coverage.target_count,
+            "issues": coverage.issues, "capability_gaps": coverage.capability_gaps,
         },
         "whole_plan_validation": validation,
-        "next_action": "engineer_review" if passed else validation.get("next_action"),
+        "next_action": (
+            "resolve_geometry_or_process_review"
+            if passed and review_required
+            else "engineer_review" if passed
+            else validation.get("next_action")
+        ),
         "release_status": "DRAFT",
         "production_ready": False,
     }
@@ -3904,8 +3939,9 @@ def get_l32_agent_rolling_loop(job_id: str) -> dict[str, object]:
             ),
             "current_operation": None, "next_operation_id": None,
             "next_action": "advance_current_operation",
+            **_l32_coverage_progress(job),
         }
-    return _public_l32_rolling_loop(payload)
+    return {**_public_l32_rolling_loop(payload), **_l32_coverage_progress(job)}
 
 
 @app.get("/api/v1/jobs/{job_id}/agent/l32/repair-options")
@@ -4330,6 +4366,18 @@ def advance_l32_agent_rolling_loop(
         )
         result["validation_cache"] = validation
         result["evidence_reused"] = cache_valid
+        result.update(_l32_coverage_progress(job))
+        if result.get("status") == "completed" and not result["plan_complete"]:
+            result.update({
+                "status": "route_incomplete",
+                "terminal": False,
+                "completion_allowed": False,
+                "next_action": "add_next_uncovered_operation",
+                "message": (
+                    "Every current operation has evidence, but manufacturing coverage is incomplete; "
+                    "continue planning the next uncovered target."
+                ),
+            })
         write_json(loop_path, result)
         decision = result.get("decision") or {}
         publish_job_event(

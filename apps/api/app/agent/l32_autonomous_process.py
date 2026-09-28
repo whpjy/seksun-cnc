@@ -48,10 +48,9 @@ def classify_blocker(payload: dict[str, Any]) -> AutonomousOutcome:
     status = str(payload.get("status") or "")
     reason = str(payload.get("reason") or "")
     if (
-        status in {"capability_required", "tool_evidence_required"}
+        status == "capability_required"
         or payload.get("capability_requirements")
         or "capability" in reason
-        or "inventory" in reason
         or "unsupported" in reason
     ):
         return "capability_unavailable"

@@ -146,13 +146,13 @@ def assess_plan_knowledge(analysis: GeometryAnalysis, plan: ProcessPlan) -> Proc
         else [
             "二维图纸尺寸、公差与基准体系尚未形成结构化输入",
             "表面粗糙度、热处理、表面处理及特殊特性要求尚未形成结构化输入",
-            "毛坯状态、批量、实际设备/刀具/夹具库存与成本约束尚未确认",
+            "毛坯状态、批量与成本约束尚未确认",
         ]
     )
     decisions = [
         "确认材料牌号、供货和热处理状态",
         "确认关键尺寸、形位公差、粗糙度及检验放行方案",
-        "确认毛坯、装夹基准、工序间余量和实际制造资源",
+        "确认毛坯、装夹基准和工序间余量",
     ]
     if unmapped or (plan.manufacturing_route and plan.manufacturing_route.status == "incomplete"):
         status = "incomplete"

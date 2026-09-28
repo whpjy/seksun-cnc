@@ -433,6 +433,76 @@ def summarize_tool_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def summarize_tool_catalog(
+    payload: dict[str, Any],
+    *,
+    tool_kind: str = "",
+    maximum_cutting_width_mm: float | None = None,
+) -> dict[str, Any]:
+    """Expose compact tool capabilities under the assumed-availability policy."""
+    normalized_kind = tool_kind.strip().lower()
+    if maximum_cutting_width_mm is not None and maximum_cutting_width_mm <= 0:
+        raise CncApiError("maximum_cutting_width_mm must be greater than zero")
+    tools: list[dict[str, Any]] = []
+    for item in payload.get("tools") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").lower()
+        width = item.get("cutting_width_mm")
+        if normalized_kind and kind != normalized_kind:
+            continue
+        if maximum_cutting_width_mm is not None and (
+            not isinstance(width, (int, float)) or float(width) > maximum_cutting_width_mm
+        ):
+            continue
+        catalog_match = item.get("catalog_match", True) is True
+        tools.append({
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "kind": item.get("kind"),
+            "diameter_mm": item.get("diameter_mm"),
+            "cutting_width_mm": width,
+            "nose_radius_mm": item.get("nose_radius_mm"),
+            "flute_length_mm": item.get("flute_length_mm"),
+            "stickout_mm": item.get("stickout_mm"),
+            "holder_diameter_mm": item.get("holder_diameter_mm"),
+            "hand": item.get("hand"),
+            "orientation_code": item.get("orientation_code"),
+            "groove_profile": item.get("groove_profile"),
+            "axial_contouring_supported": item.get("axial_contouring_supported", False),
+            "catalog_source_document": item.get("catalog_source_document"),
+            "catalog_source_page": item.get("catalog_source_page"),
+            "catalog_series": item.get("catalog_series"),
+            "catalog_source": "validated_catalog" if catalog_match else "engineering_template",
+            "draft_simulation_allowed": True,
+            "resource_availability": "assumed_available",
+        })
+    return {
+        "schema_version": payload.get("schema_version"),
+        "tool_count": len(tools),
+        "filters": {
+            "tool_kind": normalized_kind or None,
+            "maximum_cutting_width_mm": maximum_cutting_width_mm,
+        },
+        "tools": tools,
+        "resource_availability_policy": payload.get("resource_availability_policy") or {
+            "mode": "catalog_resources_assumed_available",
+            "requires_physical_inventory_binding": False,
+        },
+        "usage_policy": {
+            "draft": (
+                "These catalog definitions and engineering templates may be used for deterministic "
+                "DRAFT simulation and candidate comparison."
+            ),
+            "resource": "Treat every returned catalog or engineering tool as available for planning.",
+            "agent_rule": (
+                "Select tools from tools[].id instead of guessing dimensions. Never ask for stock counts, "
+                "physical measurements, tool-station binding or proof that a returned resource exists."
+            ),
+        },
+    }
+
+
 def attach_cnc_evidence_contract(
     payload: dict[str, Any],
     *,
@@ -489,12 +559,8 @@ mcp = FastMCP(
         "每次新增 L32 工序后必须立即调用 trial_l32_operation；只有 can_accept=true 时才能调用 "
         "accept_l32_operation_trial，并提交具体理由；warning 还必须显式 acknowledge_warning。"
         "试算被阻断时优先调用 auto_repair_l32_operation，让后端依据验证证据生成并试算安全候选；"
-        "如果候选因工程刀具尚未绑定现场实物而不可应用，先调用 bind_l32_candidate_inventory_tool，"
-        "仅可绑定当前设备库存中已测量且能力证据完整的刀具；绑定后必须采用重新试算的结果，禁止伪造库存或证明；"
-        "绑定前调用 inspect_l32_tool_inventory 查看当前机床库存；只有用户提供了真实测量与检验信息时，"
-        "才可调用 record_l32_physical_tool 建档，不得由模型猜测刀具尺寸、检验人或证明编号；"
-        "候选返回 tool_evidence_required 时调用 inspect_l32_candidate_tool_requirements，"
-        "按 required_evidence 一次性向用户询问缺失信息；若 compatible_inventory 非空则直接绑定，不重复询问；"
+        "系统采用目录资源默认可用策略：机床、刀具、刀柄、筒夹和装夹资源只要出现在 CNC 目录或工程候选中，"
+        "即视为可用于规划和验证。不得查询现场库存、要求实测刀具、绑定刀位或询问用户是否拥有对应资源；"
         "后端要求观察模型时再提出不超过五个有差异的修正候选并调用 evaluate_l32_operation_candidates；"
         "只可用 apply_l32_operation_candidate 应用已真实试算通过的候选，随后必须重新正式试算当前工序。"
         "若无候选通过，则修改候选、删除工序或补充观察，不能继续新增工序。"
@@ -506,9 +572,21 @@ mcp = FastMCP(
         "若当前返回值不足，只能携带相同 job_id 调用 inspect_l32_operation_trial_state、"
         "inspect_job_and_geometry、observe_model 或当前结果 evidence_access.allowed_follow_up_tools 中列出的 CNC 工具。"
         "Never search local files or MCP resources for CNC job evidence. "
+        "Before concluding that a cutter is unavailable, call inspect_tool_catalog. "
+        "Catalog definitions and engineering templates are assumed available for planning, deterministic "
+        "simulation and candidate comparison. Never block on physical inventory or tool-station binding. "
+        "A successful trial only validates the current operation; it never proves that the process route is complete. "
+        "Treat manufacturing coverage targets as the completion criterion, not the number of operations currently in the draft. "
+        "If finalize_harness_process_plan returns plan_incomplete, route_incomplete, must_continue_planning=true, "
+        "or completion_allowed=false, this is a non-terminal continuation signal. Do not summarize the task as finished. "
+        "Use next_target and its required_operation_types to add, trial, repair and accept the next missing operation, "
+        "then call finalize_harness_process_plan again. A blocked operation stops only that operation: repair it, replace it, "
+        "or remove it and continue with another uncovered target. Ask the user only when authoritative geometry is ambiguous; "
+        "never stop because physical inventory, machine accessories or catalog resources are thought to be unavailable. "
         "旧的完整草案可使用 advance_l32_operation 逐道审核，"
         "新草案全部逐道接受后调用 finalize_harness_process_plan 检查覆盖率和整件连续仿真。"
-        "返回 blocked 或 plan_blocked 后必须停止，并调用 inspect_l32_repair_options。"
+        "当前工序返回 blocked 或 plan_blocked 后必须停止推进该工序，并调用 inspect_l32_repair_options；"
+        "若该工序无法修复，则删除或替换它并继续下一个未覆盖制造目标，不得直接结束整个任务。"
         "只有用户明确确认且候选通过确定性安全门时，才调用 select_l32_repair_candidate。"
         "只有整体验证时才调用 validate_l32_plan。"
         "所有输出均为 DRAFT；"
@@ -598,6 +676,27 @@ def inspect_operation_catalog(job_id: str = "") -> dict[str, Any]:
         except CncApiError:
             rotational = None
     return summarize_operation_catalog(payload, job, rotational)
+
+
+@mcp.tool()
+def inspect_tool_catalog(
+    job_id: str = "",
+    tool_kind: str = "",
+    maximum_cutting_width_mm: float | None = None,
+) -> dict[str, Any]:
+    """Read tool capabilities that are assumed available for CNC planning and validation."""
+    resolved, _ = _resolve_job_id(job_id)
+    payload = _client().json("GET", "/api/v1/catalogs")
+    if not isinstance(payload, dict):
+        raise CncApiError("Invalid tool catalog response")
+    result = summarize_tool_catalog(
+        payload,
+        tool_kind=tool_kind,
+        maximum_cutting_width_mm=maximum_cutting_width_mm,
+    )
+    result["job_id"] = resolved
+    result["next_action"] = "select_catalog_tool_then_add_or_repair_operation"
+    return result
 
 
 @mcp.tool()
@@ -763,7 +862,6 @@ def evaluate_l32_operation_candidates(
         raise CncApiError("L32 工序修正候选试算响应格式无效")
     return attach_cnc_evidence_contract(payload, follow_up_tools=[
         "apply_l32_operation_candidate",
-        "inspect_l32_candidate_tool_requirements",
         "inspect_l32_operation_trial_state",
         "observe_model",
         "evaluate_l32_operation_candidates",
@@ -783,7 +881,6 @@ def auto_repair_l32_operation(operation_id: str, job_id: str = "") -> dict[str, 
         raise CncApiError("L32 automatic repair response is invalid")
     return attach_cnc_evidence_contract(payload, follow_up_tools=[
         "apply_l32_operation_candidate",
-        "inspect_l32_candidate_tool_requirements",
         "inspect_l32_operation_trial_state",
         "observe_model",
         "evaluate_l32_operation_candidates",
@@ -791,7 +888,6 @@ def auto_repair_l32_operation(operation_id: str, job_id: str = "") -> dict[str, 
     ])
 
 
-@mcp.tool()
 def inspect_l32_candidate_tool_requirements(
     operation_id: str,
     candidate_id: str,
@@ -811,7 +907,6 @@ def inspect_l32_candidate_tool_requirements(
     return payload
 
 
-@mcp.tool()
 def bind_l32_candidate_inventory_tool(
     operation_id: str,
     candidate_id: str,
@@ -867,7 +962,27 @@ def finalize_harness_process_plan(job_id: str = "") -> dict[str, Any]:
     )
     if not isinstance(payload, dict):
         raise CncApiError("Harness L32 工艺方案收口响应格式无效")
-    return payload
+    if payload.get("status") == "plan_incomplete" or payload.get("completion_allowed") is False:
+        payload = {
+            **payload,
+            "agent_directive": {
+                "task_may_end": False,
+                "mandatory_action": "continue_planning_from_next_target",
+                "prohibited_action": "final_answer_claiming_route_completion",
+                "success_gate": "status_is_validated_draft_or_validated_draft_with_review",
+            },
+        }
+    return attach_cnc_evidence_contract(
+        payload,
+        follow_up_tools=[
+            "inspect_operation_catalog",
+            "add_process_operation",
+            "trial_l32_operation",
+            "auto_repair_l32_operation",
+            "remove_process_operation",
+            "inspect_job_and_geometry",
+        ],
+    )
 
 
 @mcp.tool()
@@ -1040,24 +1155,29 @@ def provisionally_accept_l32_profile(
 
 @mcp.tool()
 def inspect_machine(job_id: str = "") -> dict[str, Any]:
-    """读取任务绑定的机床快照和真实刀具库存，用于能力与可达性判断。"""
+    """Read the bound machine configuration; catalog resources are available by default."""
     resolved, _ = _resolve_job_id(job_id)
     api = _client()
     job = api.json("GET", f"/api/v1/jobs/{resolved}")
-    if not isinstance(job, dict) or not job.get("machine_instance_id"):
-        raise CncApiError("任务尚未绑定可验证的机床实例")
-    snapshot = api.json("GET", f"/api/v1/jobs/{resolved}/machine-instance")
-    tools = api.json("GET", f"/api/v1/machines/l32/instances/{job['machine_instance_id']}/tools")
+    if not isinstance(job, dict):
+        raise CncApiError("任务响应格式无效")
+    if job.get("machine_instance_id"):
+        snapshot = api.json("GET", f"/api/v1/jobs/{resolved}/machine-instance")
+        configuration_source = "job_configuration"
+    else:
+        snapshot = api.json("GET", "/api/v1/machines/l32/definitions")
+        configuration_source = "default_catalog_template"
     return {
         "job_id": resolved,
         "configuration_hash": job.get("machine_configuration_hash"),
         "machine": snapshot,
-        "tool_inventory": summarize_tool_inventory(tools if isinstance(tools, dict) else {}),
+        "configuration_source": configuration_source,
+        "resource_availability": "catalog_resources_assumed_available",
+        "physical_inventory_binding_required": False,
         "release_status": "DRAFT",
     }
 
 
-@mcp.tool()
 def inspect_l32_tool_inventory(job_id: str = "") -> dict[str, Any]:
     """List measured physical tools for the job's bound L32 machine and their verification evidence."""
     resolved, _ = _resolve_job_id(job_id)
@@ -1075,7 +1195,6 @@ def inspect_l32_tool_inventory(job_id: str = "") -> dict[str, Any]:
     return result
 
 
-@mcp.tool()
 def record_l32_physical_tool(
     inventory: dict[str, Any],
     job_id: str = "",

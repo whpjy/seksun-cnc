@@ -5,7 +5,9 @@ from typing import Any
 from ..catalogs import TOOL_DEFINITIONS
 from ..l32_front_groove import build_front_groove_geometry_draft
 from ..models import L32OperationRepairCandidate, Operation
-from ..rotational_features import RotationalFeatureAnalysis, RotationalProfile
+from ..rotational_features import (
+    RotationalFeatureAnalysis, RotationalProfile, TurningProfileFeature,
+)
 
 
 def _compatible_tools(operation: Operation) -> list[dict[str, Any]]:
@@ -53,6 +55,34 @@ def _external_groove_context(
         if feature is not None and item.id == feature.profile_id
     ), None)
     return feature, exact_profile
+
+
+def _profile_for_reversible_draft_geometry(
+    profile: RotationalProfile,
+    feature: TurningProfileFeature,
+    operation: Operation,
+    trial: dict[str, Any],
+) -> RotationalProfile:
+    """Honor a bounded AI profile authorization only inside candidate sandbox geometry."""
+    if profile.review_state == "accepted":
+        return profile
+    authorization = trial.get("profile_authorization") or {}
+    z_min = authorization.get("z_min_mm")
+    z_max = authorization.get("z_max_mm")
+    authorized = (
+        authorization.get("state") == "ai_provisional"
+        and authorization.get("production_ready") is False
+        and operation.reference_profile_id == profile.id
+        and isinstance(z_min, (int, float))
+        and isinstance(z_max, (int, float))
+        and float(z_min) <= feature.z_start + 1e-9
+        and float(z_max) >= feature.z_end - 1e-9
+    )
+    if not authorized:
+        return profile
+    # The copy only satisfies the geometry builder's exact-profile precondition.
+    # The formal operation trial independently rechecks the original authorization.
+    return profile.model_copy(update={"review_state": "accepted"})
 
 
 def propose_l32_operation_repairs(
@@ -220,7 +250,17 @@ def propose_l32_operation_repairs(
     # deterministic material trial decide whether their swept envelopes close
     # the residual. This is deliberately geometry-led, not an LLM guess.
     groove_feature, groove_profile = _external_groove_context(operation, rotational)
-    if (excess_count or traceability_failure) and groove_feature is not None and groove_profile is not None:
+    groove_width_failure = (
+        operation.type == "turn_grooving"
+        and "grooving tool width" in detail
+        and ("no larger than the groove width" in detail or "must be positive" in detail)
+    )
+    if (
+        excess_count or traceability_failure or groove_width_failure
+    ) and groove_feature is not None and groove_profile is not None:
+        draft_geometry_profile = _profile_for_reversible_draft_geometry(
+            groove_profile, groove_feature, operation, trial,
+        )
         current_width = float(operation.tool.cutting_width_mm or operation.tool.diameter_mm)
         groove_tools = sorted(
             (
@@ -237,8 +277,8 @@ def propose_l32_operation_repairs(
             width = float(tool["cutting_width_mm"])
             try:
                 geometry = build_front_groove_geometry_draft(
-                    groove_profile, groove_feature,
-                    stock_radius_mm=max(point.radius for point in groove_profile.points) + groove_feature.depth_mm,
+                    draft_geometry_profile, groove_feature,
+                    stock_radius_mm=max(point.radius for point in draft_geometry_profile.points) + groove_feature.depth_mm,
                     actual_planned_tool_width_mm=width,
                     proposed_tool_width_mm=width,
                 )
@@ -273,8 +313,8 @@ def propose_l32_operation_repairs(
             engineering_width = float(engineering_tool["cutting_width_mm"])
             try:
                 engineering_geometry = build_front_groove_geometry_draft(
-                    groove_profile, groove_feature,
-                    stock_radius_mm=max(point.radius for point in groove_profile.points) + groove_feature.depth_mm,
+                    draft_geometry_profile, groove_feature,
+                    stock_radius_mm=max(point.radius for point in draft_geometry_profile.points) + groove_feature.depth_mm,
                     actual_planned_tool_width_mm=engineering_width,
                     proposed_tool_width_mm=engineering_width,
                 )
@@ -303,7 +343,7 @@ def propose_l32_operation_repairs(
                 "required_tip_radius_mm": float(engineering_tool["nose_radius_mm"]),
                 "catalog_match": bool(engineering_tool.get("catalog_match", True)),
                 "reason": "contour_strategy_requires_verified_full_radius_insert_and_axial_cutting_capability",
-                "next_action": "sandbox_strategy_then_bind_verified_inventory_tool",
+                "next_action": "sandbox_strategy_with_assumed_available_catalog_resource",
             })
 
     allowance = operation.parameters.get("radial_allowance_mm")

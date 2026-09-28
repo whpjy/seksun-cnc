@@ -297,3 +297,24 @@ def test_exact_groove_excess_proposes_narrower_catalogued_cutter() -> None:
         if item["required_tool_kind"] == "full_radius_contour_grooving"
     )
     assert requirement["catalog_match"] is False
+
+    width_failure = propose_l32_operation_repairs(
+        source,
+        {
+            "status": "blocked",
+            "detail": "grooving tool width must be positive and no larger than the groove width",
+            "profile_authorization": {
+                "state": "ai_provisional", "production_ready": False,
+                "z_min_mm": -0.5, "z_max_mm": 0.5,
+            },
+        },
+        groove_profile.model_copy(update={"review_state": "review"}),
+        operations=[source],
+        rotational=rotational.model_copy(update={
+            "profiles": [groove_profile.model_copy(update={"review_state": "review"})],
+        }),
+    )
+    assert {item["tool_id"] for item in width_failure["candidates"]} == {
+        "TURN-GROOVE-0.8", "ENGINEERING-GROOVE-FULL-R-0.4",
+    }
+    assert width_failure["next_action"] == "evaluate_candidates"

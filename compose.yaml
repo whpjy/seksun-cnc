@@ -30,6 +30,39 @@ services:
       - ./.seksun-cnc:/var/lib/seksun-cnc
     ports:
       - "8090:8090"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8090/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+  harness:
+    build:
+      context: ..
+      dockerfile: deepseek-harness-cnc/docker/Dockerfile
+    environment:
+      DSH_HOME: /var/lib/deepseek-harness
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      CNC_API_BASE_URL: http://api:8090
+    command:
+      - node
+      - /opt/deepseek-harness/scripts/cnc/docker-web.mjs
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - harness_data:/var/lib/deepseek-harness
+      - harness_workspace:/workspace
+    ports:
+      - "127.0.0.1:3081:3081"
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--show-error", "--output", "/dev/null", "http://127.0.0.1:3081/"]
+      interval: 20s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
     restart: unless-stopped
 
   web:
@@ -39,9 +72,13 @@ services:
         VITE_APP_NAME: ${VITE_APP_NAME:-NEXUS CNC}
         VITE_PAGE_TITLE: ${VITE_PAGE_TITLE:-智能工艺规划}
         VITE_APP_LOGO_TEXT: ${VITE_APP_LOGO_TEXT:-N}
-        VITE_HARNESS_URL: ${VITE_HARNESS_URL:-http://127.0.0.1:3080}
+        VITE_HARNESS_URL: ${VITE_HARNESS_URL:-http://127.0.0.1:3081}
     depends_on:
       - api
     ports:
       - "3001:80"
     restart: unless-stopped
+
+volumes:
+  harness_data:
+  harness_workspace:

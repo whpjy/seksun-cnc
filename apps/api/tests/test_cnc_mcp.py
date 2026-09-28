@@ -3,10 +3,12 @@ from pathlib import Path
 
 import httpx
 
+import app.cnc_mcp as cnc_mcp
+
 from app.cnc_mcp import (
     CncApiClient, CncApiError, attach_cnc_evidence_contract, resolve_step_import,
     summarize_geometry, summarize_job, summarize_operation_catalog, summarize_progress,
-    summarize_tool_inventory,
+    summarize_tool_catalog, summarize_tool_inventory,
 )
 
 
@@ -107,6 +109,51 @@ def test_operation_catalog_only_exposes_l32_executable_options_with_legal_refs()
     live = result["definitions"][0]
     assert live["valid_geometry_refs"][0]["id"] == "REGION-NONROTATIONAL-OUTER-1"
     assert "surface_3d" in result["unavailable_definition_ids"]
+
+
+def test_tool_catalog_exposes_narrow_candidates_as_assumed_available() -> None:
+    payload = {
+        "schema_version": "0.8.0",
+        "tools": [
+            {
+                "id": "TURN-GROOVE-2", "name": "2 mm groove", "kind": "grooving",
+                "diameter_mm": 2.0, "cutting_width_mm": 2.0,
+            },
+            {
+                "id": "TURN-GROOVE-0.8", "name": "0.8 mm groove", "kind": "grooving",
+                "diameter_mm": 0.8, "cutting_width_mm": 0.8,
+            },
+            {
+                "id": "ENGINEERING-GROOVE-FULL-R-0.4", "name": "0.4 mm full radius",
+                "kind": "grooving", "diameter_mm": 0.4, "cutting_width_mm": 0.4,
+                "catalog_match": False, "groove_profile": "full_radius",
+                "axial_contouring_supported": True,
+            },
+            {"id": "EM-1", "name": "1 mm end mill", "kind": "end_mill", "diameter_mm": 1.0},
+        ],
+    }
+
+    result = summarize_tool_catalog(
+        payload, tool_kind="grooving", maximum_cutting_width_mm=1.0,
+    )
+
+    assert [item["id"] for item in result["tools"]] == [
+        "TURN-GROOVE-0.8", "ENGINEERING-GROOVE-FULL-R-0.4",
+    ]
+    assert result["tools"][0]["catalog_source"] == "validated_catalog"
+    assert result["tools"][1]["catalog_source"] == "engineering_template"
+    assert all(item["draft_simulation_allowed"] for item in result["tools"])
+    assert all(item["resource_availability"] == "assumed_available" for item in result["tools"])
+    assert result["resource_availability_policy"]["requires_physical_inventory_binding"] is False
+
+
+def test_tool_catalog_rejects_nonpositive_width_filter() -> None:
+    try:
+        summarize_tool_catalog({"tools": []}, maximum_cutting_width_mm=0)
+    except CncApiError as exc:
+        assert "greater than zero" in str(exc)
+    else:
+        raise AssertionError("expected invalid width rejection")
 
 
 def test_cnc_api_client_surfaces_bounded_api_error() -> None:
@@ -234,3 +281,28 @@ def test_cnc_evidence_contract_forbids_workspace_artifact_search() -> None:
     assert contract["allowed_follow_up_tools"] == [
         "inspect_l32_operation_trial_state", "observe_model",
     ]
+
+
+def test_incomplete_finalization_forces_agent_to_continue(monkeypatch) -> None:
+    class FakeClient:
+        def json(self, method: str, path: str) -> dict:
+            assert method == "POST"
+            assert path == "/api/v1/jobs/job-1/agent/l32/plan/finalize"
+            return {
+                "job_id": "job-1",
+                "status": "plan_incomplete",
+                "completion_allowed": False,
+                "next_target": {
+                    "id": "TARGET-HF-7",
+                    "required_operation_types": ["drilling"],
+                },
+            }
+
+    monkeypatch.setattr(cnc_mcp, "_resolve_job_id", lambda _job_id: ("job-1", False))
+    monkeypatch.setattr(cnc_mcp, "_client", lambda: FakeClient())
+
+    result = cnc_mcp.finalize_harness_process_plan("job-1")
+
+    assert result["agent_directive"]["task_may_end"] is False
+    assert result["agent_directive"]["mandatory_action"] == "continue_planning_from_next_target"
+    assert "add_process_operation" in result["evidence_access"]["allowed_follow_up_tools"]

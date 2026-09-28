@@ -401,7 +401,7 @@ class GroovingOperationReviewRequest(BaseModel):
     confirmed_final_diameter_mm: float = Field(gt=0, le=100)
     peck_depth_mm: float = Field(gt=0, le=10)
     groove_tool_id: str = Field(min_length=1, max_length=64)
-    groove_tool_inventory_id: str = Field(min_length=1, max_length=64)
+    groove_tool_inventory_id: str = Field(default="catalog-assumed-available", min_length=1, max_length=64)
     confirmed_stickout_mm: float | None = Field(default=None, gt=0, le=200)
     assembly_clearance_mm: float = Field(default=0.2, ge=0, le=5)
     profile_form_confirmed: bool = False
@@ -414,7 +414,7 @@ class BoringOperationReviewRequest(BaseModel):
     assembly_clearance_mm: float = Field(default=0.2, ge=0, le=5)
     finishing_tool_id: str | None = Field(default=None, min_length=1, max_length=64)
     shoulder_strategy: Literal["not_required", "small_nose_tool"] = "not_required"
-    boring_bar_inventory_id: str = Field(min_length=1, max_length=64)
+    boring_bar_inventory_id: str = Field(default="catalog-assumed-available", min_length=1, max_length=64)
     reviewer: str = Field(min_length=1, max_length=100)
 
 
@@ -427,7 +427,7 @@ class AxialDrillingOperationReviewRequest(BaseModel):
     tip_overtravel_allowance_mm: float = Field(default=0, ge=0, le=50)
     chip_evacuation_strategy: Literal["standard_peck", "deep_hole_peck"] = "standard_peck"
     through_tool_coolant_confirmed: bool = False
-    drill_inventory_id: str = Field(min_length=1, max_length=64)
+    drill_inventory_id: str = Field(default="catalog-assumed-available", min_length=1, max_length=64)
     reviewer: str = Field(min_length=1, max_length=100)
 
 

@@ -20,6 +20,57 @@ MACHINES = [
     MachineProfile(id="u500-5x", name="五轴加工中心", axes=5, travel_mm=[600, 500, 450], max_spindle_rpm=18000, max_feed_mm_min=15000, max_tool_diameter_mm=63, postprocessor=None),
 ]
 
+# These facts were extracted from manufacturer documents supplied for the project. They are
+# stored as structured evidence so runtime behavior does not depend on the original PDF paths.
+MANUFACTURER_EVIDENCE = [
+    {
+        "id": "citizen-l32-brochure",
+        "document": "L32(1).pdf",
+        "pages": [2, 3, 4],
+        "facts": {
+            "stock_diameter_mm": {"standard": 32, "optional": 38},
+            "main_spindle_max_rpm": 8000,
+            "rotary_tool_max_rpm": 6000,
+            "rotary_tool_collets": ["ER11", "ER16"],
+            "square_shank_mm": 16,
+            "sleeve_diameter_mm": 25.4,
+        },
+    },
+    {
+        "id": "tungaloy-drilling-dsm",
+        "document": "钻削-东芝.pdf",
+        "pages": [14, 17],
+        "facts": {
+            "series": ["DSM", "DSM-CP"],
+            "diameter_range_mm": [0.1, 3.0],
+            "length_to_diameter": [5, 10, 15],
+        },
+    },
+    {
+        "id": "tungaloy-turning-jtter",
+        "document": "车削-东芝.pdf",
+        "pages": [760],
+        "facts": {"series": ["JTTER", "JTTEL"], "catalogued_cutting_width_mm": 1.2},
+    },
+    {
+        "id": "tungaloy-er-collet-system",
+        "document": "工具系统-东芝.pdf",
+        "pages": [115],
+        "facts": {"interface": "ER16", "catalog_clamping_range_mm": [0.5, 10.0]},
+    },
+]
+
+RESOURCE_AVAILABILITY_POLICY = {
+    "mode": "catalog_resources_assumed_available",
+    "requires_physical_inventory_binding": False,
+    "description": (
+        "Machine, holder and cutter resources represented by the engineering catalog are "
+        "available by default. Planning must not request stock counts, tool-station binding, "
+        "measured inventory or proof of physical possession."
+    ),
+}
+
+
 TOOL_DEFINITIONS = [
     {"id": "TURN-OD-L-R", "name": "外圆反向粗车刀", "kind": "turning_od", "diameter_mm": 0.8, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.8, "stickout_mm": 20, "holder_diameter_mm": 16, "nose_radius_mm": 0.8, "insert_shape": "CNMG", "hand": "left", "orientation_code": 3},
     {"id": "TURN-OD-L-MICRO-F", "name": "外圆反向小刀尖精车刀", "kind": "turning_od", "diameter_mm": 0.2, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 0.2, "stickout_mm": 20, "holder_diameter_mm": 12, "nose_radius_mm": 0.2, "insert_shape": "VBMT", "hand": "left", "orientation_code": 3},
@@ -51,6 +102,30 @@ TOOL_DEFINITIONS = [
     {"id": "TURN-CUTOFF-2", "name": "2 mm 切断刀", "kind": "cutoff", "diameter_mm": 2.0, "flute_count": 1, "max_rpm": 8000, "flute_length_mm": 2.0, "stickout_mm": 25, "holder_diameter_mm": 16, "cutting_width_mm": 2.0, "hand": "neutral", "orientation_code": 4},
     {"id": "TAP-M6", "name": "M6 丝锥", "kind": "tap", "diameter_mm": 6.0, "flute_count": 3, "max_rpm": 3000, "flute_length_mm": 15, "stickout_mm": 30, "holder_diameter_mm": 16},
 ]
+
+TOOL_DEFINITIONS.extend([
+    {
+        "id": "TUNGALOY-JTTER-1.2", "name": "Tungaloy JTTER 1.2 mm 窄槽刀",
+        "kind": "grooving", "diameter_mm": 1.2, "flute_count": 1, "max_rpm": 8000,
+        "flute_length_mm": 0.9, "stickout_mm": 16, "holder_diameter_mm": 10,
+        "cutting_width_mm": 1.2, "hand": "right", "orientation_code": 4,
+        "catalog_source_document": "车削-东芝.pdf", "catalog_source_page": 760,
+        "catalog_series": "JTTER/JTTEL",
+    },
+    *[
+        {
+            "id": f"TUNGALOY-DSM-{diameter:g}",
+            "name": f"Tungaloy DSM/DSM-CP Ø{diameter:g} 微型钻头",
+            "kind": "drill", "diameter_mm": diameter, "flute_count": 2,
+            "max_rpm": 12000, "flute_length_mm": diameter * 5,
+            "stickout_mm": max(10, diameter * 8), "holder_diameter_mm": max(0.5, diameter),
+            "catalog_source_document": "钻削-东芝.pdf", "catalog_source_page": 17,
+            "catalog_series": "DSM/DSM-CP", "supported_length_to_diameter": [5, 10, 15],
+            "compatible_collet": "ER11/ER16",
+        }
+        for diameter in (0.1, 0.2, 0.3, 0.5, 0.8, 1.0, 1.5)
+    ],
+])
 
 
 def resolve_material(value: str) -> MaterialProfile:
@@ -128,13 +203,15 @@ def apply_cutting_parameters(operation: Operation, material: MaterialProfile, ma
     if calculated_feed > machine.max_feed_mm_min:
         warnings.append(f"{operation.id} 进给已限制为机床上限 {machine.max_feed_mm_min:.0f} mm/min")
     if not tool.catalog_match:
-        warnings.append(f"{operation.id} 使用临时刀具定义 {tool.name}，上机前需录入真实刀具参数")
+        warnings.append(f"{operation.id} 使用目录资源默认可用策略下的工程刀具定义 {tool.name}")
     return warnings
 
 
 def catalog_payload() -> dict[str, object]:
     return {
         "schema_version": "0.8.0",
+        "resource_availability_policy": RESOURCE_AVAILABILITY_POLICY,
+        "manufacturer_evidence": MANUFACTURER_EVIDENCE,
         "materials": [item.model_dump(mode="json") for item in MATERIALS],
         "machines": [item.model_dump(mode="json") for item in MACHINES],
         "tools": TOOL_DEFINITIONS,

@@ -887,6 +887,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
   const [operationPopoverPosition, setOperationPopoverPosition] = useState({ top: 110, left: 326, anchorY: 28 });
   const [playbackMode, setPlaybackMode] = useState<"single" | "cumulative">("single");
   const [playbackResetToken, setPlaybackResetToken] = useState(0);
+  const [harnessFollowLatest, setHarnessFollowLatest] = useState(true);
   const [showL32Workbench, setShowL32Workbench] = useState(false);
   const [showProcessDesigner, setShowProcessDesigner] = useState(false);
   const [l32Program, setL32Program] = useState<WholePartDraftResult | null>(null);
@@ -2184,20 +2185,20 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
     if (mode === "仿真" && isL32 && selectedOperation) void previewL32Operation(selectedOperation);
   };
 
-  const harnessAcceptedOperationIds = new Set([
+  const harnessAcceptedOperationIds = useMemo(() => new Set([
     ...(agentWorkspace?.orchestration?.rolling_loop?.accepted_operation_ids ?? []),
     ...(agentWorkspace?.orchestration?.independent_operation_trials?.accepted_operation_ids ?? []),
     ...(agentWorkspace?.orchestration?.autonomous_process?.operations ?? [])
       .filter((operation) => operation.can_accept || operation.decision === "accept" || operation.trial_status === "accepted")
       .flatMap((operation) => operation.operation_id ? [operation.operation_id] : []),
-  ]);
-  const harnessBlockedOperationIds = new Set([
+  ]), [agentWorkspace?.orchestration?.autonomous_process?.operations, agentWorkspace?.orchestration?.independent_operation_trials?.accepted_operation_ids, agentWorkspace?.orchestration?.rolling_loop?.accepted_operation_ids]);
+  const harnessBlockedOperationIds = useMemo(() => new Set([
     ...(agentWorkspace?.orchestration?.autonomous_process?.operations ?? [])
       .filter((operation) => operation.decision === "blocked" || operation.decision === "reject" || operation.trial_status === "blocked")
       .flatMap((operation) => operation.operation_id ? [operation.operation_id] : []),
     ...(agentWorkspace?.orchestration?.autonomous_process?.blockers ?? [])
       .flatMap((blocker) => blocker.operation_id ? [blocker.operation_id] : []),
-  ]);
+  ]), [agentWorkspace?.orchestration?.autonomous_process?.blockers, agentWorkspace?.orchestration?.autonomous_process?.operations]);
   const harnessReportedOperationId = agentWorkspace?.orchestration?.autonomous_process?.current_operation_id
     ?? agentWorkspace?.orchestration?.rolling_loop?.current_operation?.operation_id
     ?? agentWorkspace?.orchestration?.current_operation_id
@@ -2215,21 +2216,45 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
 
   useEffect(() => {
     if (!embeddedInHarness || operations.length === 0) return;
-    const accepted = operations.filter((operation) => harnessAcceptedOperationIds.has(operation.id) || simulatedOperationIds.has(operation.id));
-    const preferredId = harnessCurrentOperationId
-      ?? (harnessFocus === "simulation" || harnessFocus === "toolpath" ? accepted.at(-1)?.id : null)
-      ?? selectedOperation?.id
-      ?? operations[0].id;
-    const preferred = operations.find((operation) => operation.id === preferredId) ?? operations[0];
-    if (selectedOperation?.id !== preferred.id) {
-      setSelectedOperation(preferred);
-      setSelectedFeatureIds(preferred.feature_ids);
-      setPlaybackResetToken((current) => current + 1);
-    }
-    setShowOperationViewSwitch(false);
-    setStockSelected(false);
-    setActiveMode(initialHarnessMode);
-  }, [agentWorkspace?.active_event_id, embeddedInHarness, harnessFocus, harnessCurrentOperationId, initialHarnessMode, operations, selectedOperation?.id, simulatedOperationIds]);
+    const handle = window.setTimeout(() => {
+      const accepted = operations.filter((operation) => harnessAcceptedOperationIds.has(operation.id) || simulatedOperationIds.has(operation.id));
+      const selectedStillExists = operations.some((operation) => operation.id === selectedOperation?.id);
+      const preferredId = (harnessFollowLatest ? harnessCurrentOperationId : null)
+        ?? (selectedStillExists ? selectedOperation?.id : null)
+        ?? accepted.at(-1)?.id
+        ?? operations[0].id;
+      const preferred = operations.find((operation) => operation.id === preferredId) ?? operations[0];
+      if (selectedOperation?.id !== preferred.id) {
+        setSelectedOperation(preferred);
+        setSelectedFeatureIds(preferred.feature_ids);
+        setPlaybackResetToken((current) => current + 1);
+      }
+      setShowOperationViewSwitch(false);
+      setStockSelected(false);
+      setActiveMode(initialHarnessMode);
+    }, 0);
+    return () => window.clearTimeout(handle);
+  }, [agentWorkspace?.active_event_id, embeddedInHarness, harnessAcceptedOperationIds, harnessFocus, harnessCurrentOperationId, harnessFollowLatest, initialHarnessMode, operations, selectedOperation?.id, simulatedOperationIds]);
+
+  const selectHarnessOperation = (operation: Operation, mode = initialHarnessMode) => {
+    setHarnessFollowLatest(false);
+    setSelectedOperation(operation);
+    setSelectedFeatureIds(operation.feature_ids);
+    setPlaybackResetToken((current) => current + 1);
+    setActiveMode(mode);
+    if ((mode === "仿真" || mode === "刀路") && isL32) void previewL32Operation(operation);
+  };
+
+  const showHarnessCumulativeResult = () => {
+    const latestWithEvidence = operations.slice().reverse().find((operation) => (
+      harnessAcceptedOperationIds.has(operation.id)
+      || simulatedOperationIds.has(operation.id)
+      || l32AvailableToolpathSegments.some((segment) => segment.operation_id === operation.id && segment.motion === "cut")
+    )) ?? operations.at(-1);
+    if (!latestWithEvidence) return;
+    setPlaybackMode("cumulative");
+    selectHarnessOperation(latestWithEvidence, "仿真");
+  };
 
   const chooseFeature = (id: string) => {
     setStockSelected(false);
@@ -3091,18 +3116,7 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               <span>{l32WholePartBlockers.join("；")}</span>
             </div>
           </div>}
-          {simulationGenerating && selectedOperation && <div className={`simulation-generation-state ${showOperationViewSwitch ? "with-operation-card" : ""}`} aria-live="polite">
-            <div className="simulation-generation-visual" aria-hidden="true"><i /><i /><LoaderCircle className="spin" size={30} /></div>
-            <small>{selectedOperation.id} · {selectedOperation.name}</small>
-            <strong>正在生成加工仿真</strong>
-            <p>{simulationGenerationMessage}</p>
-            <div className="simulation-generation-progress"><i /></div>
-            <div className="simulation-generation-steps">
-              <span className="active">刀路求解</span><span className={l32MaterialGenerationPending ? "active" : ""}>材料演算</span><span>安全校核</span>
-            </div>
-            <em>结果完成后将自动显示真实模型与播放控件</em>
-          </div>}
-          {!simulationGenerating && <ModelViewer
+          <ModelViewer
             modelUrl={`${apiUrl(job.model_url)}?solid=${selectedSolidIndex}`}
             features={viewerFeatures}
             selectedFeatureIds={selectedFeatureIds}
@@ -3136,14 +3150,19 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
             activeOperationLabel={selectedOperation?.name}
             operationContextVisible={showOperationViewSwitch || stockSelected}
             operationIntent={stockSelected ? null : operationIntent}
-            compositionInsetLeftRatio={leftWorkbenchPanel
+            compositionInsetLeftRatio={embeddedInHarness ? 0.24 : leftWorkbenchPanel
               ? (leftWorkbenchPanel === "agent" ? 0 : showOperationViewSwitch || stockSelected
                 ? (activeMode === "仿真" ? 0.34 : 0.25)
                 : (activeMode === "仿真" ? 0.2 : 0.16))
               : 0}
             compositionInsetRightRatio={leftWorkbenchPanel ? 0.04 : 0}
             showFeatureAnnotations={leftWorkbenchPanel === "features" && isolatedFeatureId !== null}
-          />}
+          />
+          {simulationGenerating && selectedOperation && <div className="simulation-generation-state compact" aria-live="polite">
+            <LoaderCircle className="spin" size={18} />
+            <div><small>{selectedOperation.id} · {selectedOperation.name}</small><strong>正在生成加工证据</strong><p>{simulationGenerationMessage}</p></div>
+            <div className="simulation-generation-progress"><i /></div>
+          </div>}
           {embeddedInHarness && <>
             <header className="harness-canvas-status">
               <div className={`harness-live-indicator ${job.status === "completed" ? "complete" : "live"}`}><i />{job.status === "completed" ? "规划记录" : "智能体实时同步"}</div>
@@ -3157,30 +3176,52 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
               </div>
             </header>
 
-            {harnessFocus === "process" && <section className="harness-route-result">
-              <header><div><small>FINAL PROCESS ROUTE</small><strong>智能体工艺路线</strong></div><span>{job.plan.setups.length} 次装夹 · {operations.length} 道工序</span></header>
-              <div className="harness-route-list">
-                {job.plan.setups.map((setup, setupIndex) => <section key={setup.id}>
-                  <div className="harness-setup-label"><b>装夹 {setupIndex + 1}</b><span>{setup.name}</span><small>{setup.machine_name ?? setup.fixture}</small></div>
-                  {setup.operations.map((operation) => {
-                    const state = harnessOperationState(operation);
-                    return <button type="button" key={operation.id} className={`${state} ${selectedOperation?.id === operation.id ? "selected" : ""}`} onClick={() => {
-                      setSelectedOperation(operation);
-                      setSelectedFeatureIds(operation.feature_ids);
-                      setActiveMode("工艺");
-                    }}>
-                      <i />
-                      <span><b>{operation.id}</b><strong>{operation.name}</strong><small>{operation.tool.name}</small></span>
-                      <em>{state === "accepted" ? "已验证" : state === "running" ? "验证中" : state === "blocked" ? "受阻" : "待验证"}</em>
-                    </button>;
-                  })}
-                </section>)}
+            <aside className="harness-operation-sidebar" aria-label="工序路线">
+              <header>
+                <div><small>PROCESS ROUTE</small><strong>工序路线</strong></div>
+                <span className="harness-route-progress">{operations.length > 0
+                  ? coverage
+                    ? <>已验 {harnessAcceptedOperationIds.size}/{operations.length}<b>覆盖 {coverage.covered_count}/{coverage.target_count}</b></>
+                    : `已验 ${harnessAcceptedOperationIds.size}/${operations.length}`
+                  : "准备中"}</span>
+              </header>
+              <div className="harness-sidebar-operations">
+                {operations.length === 0 && <div className="harness-route-preparing">
+                  <div className="harness-route-preparing-title"><LoaderCircle className="spin" size={17} /><div><small>ROUTE PLANNING</small><strong>正在形成工艺路线</strong></div></div>
+                  <p>{activeAgentEvent?.summary ?? activeAgentEvent?.detail ?? "智能体正在结合零件特征、机床能力和加工约束确定首道工序。"}</p>
+                  <ol>
+                    <li className={manufacturingFeatures.length > 0 ? "complete" : "active"}><i />模型与制造特征<span>{manufacturingFeatures.length > 0 ? `${manufacturingFeatures.length} 项已识别` : "解析中"}</span></li>
+                    <li className={manufacturingFeatures.length > 0 ? "active" : "waiting"}><i />机床、装夹与加工基准<span>{manufacturingFeatures.length > 0 ? "正在评估" : "等待特征"}</span></li>
+                    <li className="waiting"><i />生成第一道工序<span>等待规划</span></li>
+                    <li className="waiting"><i />刀路与材料仿真<span>等待工序</span></li>
+                  </ol>
+                  <div className="harness-route-current"><small>当前动作</small><strong>{activeAgentEvent?.title ?? activeAgentEvent?.message ?? (manufacturingFeatures.length > 0 ? "正在建立装夹与工序约束" : "正在读取模型几何")}</strong></div>
+                </div>}
+                {operations.map((operation) => {
+                  const state = harnessOperationState(operation);
+                  const setup = job.plan?.setups.find((candidate) => candidate.operations.some((item) => item.id === operation.id));
+                  return <button type="button" key={operation.id} className={`${state} ${selectedOperation?.id === operation.id ? "selected" : ""}`} title={`${operation.id} ${operation.name}`} onClick={() => selectHarnessOperation(operation)}>
+                    <i />
+                    <span><b>{operation.id}</b><strong>{operation.name}</strong><small>{setup?.name ?? "当前装夹"} · {operation.tool.name}</small></span>
+                    <em>{state === "accepted" ? "已验证" : state === "running" ? "验证中" : state === "blocked" ? "受阻" : "待验证"}</em>
+                  </button>;
+                })}
               </div>
-              <footer className={coverage?.status ?? "review"}>
-                <ShieldCheck size={16} />
-                <div><strong>{coverage?.production_ready ? "全部制造目标已有证据" : `仍有 ${coverage?.unresolved_count ?? 0} 项制造目标待解决`}</strong><span>{coverage?.issues?.[0] ?? coverage?.capability_gaps?.[0] ?? "每道工序的刀路、仿真和审核结果会持续归档。"}</span></div>
+              <footer>
+                {operations.length === 0
+                  ? <div className="harness-route-waiting-footer"><i />首道工序生成后自动显示</div>
+                  : <>
+                    <button type="button" className={harnessFollowLatest ? "active" : ""} onClick={() => setHarnessFollowLatest((current) => !current)}>{harnessFollowLatest ? "跟随中" : "跟随最新"}</button>
+                    {(harnessFocus === "toolpath" || harnessFocus === "simulation") && <button type="button" className={playbackMode === "single" ? "active" : ""} onClick={() => setPlaybackMode("single")}>单工序</button>}
+                    {(harnessFocus === "toolpath" || harnessFocus === "simulation") && <button type="button" className={playbackMode === "cumulative" ? "active" : ""} onClick={() => setPlaybackMode("cumulative")}>累计至此</button>}
+                    {harnessFocus === "simulation" && <button type="button" className="primary" onClick={showHarnessCumulativeResult}>全部累计</button>}
+                  </>}
+                {operations.length > 0 && coverage?.status === "incomplete" && <div className="harness-route-incomplete">
+                  <AlertTriangle size={12} />
+                  <span><strong>方案尚未完成</strong>还有 {Math.max(coverage.target_count - coverage.covered_count, 0)} 项制造目标待覆盖</span>
+                </div>}
               </footer>
-            </section>}
+            </aside>
 
             {(harnessFocus === "toolpath" || harnessFocus === "simulation") && <aside className="harness-evidence-card">
               <small>{harnessFocus === "simulation" ? "SIMULATION EVIDENCE" : "TOOLPATH EVIDENCE"}</small>
@@ -3190,26 +3231,10 @@ function Workbench({ initialJob, onNew, onHistory, readOnly = false }: { initial
                 : harnessFocus === "simulation" && !visibleSimulation && !visibleTurningStage && visibleMaterialSnapshots.urls.length === 0 && visibleToolpathSegments.length === 0
                   ? "当前工序还没有可回放的仿真证据，画布不会用静态模型冒充加工结果。"
                   : harnessFocus === "simulation"
-                    ? `${visibleMaterialSnapshots.stages.length || visibleToolpathSegments.length} 条可视化证据已载入，可使用底部播放控件回放。`
+                    ? `${visibleMaterialSnapshots.stages.length || visibleToolpathSegments.length} 条可视化证据已载入，可使用画布播放控件回放。`
                     : `${visibleToolpathSegments.length} 段运动轨迹已载入。`}</p>
               {activeSimulationSummary && <div>{activeSimulationSummary.metrics.slice(0, 2).map((metric) => <span key={metric.label}>{metric.label} <b>{metric.value}</b></span>)}</div>}
             </aside>}
-
-            <nav className="harness-operation-dock" aria-label="逐工序验证路线">
-              <div className="harness-dock-heading"><span>工序验证链</span><strong>{harnessAcceptedOperationIds.size}/{operations.length}</strong></div>
-              <div className="harness-dock-operations">
-                {operations.map((operation) => {
-                  const state = harnessOperationState(operation);
-                  return <button type="button" key={operation.id} className={`${state} ${selectedOperation?.id === operation.id ? "selected" : ""}`} title={`${operation.id} ${operation.name}`} onClick={() => {
-                    setSelectedOperation(operation);
-                    setSelectedFeatureIds(operation.feature_ids);
-                    setPlaybackResetToken((current) => current + 1);
-                    setActiveMode(initialHarnessMode);
-                    if (initialHarnessMode === "仿真" && isL32) void previewL32Operation(operation);
-                  }}><i /><b>{operation.id}</b><span>{operation.name}</span></button>;
-                })}
-              </div>
-            </nav>
           </>}
           {leftWorkbenchPanel === "agent" && selectedAgentArtifact && <AgentArtifactViewer artifact={selectedAgentArtifact} apiUrl={apiUrl} onClose={() => setSelectedAgentArtifact(null)} />}
           {leftWorkbenchPanel === "agent" && isL32 && l32AgentReview?.status === "waiting_human" && !selectedAgentArtifact && <L32AgentReviewPanel context={l32AgentReview} pending={l32AgentReviewPending} error={l32AgentReviewError} onDecision={(profileId, state) => void decideL32Profile(profileId, state)} />}

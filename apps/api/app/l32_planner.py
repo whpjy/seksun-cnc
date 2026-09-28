@@ -555,7 +555,7 @@ def build_l32_process_plan(
                     },
                     rationale=[
                         "局部内槽从已接受的精确内轮廓分离，OP28 仅加工基孔轮廓",
-                        "内槽刀杆入口、轴向伸出、槽形和现场实物完成审核前保持禁用",
+                        "内槽刀具按目录资源默认可用；入口、轴向伸出和槽形仍由确定性门禁验证",
                     ],
                     confidence=min(groove.confidence, 0.7), status="warning",
                 )
@@ -640,7 +640,7 @@ def build_l32_process_plan(
                 },
                 rationale=[
                     "使用左手小刀尖刀具沿正 Z 方向完成前端回转成形轮廓",
-                    "仅输出控制器无关 DRAFT，刀位与刀片实物仍需现场确认",
+                    "仅输出控制器无关 DRAFT；目录刀具与刀位资源默认可用",
                 ],
                 confidence=min(profile.confidence, 0.75), status="warning",
             )] if front_form_candidate is not None else []),

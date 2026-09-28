@@ -87,7 +87,7 @@ def build_manufacturing_route(
         missing.append("热处理、表面处理及特殊特性")
     missing.extend([
         "毛坯形式与供货状态",
-        "批量、实际设备、刀具、夹具、外协和成本约束",
+        "批量、外协和成本约束",
     ])
     if requirements and requirements.unresolved_requirement_ids:
         missing.append(f"{len(requirements.unresolved_requirement_ids)} 项图纸要求仍未唯一绑定到三维特征")
