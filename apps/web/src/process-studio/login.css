@@ -1,0 +1,98 @@
+.login-shell{background-color: rgb(232, 237, 242); background-image: linear-gradient(rgba(62, 83, 104, 0.08) 1px, rgba(0, 0, 0, 0) 1px), linear-gradient(90deg, rgba(62, 83, 104, 0.08) 1px, rgba(0, 0, 0, 0) 1px); background-size: 32px 32px; place-items: center; width: 100%; height: 100%; padding: 20px; display: grid;}
+.login-panel{background: rgb(255, 255, 255); border: 1px solid rgb(157, 183, 213); border-radius: 8px; width: min(380px, 100%); overflow: hidden; box-shadow: rgba(35, 55, 75, 0.18) 0px 14px 34px;}
+.login-brand{color: rgb(255, 255, 255); background: rgb(47, 104, 232); align-items: center; gap: 13px; min-height: 94px; padding: 18px 20px; display: flex;}
+.login-brand > span{background: rgba(255, 255, 255, 0.12); border: 1px solid rgba(255, 255, 255, 0.75); border-radius: 7px; flex: 0 0 auto; place-items: center; width: 46px; height: 46px; font-size: 14px; font-weight: 900; display: grid;}
+.login-brand h2{letter-spacing: 0px; margin: 0px; font-size: 18px;}
+.login-brand p{color: rgba(255, 255, 255, 0.8); margin: 5px 0px 0px; font-size: 10px;}
+.login-form{gap: 15px; padding: 22px 20px 20px; display: grid;}
+.login-form > label{gap: 7px; display: grid;}
+.login-form > label > span{color: rgb(62, 83, 107); font-size: 10px; font-weight: 850;}
+.login-form input{color: rgb(36, 54, 74); background: rgb(255, 255, 255); border: 1px solid rgb(183, 201, 220); border-radius: 5px; width: 100%; height: 40px; padding: 0px 11px; font-size: 12px;}
+.login-form input:focus{border-color: rgb(47, 104, 232);}
+.password-field{position: relative;}
+.password-field input{padding-right: 42px;}
+.password-field button{color: rgb(97, 117, 140); cursor: pointer; background: 0px 0px; border: 0px; border-radius: 4px; place-items: center; width: 34px; display: grid; position: absolute; inset: 3px 3px 3px auto;}
+.password-field button:hover{color: rgb(47, 104, 232); background: rgb(237, 245, 255);}
+.password-field svg{width: 17px;}
+.login-error{color: rgb(169, 37, 42); background: rgb(255, 242, 242); border: 1px solid rgb(239, 177, 180); border-radius: 5px; align-items: center; gap: 8px; min-height: 36px; padding: 8px 10px; font-size: 10px; display: flex;}
+.login-error svg{flex: 0 0 auto; width: 16px;}
+.login-submit{color: rgb(255, 255, 255); cursor: pointer; background: rgb(47, 104, 232); border: 1px solid rgb(23, 79, 199); border-radius: 5px; justify-content: center; align-items: center; gap: 8px; height: 40px; font-size: 11px; font-weight: 900; display: flex;}
+.login-submit:disabled{opacity: 0.58; cursor: wait;}
+.login-submit svg{width: 17px;}
+.login-panel{border-color: rgb(157, 183, 213); box-shadow: rgba(35, 55, 75, 0.18) 0px 14px 34px;}
+.login-brand, .login-submit{background: var(--industrial-panel);}
+.login-form input:focus{border-color: var(--blue);}
+.login-submit{border-color: var(--blue-dark);}
+.login-submit:hover{background: rgb(36, 91, 209);}
+.password-field button:hover{color: inherit; background: rgba(255, 255, 255, 0.14);}
+.login-shell{isolation: isolate; background: rgb(234, 244, 255); grid-template-columns: minmax(0px, 1fr) minmax(360px, 410px); place-items: center stretch; padding: clamp(24px, 4vw, 72px); position: relative; overflow: hidden;}
+.login-shell::after{content: ""; z-index: -1; pointer-events: none; background: rgba(226, 241, 255, 0.08); position: absolute; inset: 0px;}
+.login-visual{z-index: 0; width: 100%; height: 100%; position: absolute; inset: 0px; overflow: hidden;}
+.login-visual img{object-fit: cover; object-position: center center; will-change: transform; width: 100%; height: 100%; animation: 22s ease-in-out 0s infinite alternate none running login-background-drift; display: block;}
+.login-scanline{z-index: 1; opacity: 0.58; pointer-events: none; background: rgba(24, 111, 242, 0.72); height: 2px; animation: 9s linear 0s infinite normal none running login-scan; position: absolute; top: 8%; left: 0px; right: 0px; box-shadow: rgba(24, 111, 242, 0.72) 0px 0px 9px, rgba(47, 104, 232, 0.48) 0px 0px 24px;}
+.login-intro{z-index: 2; color: rgb(23, 60, 120); text-shadow: rgba(255, 255, 255, 0.9) 0px 1px, rgba(245, 251, 255, 0.95) 0px 0px 22px; grid-column: 1; place-self: start; width: min(540px, 100%); margin: clamp(20px, 6vh, 64px) 0px 0px clamp(24px, 3vw, 52px); animation: 0.6s cubic-bezier(0.2, 0.72, 0.24, 1) 0s 1 normal both running login-intro-enter; position: relative;}
+.login-intro-kicker{color: rgb(36, 98, 175); letter-spacing: 0px; align-items: center; gap: 10px; margin: 0px; font-size: 10px; font-weight: 900; display: flex;}
+.login-intro-kicker::before{content: ""; background: rgb(47, 104, 232); flex: 0 0 auto; width: 40px; height: 3px; box-shadow: rgba(47, 104, 232, 0.28) 0px 0px 12px;}
+.login-intro h1{color: rgb(21, 62, 106); letter-spacing: 0px; max-width: 520px; margin: 12px 0px 13px; font-size: 32px; line-height: 1.22;}
+.login-intro-copy{color: rgb(53, 92, 128); max-width: 520px; margin: 0px; font-size: 13px; font-weight: 650; line-height: 1.75;}
+.login-shell .login-panel{z-index: 2; color: rgb(24, 50, 77); backdrop-filter: blur(18px) saturate(108%); background: rgba(246, 251, 255, 0.86); border: 1px solid rgba(112, 158, 208, 0.38); border-radius: 7px; grid-column: 2; justify-self: end; width: min(410px, 100%); animation: 0.55s cubic-bezier(0.2, 0.72, 0.24, 1) 0s 1 normal both running login-panel-enter; position: relative; overflow: hidden; box-shadow: rgba(47, 91, 137, 0.22) 0px 24px 64px, rgba(255, 255, 255, 0.86) 0px 1px inset;}
+.login-shell .login-panel::before{content: none;}
+.login-shell .login-brand{color: rgb(24, 50, 77); background: 0px 0px; border-bottom: 1px solid rgba(112, 158, 208, 0.2); min-height: 108px; padding: 22px 24px;}
+.login-shell .login-brand > span{color: rgb(255, 255, 255); background: rgb(47, 104, 232); border-color: rgba(47, 104, 232, 0.72); border-radius: 5px; width: 48px; height: 48px; box-shadow: rgba(255, 255, 255, 0.16) 0px 0px 0px 1px inset, rgba(47, 104, 232, 0.18) 0px 8px 22px;}
+.login-shell .login-brand h2{font-size: 19px;}
+.login-shell .login-brand p{color: rgb(88, 113, 138); font-size: 10px;}
+.login-shell .login-form{gap: 16px; padding: 24px;}
+.login-shell .login-form > label > span{color: rgb(61, 88, 114);}
+.login-shell .login-form input{color: rgb(31, 56, 80); background: rgba(255, 255, 255, 0.74); border-color: rgba(112, 158, 208, 0.42); height: 42px; box-shadow: rgba(39, 76, 112, 0.06) 0px 1px 3px inset;}
+.login-shell .login-form input:hover{border-color: rgba(80, 137, 204, 0.62);}
+.login-shell .login-form input:focus{background: rgba(255, 255, 255, 0.94); border-color: rgb(110, 164, 244); box-shadow: rgba(47, 104, 232, 0.14) 0px 0px 0px 3px;}
+.login-shell .password-field button{color: rgb(97, 123, 148);}
+.login-shell .password-field button:hover{color: rgb(47, 104, 232); background: rgb(237, 245, 255);}
+.login-shell .login-submit{background: rgb(47, 104, 232); border-color: rgb(74, 126, 228); border-radius: 4px; height: 42px; transition: background 0.16s, transform 0.16s, box-shadow 0.16s; box-shadow: rgba(12, 58, 160, 0.28) 0px 8px 22px;}
+.login-shell .login-submit:hover{background: rgb(59, 116, 235); transform: translateY(-1px); box-shadow: rgba(12, 58, 160, 0.36) 0px 10px 26px;}
+.login-shell .login-submit:active{transform: translateY(0px);}
+.login-shell .login-error{color: rgb(169, 37, 42); background: rgba(255, 239, 240, 0.9); border-color: rgba(220, 80, 88, 0.42);}
+.login-toast{z-index: 20; color: rgb(36, 66, 95); backdrop-filter: blur(12px); background: rgba(249, 252, 255, 0.96); border: 1px solid rgb(169, 199, 235); border-radius: 5px; justify-content: center; align-items: center; gap: 9px; min-width: min(340px, -32px + 100vw); min-height: 42px; padding: 9px 14px; font-size: 11px; font-weight: 800; animation: 0.24s ease-out 0s 1 normal both running login-toast-enter; display: flex; position: fixed; top: 22px; left: 50%; transform: translate(-50%); box-shadow: rgba(38, 77, 118, 0.2) 0px 10px 28px;}
+.login-toast svg{flex: 0 0 auto; width: 18px;}
+.login-toast.success{color: rgb(8, 112, 82); background: rgba(241, 255, 250, 0.96); border-color: rgb(143, 210, 188);}
+.login-toast.error{color: rgb(169, 37, 42); background: rgba(255, 246, 246, 0.97); border-color: rgb(239, 170, 174);}
+@keyframes login-background-drift { 
+  0% { transform: scale(1.015) translate(-0.2%); }
+  100% { transform: scale(1.04) translate(0.2%, -0.2%); }
+}
+@keyframes login-scan { 
+  0% { opacity: 0; top: 7%; }
+  8%, 88% { opacity: 0.58; }
+  100% { opacity: 0; top: 93%; }
+}
+@keyframes login-panel-enter { 
+  0% { opacity: 0; transform: translate(18px); }
+  100% { opacity: 1; transform: translate(0px, 0px); }
+}
+@keyframes login-intro-enter { 
+  0% { opacity: 0; transform: translate(-16px); }
+  100% { opacity: 1; transform: translate(0px, 0px); }
+}
+@keyframes login-toast-enter { 
+  0% { opacity: 0; transform: translate(-50%, -10px); }
+  100% { opacity: 1; transform: translate(-50%); }
+}
+@media (width <= 900px) {
+  .login-shell { grid-template-columns: minmax(0px, 1fr); place-items: center; padding: 16px; }
+  .login-visual { opacity: 1; }
+  .login-visual img { object-fit: cover; object-position: 32% center; width: 100%; }
+  .login-scanline { right: 0px; }
+  .login-shell::after { background: rgba(225, 240, 255, 0.18); }
+  .login-intro { text-align: center; width: auto; margin: 0px; position: absolute; top: 18px; left: 20px; right: 20px; }
+  .login-intro-kicker, .login-intro-copy { display: none; }
+  .login-intro h1 { max-width: none; margin: 0px; font-size: 20px; }
+  .login-shell .login-panel { background: rgba(247, 252, 255, 0.94); grid-column: 1; justify-self: center; }
+  .login-toast { top: 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .login-visual img, .login-scanline, .login-intro, .login-shell .login-panel, .login-toast { animation: auto ease 0s 1 normal none running none; }
+}
+.process-login { height:100dvh; box-sizing:border-box; font-family:Inter,"Microsoft YaHei","PingFang SC",Arial,sans-serif; }
+.process-login *, .process-login *::before, .process-login *::after { box-sizing:border-box; }
+.process-login button,.process-login input { font-family:inherit; }
+.process-login input:focus { outline:2px solid #91b4ff; outline-offset:2px; }

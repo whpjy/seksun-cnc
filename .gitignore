@@ -17,3 +17,5 @@ vendor/*.AppImage
 .browser-*-profile/
 tmp-*
 .vscode
+*.md
+*.mmd

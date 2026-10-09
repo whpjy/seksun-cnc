@@ -54,6 +54,7 @@ type Props = {
   spatialDefects?: { regions: SpatialDefectRegion[]; samples: SpatialDefectSample[] } | null;
   onSelectDefect?: (region: SpatialDefectRegion) => void;
   viewMode?: ViewMode;
+  backgroundColor?: number;
   isolatedFeatureId?: string | null;
   workAxis?: Vec3 | null;
   activeOperationLabel?: string;
@@ -63,6 +64,7 @@ type Props = {
   compositionInsetLeftRatio?: number;
   compositionInsetRightRatio?: number;
   showFeatureAnnotations?: boolean;
+  releaseContextOnCleanup?: boolean;
 };
 
 const EMPTY_TOOLPATH_SEGMENTS: ToolpathSegment[] = [];
@@ -101,7 +103,7 @@ function featureFilterKey(feature: ManufacturingFeature): FeatureFilterKey {
   return "profile";
 }
 
-export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", isolatedFeatureId = null, workAxis = null, activeOperationLabel = "", operationContextVisible = false, operationIntent = null, showFeatureSummary = true, compositionInsetLeftRatio = 0, compositionInsetRightRatio = 0, showFeatureAnnotations = false }: Props) {
+export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFeature, toolpathSegments = EMPTY_TOOLPATH_SEGMENTS, materialSnapshotUrls = EMPTY_MATERIAL_SNAPSHOT_URLS, materialSnapshotStages = EMPTY_MATERIAL_SNAPSHOT_STAGES, initialToolpathSegments = EMPTY_TOOLPATH_SEGMENTS, profileBoundaries = EMPTY_PROFILE_BOUNDARIES, simulation = null, simulationBlocked = false, turningStage = null, camoticsSurface = null, fixtureComponents = EMPTY_FIXTURE_COMPONENTS, animateToolpath = false, initialProgress = 0, playbackResetToken = 0, operationTools = EMPTY_OPERATION_TOOLS, topologyEdges = EMPTY_TOPOLOGY_EDGES, activeOperationId, isFinalOperation = false, toolpathLoaded = true, playbackMode = "cumulative", onPlaybackModeChange, formingPreview = null, spatialDefects = null, onSelectDefect, viewMode = "特征", backgroundColor, isolatedFeatureId = null, workAxis = null, activeOperationLabel = "", operationContextVisible = false, operationIntent = null, showFeatureSummary = true, compositionInsetLeftRatio = 0, compositionInsetRightRatio = 0, showFeatureAnnotations = false, releaseContextOnCleanup = false }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const axisHostRef = useRef<HTMLDivElement>(null);
   const markersRef = useRef<Map<string, THREE.Mesh>>(new Map());
@@ -231,12 +233,12 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
     if (!host || !axisHost) return;
     const cameraMemory = cameraByModeRef.current;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(
+    scene.background = new THREE.Color(backgroundColor ?? (
       viewMode === "特征" ? 0xdce7f1
         : viewMode === "工艺" ? 0xe4e9ec
           : viewMode === "刀路" ? 0xd6e1e8
-            : 0xc9cdd0,
-    );
+            : 0xc9cdd0
+    ));
     const camera = new THREE.OrthographicCamera(-100, 100, 100, -100, 0.1, 100000);
     camera.up.set(0, 0, 1);
     camera.position.set(120, -140, 150);
@@ -2035,6 +2037,10 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       controls.dispose();
       renderer.dispose();
       axisRenderer.dispose();
+      if (releaseContextOnCleanup) {
+        renderer.forceContextLoss();
+        axisRenderer.forceContextLoss();
+      }
       axisGroup.traverse((object) => {
         if (object instanceof THREE.Mesh || object instanceof THREE.Line) {
           object.geometry.dispose();
@@ -2115,7 +2121,7 @@ export function ModelViewer({ modelUrl, features, selectedFeatureIds, onSelectFe
       host.removeChild(annotationLayer);
       axisHost.removeChild(axisRenderer.domElement);
     };
-  }, [activeOperationId, animateToolpath, cameraContentKey, cameraKey, camoticsSurface, compositionInsetLeftRatio, compositionInsetRightRatio, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, isolatedFeatureId, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationIntent, operationTools, playbackKey, profileBoundaries, renderedFeatures, showFeatureAnnotations, simulation, spatialDefects, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
+  }, [activeOperationId, animateToolpath, backgroundColor, cameraContentKey, cameraKey, camoticsSurface, compositionInsetLeftRatio, compositionInsetRightRatio, features, fixtureComponents, formingPreview, initialToolpathSegments, isFinalOperation, isolatedFeatureId, materialSnapshotStages, materialSnapshotUrls, modelUrl, operationIntent, operationTools, playbackKey, profileBoundaries, renderedFeatures, releaseContextOnCleanup, showFeatureAnnotations, simulation, spatialDefects, toolpathSegments, topologyEdges, turningStage, viewMode, workAxis]);
 
   const activeTool = activeMotion ? operationTools[activeMotion.operation] : undefined;
   const activeFormingStage = formingPreview?.stages.length

@@ -7144,6 +7144,111 @@ def select_job_solid(job_id: str, request: SolidSelectionRequest) -> JobResponse
     return job
 
 
+GENERIC_NC_LOCK = threading.Lock()
+GENERIC_NC_JOBS: set[str] = set()
+
+
+def _generic_nc_source(job_id: str):
+    from .generic_nc import signature
+    job = load_job(job_id)
+    rotational = _optional_job_json(job_directory(job_id), "rotational-features.json")
+    return job, rotational, signature(job, rotational)
+
+
+@app.get("/api/v1/jobs/{job_id}/gcode/generic")
+def get_generic_nc(job_id: str) -> dict[str, object]:
+    from .generic_nc import NOTICE
+    _, _, current_signature = _generic_nc_source(job_id)
+    manifest = _optional_job_json(job_directory(job_id) / "generic-nc", "manifest.json")
+    if not manifest:
+        return {"status": "not_generated", "production_ready": False, "notice": NOTICE,
+                "programs": [], "missing": [], "generated_count": 0}
+    if manifest.get("source_signature") != current_signature:
+        return {**manifest, "status": "stale", "notice": "方案或几何已变化，请重新生成通用程序。", "programs": []}
+    base = f"/api/v1/jobs/{job_id}/gcode/generic"
+    return {**manifest, "programs": [{**p, "url": f"{base}/files/{p['filename']}"} for p in manifest["programs"]],
+            "bundle_url": f"{base}/bundle" if manifest["programs"] else None}
+
+
+@app.post("/api/v1/jobs/{job_id}/gcode/generic")
+def generate_generic_nc(job_id: str) -> dict[str, object]:
+    from .generic_nc import build_programs
+    job, rotational, source_signature = _generic_nc_source(job_id)
+    with GENERIC_NC_LOCK:
+        if job_id in GENERIC_NC_JOBS:
+            raise HTTPException(status_code=409, detail="该任务的通用程序正在生成，请稍后查看")
+        GENERIC_NC_JOBS.add(job_id)
+    try:
+        faces = None
+        def exterior_faces():
+            nonlocal faces
+            if faces is None:
+                try:
+                    faces = get_l32_catalog_ear_geometry(job_id)["side_faces"]
+                except HTTPException as error:
+                    raise ValueError(f"外形刀路几何不可用：{error.detail}") from error
+            return faces
+        try:
+            manifest, files = build_programs(job, rotational, exterior_faces)
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if _generic_nc_source(job_id)[2] != source_signature:
+            raise HTTPException(status_code=409, detail="生成期间方案已变化，请重新生成")
+        directory = job_directory(job_id) / "generic-nc"
+        directory.mkdir(exist_ok=True)
+        # Immutable source directories prevent a concurrent download from mixing revisions.
+        revision = directory / source_signature
+        revision.mkdir(exist_ok=True)
+        for filename, content in files.items():
+            temporary = revision / f".{uuid.uuid4().hex}.tmp"
+            try:
+                temporary.write_text(content, encoding="utf-8", newline="\n")
+                os.replace(temporary, revision / filename)
+            finally:
+                temporary.unlink(missing_ok=True)
+        manifest["created_at"] = datetime.now(UTC).isoformat()
+        write_json(directory / "manifest.json", manifest)
+        return get_generic_nc(job_id)
+    finally:
+        with GENERIC_NC_LOCK: GENERIC_NC_JOBS.discard(job_id)
+
+
+@app.get("/api/v1/jobs/{job_id}/gcode/generic/files/{filename}")
+def download_generic_nc(job_id: str, filename: str) -> FileResponse:
+    manifest = get_generic_nc(job_id)
+    if manifest["status"] == "stale": raise HTTPException(status_code=409, detail="通用程序已失效，请重新生成")
+    item = next((p for p in manifest["programs"] if p["filename"] == filename), None)
+    if item is None or Path(filename).name != filename:
+        raise HTTPException(status_code=404, detail="通用程序文件不存在")
+    path = job_directory(job_id) / "generic-nc" / manifest["source_signature"] / filename
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
+        raise HTTPException(status_code=409, detail="通用程序文件校验失败，请重新生成")
+    return FileResponse(path, media_type="text/plain", filename=filename)
+
+
+@app.get("/api/v1/jobs/{job_id}/gcode/generic/bundle")
+def download_generic_nc_bundle(job_id: str) -> Response:
+    from io import BytesIO
+    from zipfile import ZIP_DEFLATED, ZipFile
+    manifest = get_generic_nc(job_id)
+    if manifest["status"] == "stale": raise HTTPException(status_code=409, detail="通用程序已失效，请重新生成")
+    if not manifest["programs"]: raise HTTPException(status_code=404, detail="尚未生成通用程序")
+    stream = BytesIO()
+    with ZipFile(stream, "w", ZIP_DEFLATED) as bundle:
+        for item in manifest["programs"]:
+            file = download_generic_nc(job_id, item["filename"])
+            content = Path(file.path).read_bytes()
+            if hashlib.sha256(content).hexdigest() != item["sha256"]:
+                raise HTTPException(status_code=409, detail="程序版本已变化，请重新下载")
+            bundle.writestr(item["filename"], content)
+        bundle.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        bundle.writestr("README.txt", manifest["notice"] + "\n各 NC 文件是独立工序草案，未编排接料、装夹和通道同步；不能拼接后直接上机。\n")
+    if get_generic_nc(job_id).get("source_signature") != manifest["source_signature"] or get_generic_nc(job_id)["status"] == "stale":
+        raise HTTPException(status_code=409, detail="程序版本已变化，请重新下载")
+    return Response(stream.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="generic-nc-review.zip"'})
+
+
 @app.get("/api/v1/jobs/{job_id}/files/{filename}")
 def get_job_file(job_id: str, filename: str) -> FileResponse:
     allowed = {
