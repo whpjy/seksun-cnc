@@ -143,7 +143,11 @@ def build_l32_process_plan(
                 item.review_state == "accepted" for item in analysis.prismatic_features
             ):
                 finished_back_z = min(finished_back_z, solid_span[0])
-        radial_allowance = max(1.0, round(maximum_radius * 0.05, 2))
+        from .stock_selection import load_stock_rule, select_solid_bar
+        selected_stock = select_solid_bar(maximum_radius * 2,
+            min(finished_back_z, solid_span[0]) if solid_span else finished_back_z,
+            max(max(z_values), solid_span[1]) if solid_span else max(z_values), load_stock_rule())
+        radial_allowance = float(selected_stock["allowance_mm"]["radial"])
         stock_radius = maximum_radius + radial_allowance
         stock_length = max(
             profile_length,
@@ -155,11 +159,15 @@ def build_l32_process_plan(
             "length_mm": round(stock_length, 3),
             "allowance_mm": {"radial": radial_allowance, "axial": 2.0},
             "rotational_profile_id": profile.id,
+            "rotational_axis": spindle_axis.model_dump(mode="json") if spindle_axis else None,
             "profile_review_state": profile.review_state,
             "profile_extraction_method": profile.extraction_method,
             "profile_axial_complete": axial_profile_complete,
             "finished_back_z_mm": round(finished_back_z, 6),
         }
+        stock.update(selected_stock)
+        stock_radius = float(stock["diameter_mm"]) / 2
+        stock_length = float(stock["length_mm"])
         if protected_limit is not None:
             stock["nonrotational_turning_limit_z_mm"] = round(protected_limit, 6)
             stock["nonrotational_region_z_mm"] = [

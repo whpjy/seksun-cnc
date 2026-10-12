@@ -177,6 +177,8 @@ class MaterialProfile(BaseModel):
     drilling_speed_m_min: float
     mill_feed_per_tooth_mm: float
     drill_feed_per_rev_mm: float
+    parameter_status: str = "catalog_reference"
+    parameter_source: str = "内置参数参考，需结合实际刀具审核"
 
 
 class MachineProfile(BaseModel):
@@ -208,6 +210,7 @@ class SafetyConfiguration(BaseModel):
 
 
 class Operation(BaseModel):
+    profile_authorization: dict[str, Any] | None = None
     id: str
     sequence: int
     type: str
@@ -469,6 +472,7 @@ class JobResponse(BaseModel):
     model_url: str | None = None
     drawing_filename: str | None = None
     drawing_url: str | None = None
+    drawing_analysis: dict[str, Any] | None = None
     measurement_job_id: str | None = None
     error: str | None = None
 

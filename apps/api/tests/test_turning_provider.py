@@ -367,3 +367,16 @@ def test_axial_drilling_ir_preserves_reviewed_chip_evacuation_and_coolant() -> N
 def test_unimplemented_back_turning_is_rejected_instead_of_emitting_unsafe_ir() -> None:
     with pytest.raises(ValueError, match="does not support"):
         TurningProvider().generate(operation("back_turning", tool_id="TURN-ID-R"), context())
+@pytest.mark.parametrize("direction,expected",[("negative_z",[8.5,8,7.5,7.2]),("positive_z",[-31.5,-31,-30.5,-30.2])])
+def test_facing_layers_and_allowance_follow_chucking_direction(direction,expected):
+    ctx=TurningContext(machine_snapshot_hash="a"*64,stock_radius_mm=12,cut_direction=direction,stock_z_min_mm=-32,stock_z_max_mm=9)
+    profile=stepped_profile()
+    if direction=="negative_z":
+        profile.points[-1].z=7
+    program=TurningProvider().generate(operation("turn_facing",stock_allowance_mm=.2,depth_of_cut_mm=.5),ctx,profile)
+    z=next(p.axes["Z"] for p in program.channels[0].commands if p.type=="feed_move")
+    cuts=[]
+    for command in program.channels[0].commands:
+        z=command.axes.get("Z",z)
+        if command.parameters.get("cut_side")=="facing":cuts.append(z)
+    assert cuts==pytest.approx(expected)

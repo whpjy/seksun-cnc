@@ -1,7 +1,7 @@
 import type { AgentWorkspace, Job } from "../types";
 import type { JournalEvent } from "./harness";
 
-export type TrialState = { accepted_operation_ids: string[]; formally_accepted_operation_ids?: string[]; provisional_operation_ids?: string[]; production_ready?: boolean };
+export type TrialState = { accepted_operation_ids: string[]; formally_accepted_operation_ids?: string[]; provisional_operation_ids?: string[]; production_ready?: boolean; planning_status?: string; planning_reason?: string };
 export type Delivery = { path: string; label: string };
 export function finalText(events: JournalEvent[]): string {
   const lastEnd = events.filter(e => e.type === "turn/end").at(-1);
@@ -23,7 +23,8 @@ export function outcome(job: Job | null, workspace: AgentWorkspace | null, trial
   const accepted = trials?.accepted_operation_ids || [];
   const last = workspace?.events.filter(e => e.stage === "harness_plan_finalize").at(-1);
   const ready = coverage?.production_ready === true && trials?.production_ready === true;
-  return { label: ready ? "验证通过" : last?.status === "blocked" || coverage?.status === "incomplete" || coverage?.status === "review" ? "部分验证通过" : accepted.length ? "工序试算已完成" : "工艺草案待验证", ready, accepted, coverage };
+  const incomplete = last?.status === "blocked" || coverage?.status === "incomplete" || coverage?.status === "review";
+  return { label: ready ? "验证通过" : trials?.planning_status === "blocked" ? "工艺规划受阻" : incomplete ? "工艺规划未完成" : accepted.length ? "局部工序试算已完成" : "工艺草案待验证", ready, accepted, coverage };
 }
 
 export function operationState(id: string, trials: TrialState | null, workspace: AgentWorkspace | null): string {

@@ -283,7 +283,7 @@ def test_l32_builds_formal_turning_plan_from_rotational_profile() -> None:
     assert plan.machine_profile is not None
     assert plan.machine_profile.id == "citizen-cincom-l32"
     assert plan.stock["type"] == "round_bar"
-    assert plan.stock["diameter_mm"] == 22
+    assert plan.stock["diameter_mm"] == 20.2
     assert plan.stock["length_mm"] == 54
     assert plan.stock["rotational_profile_id"] == "RP-OUTER-1"
     assert plan.stock["profile_review_state"] == "review"
@@ -995,7 +995,7 @@ def test_internal_groove_runs_after_base_bore_and_passes_continuous_chain(
 def test_l32_marks_38mm_option_without_rejecting_supported_stock() -> None:
     plan = build_process_plan(shaft_analysis(radius=18), "S45C", "Citizen Cincom L32")
 
-    assert plan.stock["diameter_mm"] == 38
+    assert plan.stock["diameter_mm"] == 36.2
     assert plan.stock["required_option"] == "bar_diameter_38mm"
     assert plan.automation_status == "review"
     assert plan.blocking_reasons == []
@@ -1033,7 +1033,7 @@ def test_recognized_only_thread_does_not_add_threading_draft() -> None:
 def test_l32_rejects_stock_larger_than_known_38mm_option() -> None:
     plan = build_process_plan(shaft_analysis(radius=19), "S45C", "Citizen Cincom L32")
 
-    assert plan.stock["diameter_mm"] == 40
+    assert plan.stock["diameter_mm"] == 38.2
     assert plan.automation_status == "unsupported"
     assert plan.blocking_reasons
     assert plan.setups == []

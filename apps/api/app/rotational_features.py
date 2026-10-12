@@ -613,7 +613,7 @@ def clip_rotational_profile(
     minimum_z: float,
     maximum_z: float,
 ) -> RotationalProfile:
-    """Clip a profile to point-aligned bounds used by a regional operation."""
+    """Clip the piecewise-linear contour, including interpolated boundary points."""
     if maximum_z <= minimum_z:
         raise ValueError("profile region maximum Z must be greater than minimum Z")
     profile_minimum = min(point.z for point in profile.points)
@@ -625,6 +625,19 @@ def clip_rotational_profile(
         for point in profile.points
         if minimum_z - 1e-9 <= point.z <= maximum_z + 1e-9
     ]
+    for bound in (minimum_z, maximum_z):
+        if any(abs(point.z-bound) <= 1e-9 for point in points):
+            continue
+        intersections = []
+        for left, right in zip(profile.points, profile.points[1:]):
+            if min(left.z,right.z) < bound < max(left.z,right.z):
+                fraction = (bound-left.z)/(right.z-left.z)
+                intersections.append(RotationalProfilePoint(z=bound,
+                    radius=left.radius+fraction*(right.radius-left.radius)))
+        if bound == minimum_z:
+            points = intersections + points
+        else:
+            points += intersections
     if len(points) < 2 or len({round(point.z, 9) for point in points}) < 2:
         raise ValueError("profile region must contain at least two axial positions")
     return profile.model_copy(update={"points": points})

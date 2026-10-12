@@ -30,6 +30,7 @@ class TurningStageSnapshot(BaseModel):
 class ContinuousTurningSimulationResult(BaseModel):
     schema_version: str = "1.0.0"
     status: Literal["passed", "failed"]
+    cutoff_operation_id: str | None = None
     main_frame_after_cutoff: TurningSimulationResult
     transferred_sub_frame_samples: list[TurningStockSample]
     sub_frame_final: TurningSimulationResult
@@ -145,6 +146,16 @@ def _volume(samples: list[TurningStockSample]) -> float:
     return max(total, 0)
 
 
+def _cutoff_operation_id(program: ToolpathProgram) -> str:
+    main = next((item for item in program.channels if item.id == "main"), None)
+    if main is None:
+        raise ValueError("whole-part program is missing channel: main")
+    cutoffs = [item for item in main.commands if item.type == "cutoff"]
+    if len(cutoffs) != 1:
+        raise ValueError(f"continuous transfer requires exactly one cutoff command; found {len(cutoffs)}")
+    return cutoffs[0].operation_id
+
+
 def _retained_material_boundary(program: ToolpathProgram, datum_z_mm: float) -> float:
     """Return the main-spindle Z at the retained edge of the cutoff kerf.
 
@@ -156,16 +167,18 @@ def _retained_material_boundary(program: ToolpathProgram, datum_z_mm: float) -> 
     main = next((item for item in program.channels if item.id == "main"), None)
     if main is None:
         raise ValueError("whole-part program is missing channel: main")
-    cutoff_feed = next((
+    cutoff_id = _cutoff_operation_id(program)
+    cutoff_feeds = [
         command for command in main.commands
-        if command.operation_id == "OP40"
+        if command.operation_id == cutoff_id
         and command.type == "feed_move"
         and command.parameters.get("cut_side") == "external"
         and float(command.parameters.get("axial_width_mm", 0)) > 0
         and "Z" in command.axes
-    ), None)
-    if cutoff_feed is None:
-        raise ValueError("whole-part program does not expose the OP40 cutoff kerf")
+    ]
+    if len(cutoff_feeds) != 1:
+        raise ValueError(f"whole-part program requires one unambiguous cutoff kerf for {cutoff_id}")
+    cutoff_feed = cutoff_feeds[0]
     boundary = float(cutoff_feed.axes["Z"]) + float(cutoff_feed.parameters["axial_width_mm"]) / 2
     if boundary > datum_z_mm + 1e-9:
         raise ValueError("cutoff kerf intrudes beyond the finished back datum")
@@ -202,6 +215,7 @@ def simulate_continuous_whole_part(
         resolution_mm=resolution_mm,
     )
     retained_boundary_z_mm = _retained_material_boundary(program, transfer_datum_z_mm)
+    cutoff_id = _cutoff_operation_id(program)
     retained_interior = [
         TurningStockSample(
             z=round(transfer_datum_z_mm - sample.z, 6),
@@ -214,13 +228,22 @@ def simulate_continuous_whole_part(
     retained_interior.sort(key=lambda item: item.z)
     if len(retained_interior) < 2:
         raise ValueError("cutoff transfer produced fewer than two retained material samples")
-    boundary_side = max(retained_interior, key=lambda item: item.z)
+    # Interpolate the actual cut-state boundary. Copying the first intact
+    # section back over the kerf edge creates half a cell of material on transfer.
+    ordered_main = sorted(main_result.samples, key=lambda item: item.z)
+    left = max((s for s in ordered_main if s.z <= retained_boundary_z_mm), key=lambda s:s.z, default=None)
+    right = min((s for s in ordered_main if s.z >= retained_boundary_z_mm), key=lambda s:s.z, default=None)
+    if left is None or right is None:
+        raise ValueError("cutoff retained boundary lies outside the simulated stock domain")
+    fraction = ((retained_boundary_z_mm-left.z)/(right.z-left.z)) if right.z > left.z else 0
+    boundary_outer = left.outer_radius + fraction * (right.outer_radius-left.outer_radius)
+    boundary_inner = left.inner_radius + fraction * (right.inner_radius-left.inner_radius)
     retained = [
         *retained_interior,
         TurningStockSample(
             z=round(transfer_datum_z_mm - retained_boundary_z_mm, 6),
-            outer_radius=boundary_side.outer_radius,
-            inner_radius=boundary_side.inner_radius,
+            outer_radius=boundary_outer,
+            inner_radius=boundary_inner,
         ),
     ]
     retained.sort(key=lambda item: item.z)
@@ -242,12 +265,18 @@ def simulate_continuous_whole_part(
         z_max_mm=retained[-1].z,
         resolution_mm=resolution_mm,
         initial_samples=retained,
-        excluded_operation_ids={"OP40"},
+        excluded_operation_ids={cutoff_id},
     )
     initial_volume = main_result.metrics.initial_volume_mm3
     transferred_volume = _volume(retained)
     final_volume = sub_result.metrics.remaining_volume_mm3
     checks = [
+        ContinuousMaterialCheck(
+            id="transfer_preserves_cut_stock",
+            status="passed" if transferred_volume <= main_result.metrics.remaining_volume_mm3 + 1e-6 else "failed",
+            message="转接材料不得超过切断后的实际剩余材料",
+            measured_value=round(transferred_volume-main_result.metrics.remaining_volume_mm3,6),
+        ),
         ContinuousMaterialCheck(
             id="transfer_volume_nonincrease",
             status="passed" if transferred_volume <= initial_volume + 1e-6 else "failed",
@@ -279,6 +308,7 @@ def simulate_continuous_whole_part(
     status = "failed" if any(item.status == "failed" for item in checks) else "passed"
     return ContinuousTurningSimulationResult(
         status=status,
+        cutoff_operation_id=cutoff_id,
         main_frame_after_cutoff=main_result,
         transferred_sub_frame_samples=retained,
         sub_frame_final=sub_result,

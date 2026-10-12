@@ -461,6 +461,7 @@ std::optional<RotationalSectionCandidate> collect_rotational_section(
     const double diagonal = shape_diagonal(shape);
     const double sampling_tolerance = std::clamp(diagonal / 20000.0, 0.001, 0.01);
     std::vector<RotationalSectionPoint> samples;
+    std::vector<std::vector<RotationalSectionPoint>> section_traces;
     TopTools_IndexedMapOfShape section_edges;
     TopExp::MapShapes(section.Shape(), TopAbs_EDGE, section_edges);
     for (int edge_index = 1; edge_index <= section_edges.Extent(); ++edge_index) {
@@ -469,14 +470,18 @@ std::optional<RotationalSectionCandidate> collect_rotational_section(
         GCPnts_QuasiUniformDeflection points(curve, sampling_tolerance);
         if (!points.IsDone() || points.NbPoints() < 2) continue;
         const int stride = std::max(1, static_cast<int>(std::ceil(points.NbPoints() / 1024.0)));
+        std::vector<RotationalSectionPoint> trace;
         for (int index = 1; index <= points.NbPoints(); index += stride) {
             const Vec3 point = point_to_vec(points.Value(index));
             const Vec3 delta = subtract(point, reference->center);
             samples.push_back({dot(delta, axis), std::abs(dot(delta, radial_direction))});
+            trace.push_back(samples.back());
         }
         const Vec3 point = point_to_vec(points.Value(points.NbPoints()));
         const Vec3 delta = subtract(point, reference->center);
         samples.push_back({dot(delta, axis), std::abs(dot(delta, radial_direction))});
+        trace.push_back(samples.back());
+        section_traces.push_back(std::move(trace));
     }
     if (samples.size() < 2) return std::nullopt;
 
@@ -515,6 +520,20 @@ std::optional<RotationalSectionCandidate> collect_rotational_section(
                     return std::abs(radius - item.radius) > radius_tolerance;
                 })) {
                 radii.push_back(item.radius);
+            }
+        }
+        // Every axial station must intersect all section curves, not just the
+        // curves with a sampled vertex at that Z. Otherwise inner fillet points
+        // can become a false OD while a straight outer wall has only endpoints.
+        for (const auto& trace : section_traces) {
+            for (std::size_t i = 1; i < trace.size(); ++i) {
+                const auto& left = trace[i - 1];
+                const auto& right = trace[i];
+                if (std::abs(right.z - left.z) < 1e-12) continue;
+                if (z < std::min(left.z, right.z) - 1e-9 || z > std::max(left.z, right.z) + 1e-9) continue;
+                const double fraction = std::clamp((z - left.z) / (right.z - left.z), 0.0, 1.0);
+                const double radius = left.radius + fraction * (right.radius - left.radius);
+                if (radius > radius_tolerance) radii.push_back(radius);
             }
         }
         if (radii.empty()) continue;

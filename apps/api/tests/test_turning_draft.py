@@ -431,6 +431,7 @@ def test_turning_draft_api_requires_the_job_bound_machine_snapshot(tmp_path, mon
 
 
 def test_synchronized_transfer_api_persists_controller_neutral_ir(tmp_path, monkeypatch) -> None:
+    from test_l32_operation_trial import job as trial_job
     monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
     job_id = "1" * 32
     directory = tmp_path / job_id
@@ -447,6 +448,7 @@ def test_synchronized_transfer_api_persists_controller_neutral_ir(tmp_path, monk
         machine_instance_id=snapshot.instance.id,
         machine_configuration_hash=snapshot.configuration_hash,
         analysis=_analysis(),
+        plan=trial_job(_transfer_request().operation).plan,
     ))
     main.write_json(directory / "machine-configuration.json", snapshot.model_dump(mode="json"))
     main.write_json(directory / "rotational-features.json", RotationalFeatureAnalysis(
@@ -463,7 +465,13 @@ def test_synchronized_transfer_api_persists_controller_neutral_ir(tmp_path, monk
     assert len(response.json()["toolpath"]["channels"]) == 2
     assert (directory / "turning-transfer-ir.json").is_file()
     assert (directory / "turning-transfer-draft.json").is_file()
+    assert (directory / "turning-transfer-evidence.json").is_file()
     assert client.get(f"/api/v1/jobs/{job_id}/files/turning-transfer-draft.json").status_code == 200
+    modified = _transfer_request()
+    modified.operation.parameters["z_mm"] = -999
+    rejected = client.post(f"/api/v1/jobs/{job_id}/turning/transfer/draft", json=modified.model_dump(mode="json"))
+    assert rejected.status_code == 422
+    assert "current process plan" in rejected.json()["detail"]
 
 
 def test_rotational_profile_review_is_persisted_and_required_by_draft_api(tmp_path, monkeypatch) -> None:

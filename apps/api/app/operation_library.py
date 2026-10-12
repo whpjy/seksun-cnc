@@ -189,7 +189,7 @@ OPERATION_DEFINITIONS = [
                ["surface_set", "solid"], ["ball_end_mill", "bull_end_mill", "end_mill"], "EM-6", [*COMMON_DEPTH, *COMMON_MILLING], "planned", False),
     definition("turn_facing", "车端面", "车削", "沿径向加工棒料或零件端面。", "Facing",
                ["rotational_face", "rotational_profile", "outer_rotational_profile"], ["turning_od"], "TURN-OD-R",
-               [number("stock_allowance_mm", "轴向余量", 0.0), number("depth_of_cut_mm", "切深", 0.5, minimum=0.01, group="cutting"), *COMMON_TURNING], "experimental", False, provider="turning"),
+               [ParameterDefinition(key="face_z_mm", label="成品端面 Z（不填时取完整参考端面）", type="number", group="geometry", unit="mm"), number("stock_allowance_mm", "端面保留轴向余量", 0.0), number("depth_of_cut_mm", "端面分层切深", 0.5, minimum=0.01, group="cutting"), *COMMON_TURNING], "experimental", False, provider="turning"),
     definition("turn_od_roughing", "外圆粗车", "车削", "按 Z-R 外轮廓分层去除外圆余量。", "ODRoughing",
                ["outer_rotational_profile"], ["turning_od"], "TURN-OD-R",
                [number("radial_allowance_mm", "径向余量", 0.3), number("axial_allowance_mm", "轴向余量", 0.15), number("depth_of_cut_mm", "径向切深", 1.0, minimum=0.01, group="cutting"), *COMMON_TURNING], "experimental", False, provider="turning"),

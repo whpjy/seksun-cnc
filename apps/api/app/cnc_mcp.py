@@ -67,12 +67,18 @@ class CncApiClient:
         *,
         device_id: str,
         material: str,
+        drawing: Path | None = None,
     ) -> dict[str, Any]:
-        with source.open("rb") as stream:
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            stream = stack.enter_context(source.open("rb"))
+            files = {"step": (source.name, stream, "application/step")}
+            if drawing:
+                files["drawing"] = (drawing.name, stack.enter_context(drawing.open("rb")), "application/pdf")
             response = self.request(
                 "POST",
                 "/api/v1/jobs/intake",
-                files={"step": (source.name, stream, "application/step")},
+                files=files,
                 data={"device_id": device_id, "material": material},
             )
         try:
@@ -116,6 +122,17 @@ def resolve_step_import(step_path: str) -> Path:
     maximum = int(os.getenv("CNC_MCP_MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
     if candidate.stat().st_size > maximum:
         raise CncApiError(f"STEP 文件超过 Harness 导入上限 {maximum // 1024 // 1024} MB")
+    return candidate
+
+
+def resolve_drawing_import(drawing_path: str) -> Path:
+    candidate = Path(drawing_path).expanduser().resolve()
+    if not candidate.is_file() or candidate.suffix.lower() != ".pdf":
+        raise CncApiError("二维图纸必须是存在的 PDF 文件")
+    if not any(candidate.is_relative_to(root) for root in _import_roots()):
+        raise CncApiError("图纸不在允许导入的附件目录中")
+    if candidate.stat().st_size > int(os.getenv("CNC_MCP_MAX_UPLOAD_BYTES", str(200 * 1024 * 1024))):
+        raise CncApiError("PDF 超过上传限制")
     return candidate
 
 
@@ -177,6 +194,12 @@ def summarize_job(job: dict[str, Any]) -> dict[str, Any]:
         "device_id": job.get("device_id"),
         "machine_instance_id": job.get("machine_instance_id"),
         "material": job.get("material"),
+        "drawing_filename": job.get("drawing_filename"),
+        "drawing_analysis": job.get("drawing_analysis"),
+        "manufacturing_requirements": plan.get("manufacturing_requirements"),
+        "material_parameters": plan.get("material_profile"),
+        "machining_policy": (plan.get("ai_planning") or {}).get("machining_policy"),
+        "feature_process_logic": (plan.get("ai_planning") or {}).get("feature_process_logic"),
         "stock": plan.get("stock") or {},
         # Empty setups are decision inputs. Harness must copy an exact ID
         # instead of inventing aliases such as setup-1, front, or SU-1.
@@ -261,7 +284,9 @@ def collect_geometry_references(
     job: dict[str, Any], rotational: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     """Build the exact geometry vocabulary accepted by operation creation."""
+    from .machining_geometry import axial_hole, job_axis
     analysis = job.get("analysis") or {}
+    axis = job_axis(job, rotational)
     references: dict[str, dict[str, Any]] = {}
 
     def add(identifier: Any, geometry_type: str, kind: Any = None, state: Any = None) -> None:
@@ -276,6 +301,15 @@ def collect_geometry_references(
     for item in analysis.get("cylindrical_features") or []:
         kind = item.get("kind")
         add(item.get("id"), "cylindrical_hole" if kind == "hole" else "cylindrical_face", kind, item.get("review_state"))
+        if item.get("id") and kind == "hole":
+            reference = references[str(item["id"])]
+            reference["compatible_geometry_types"] = ["cylindrical_hole"]
+            reference["machining_access"] = "radial_or_offset"
+            if axial_hole(item, axis):
+                reference["compatible_geometry_types"].append("axial_hole")
+                reference["machining_access"] = "coaxial"
+            reference["diameter_mm"] = item.get("diameter")
+            reference["depth_mm"] = item.get("length")
     for item in analysis.get("prismatic_features") or []:
         add(item.get("id"), f"prismatic_{item.get('kind')}", item.get("kind"), item.get("review_state"))
     for item in analysis.get("planar_machining_features") or []:
@@ -335,7 +369,9 @@ def summarize_operation_catalog(
             engine.get("provider") == "turning" or item.get("id") in l32_nonrotational
         ) if l32 else bool(item.get("manual_enabled"))
         accepts = set((item.get("geometry") or {}).get("accepts") or [])
-        compatible = [reference for reference in references if reference["geometry_type"] in accepts]
+        compatible = [reference for reference in references
+                      if reference.get("review_state") != "excluded"
+                      and accepts.intersection(reference.get("compatible_geometry_types", [reference["geometry_type"]]))]
         minimum = int((item.get("geometry") or {}).get("minimum_selection") or 1)
         if not agent_supported or len(compatible) < minimum:
             unavailable.append(item.get("id"))
@@ -357,7 +393,9 @@ def summarize_operation_catalog(
         "unavailable_definition_ids": unavailable,
         "catalog_rule": (
             "Only definitions[] may be passed to add_process_operation. Never invent a geometry ID, "
-            "and never call an unavailable definition."
+            "and never call an unavailable definition. An unavailable operation is an execution "
+            "limitation, not evidence that its manufacturing goal is unnecessary. Report such "
+            "goals as pending steps with their prerequisites and blockers."
         ),
     }
 
@@ -581,6 +619,9 @@ mcp = FastMCP(
         "or completion_allowed=false, this is a non-terminal continuation signal. Do not summarize the task as finished. "
         "Use next_target and its required_operation_types to add, trial, repair and accept the next missing operation, "
         "then call finalize_harness_process_plan again. A blocked operation stops only that operation: repair it, replace it, "
+        "A terminal capability_unavailable result permits an incomplete DRAFT report listing the unsupported targets. "
+        "Coaxial holes use axial_drilling for a real pilot hole before turn_id operations; use catalog geometry references. "
+        "Never create an initial bore by parameter alone, or add a zero-removal roughing step after finishing to satisfy coverage. "
         "or remove it and continue with another uncovered target. Ask the user only when authoritative geometry is ambiguous; "
         "never stop because physical inventory, machine accessories or catalog resources are thought to be unavailable. "
         "旧的完整草案可使用 advance_l32_operation 逐道审核，"
@@ -600,17 +641,20 @@ def create_job_from_step(
     step_path: str,
     device_id: str = "citizen-cincom-l32",
     material: str = "待确认",
+    drawing_path: str = "",
 ) -> dict[str, Any]:
     """导入 Harness 附件；默认只解析几何，不调用后台工艺规划器。"""
     global _active_job_id
     source = resolve_step_import(step_path)
+    drawing = resolve_drawing_import(drawing_path) if drawing_path.strip() else None
     payload = _client().upload_step(
-        source, device_id=device_id, material=material,
+        source, device_id=device_id, material=material, drawing=drawing,
     )
     _active_job_id = str(payload["id"])
     return {
         "job_id": _active_job_id,
         "filename": payload.get("filename") or source.name,
+        "drawing_filename": payload.get("drawing_filename"),
         "status": payload.get("status", "processing"),
         "device_id": payload.get("device_id") or device_id,
         "source_size_bytes": source.stat().st_size,
@@ -653,7 +697,7 @@ def initialize_process_draft(job_id: str = "") -> dict[str, Any]:
         raise CncApiError("工艺草案初始化响应格式无效")
     result = summarize_job(payload)
     result["planning_owner"] = "deepseek_harness"
-    result["next_action"] = "inspect_operation_catalog_then_add_process_operation"
+    result["next_action"] = "inspect_candidate_process_route_then_operation_catalog" if payload.get("device_id") == "citizen-cincom-l32" else "inspect_operation_catalog_then_add_process_operation"
     return result
 
 
@@ -697,6 +741,30 @@ def inspect_tool_catalog(
     result["job_id"] = resolved
     result["next_action"] = "select_catalog_tool_then_add_or_repair_operation"
     return result
+
+
+@mcp.tool()
+def inspect_side_hole_draft(feature_ids: list[str], job_id: str = "", tool_diameter_mm: float | None = None) -> dict[str, Any]:
+    """Read real STEP side-hole centerlines and offsets; not a material-removal trial or acceptance."""
+    from urllib.parse import urlencode
+    resolved, _ = _resolve_job_id(job_id)
+    query = {"feature_ids": ",".join(feature_ids)}
+    if tool_diameter_mm is not None:
+        query["tool_diameter_mm"] = tool_diameter_mm
+    result = _client().json("GET", f"/api/v1/jobs/{resolved}/side-hole-draft?{urlencode(query)}")
+    return {**result, "job_id": resolved, "next_action": "confirm_drawing_binding_and_machine_access_then_report_missing_exact_3d_executor"}
+
+
+@mcp.tool()
+def check_side_hole_material(feature_ids: list[str], job_id: str = "", tool_diameter_mm: float | None = None, drill_geometry: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run sandbox OCC subtraction. Optional explicit drill_geometry adds a conical tip and complete body dimensions; fixtures and machine transforms remain unverified. Never accepts an operation."""
+    from urllib.parse import urlencode
+    resolved, _ = _resolve_job_id(job_id)
+    query = {"feature_ids": ",".join(feature_ids)}
+    if tool_diameter_mm is not None:
+        query["tool_diameter_mm"] = tool_diameter_mm
+    result = _client().json("POST", f"/api/v1/jobs/{resolved}/side-hole-check?{urlencode(query)}", **({"json":drill_geometry} if drill_geometry is not None else {}))
+    return {**result, "job_id":resolved, "next_action":"review_target_contact_then_confirm_drill_tip_depth_machine_and_fixture_before_trial_acceptance"}
 
 
 @mcp.tool()
@@ -962,7 +1030,13 @@ def finalize_harness_process_plan(job_id: str = "") -> dict[str, Any]:
     )
     if not isinstance(payload, dict):
         raise CncApiError("Harness L32 工艺方案收口响应格式无效")
-    if payload.get("status") == "plan_incomplete" or payload.get("completion_allowed") is False:
+    if payload.get("reason") == "capability_unavailable" and payload.get("terminal") is True:
+        payload = {**payload, "agent_directive": {
+            "task_may_end": True, "route_complete": False,
+            "mandatory_action": "report_capability_gaps_and_incomplete_draft",
+            "prohibited_action": "final_answer_claiming_route_completion",
+        }}
+    elif payload.get("status") == "plan_incomplete" or payload.get("completion_allowed") is False:
         payload = {
             **payload,
             "agent_directive": {
@@ -1049,6 +1123,34 @@ def open_job_context(job_id: str = "") -> dict[str, Any]:
     result = summarize_job(payload)
     result["context_binding"] = {"source": source, "active_job_id": resolved}
     return result
+
+
+@mcp.tool()
+def inspect_candidate_process_route(job_id: str = "") -> dict[str, Any]:
+    """读取完整候选加工步骤、前置条件和实际建立进度；候选步骤不是已执行工序。"""
+    resolved, _ = _resolve_job_id(job_id)
+    return _client().json("GET", f"/api/v1/jobs/{resolved}/candidate-route")
+
+
+@mcp.tool()
+def inspect_l32_material_protection(job_id: str = "") -> dict[str, Any]:
+    """逐道比较前序累计材料与完整 STEP 成品实体，定位最早三维过切。二维轮廓通过不能替代此检查；不接受工序。"""
+    resolved, _ = _resolve_job_id(job_id)
+    return _client().json("POST", f"/api/v1/jobs/{resolved}/agent/l32/material-protection")
+
+
+@mcp.tool()
+def rebuild_l32_geometry_revision(job_id: str = "") -> dict[str, Any]:
+    """截面识别需要更新时，从原 STEP/二维图纸建立新版本和空白 Harness 草案；保留原任务，不复制旧工序或授权。随后 open_job_context 新 job_id 并重新规划。"""
+    resolved, _ = _resolve_job_id(job_id)
+    return _client().json("POST", f"/api/v1/jobs/{resolved}/geometry-revision")
+
+
+@mcp.tool()
+def save_candidate_process_route(steps: list[dict[str, Any]], job_id: str = "") -> dict[str, Any]:
+    """保存候选路线。每步提供 id/name/feature_ids/operation_types/reason，可选 prerequisite_ids/blockers/conditional/workpiece_side(front或back)；背面步骤须明确侧别，不得遗漏必需制造目标。"""
+    resolved, _ = _resolve_job_id(job_id)
+    return _client().json("PUT", f"/api/v1/jobs/{resolved}/candidate-route", json={"steps": steps})
 
 
 @mcp.tool()

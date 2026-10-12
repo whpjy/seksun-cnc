@@ -65,10 +65,18 @@ def evaluate_plan_coverage(
 
     for feature in analysis.cylindrical_features:
         if feature.kind == "hole" and feature.review_state != "excluded":
+            from .machining_geometry import axial_hole
+            coaxial = plan.stock.get("type") == "round_bar" and axial_hole(feature.model_dump(mode="json"), plan.stock.get("rotational_axis"))
+            required = {"axial_drilling"} if coaxial and feature.diameter <= 12 else {"turn_id_finishing"} if coaxial else {"drilling"} if feature.diameter <= 12 else {"helical_boring"}
             add_feature_target(
-                feature, "hole", {"drilling"} if feature.diameter <= 12 else {"helical_boring"},
+                feature, "hole", required,
                 f"Ø{feature.diameter:g} {feature.end_type} hole",
             )
+            if plan.stock.get("type") == "round_bar":
+                # An operation name or HF binding alone is not material evidence.
+                targets[-1].state = "covered" if feature.id in set(plan.stock.get("verified_hole_feature_ids", [])) else "review" if feature.review_state == "review" else "uncovered"
+                if targets[-1].state == "covered" and not targets[-1].covered_by:
+                    targets[-1].covered_by = [operation.id for operation in operations if operation.type in {"axial_drilling", "turn_id_roughing", "turn_id_finishing"}]
 
     for feature in analysis.prismatic_features:
         if feature.review_state == "excluded":
@@ -124,15 +132,15 @@ def evaluate_plan_coverage(
 
     if plan.stock.get("type") == "round_bar":
         profile_id = str(plan.stock.get("rotational_profile_id", ""))
-        turning_required = {"turn_od_roughing", "turn_od_finishing"}
+        turning_required = {"turn_od_finishing"}
         profile_operations = [
-            operation for operation in by_feature.get(profile_id, [])
-            if operation.type in turning_required
+            operation for operation in operations
+            if operation.type in turning_required and (profile_id in operation.feature_ids or operation.reference_profile_id == profile_id)
         ]
         found_types = {operation.type for operation in profile_operations}
         review_state = str(plan.stock.get("profile_review_state", "review"))
         protected_limit = plan.stock.get("nonrotational_turning_limit_z_mm")
-        covers_complete_profile = all(
+        covers_complete_profile = profile_id in set(plan.stock.get("verified_rotational_profile_ids", [])) or all(
             operation.parameters.get("profile_region_complete", True) is True
             or (
                 protected_limit is not None
@@ -145,11 +153,12 @@ def evaluate_plan_coverage(
             or protected_limit is not None
         )
         if (
-            review_state == "accepted"
+            (review_state == "accepted" or profile_id in set(plan.stock.get("verified_rotational_profile_ids", [])))
             and profile_id
             and turning_required <= found_types
             and covers_complete_profile
             and rotational_scope_complete
+            and ((plan.ai_planning or {}).get("planning_owner") != "deepseek_harness" or profile_id in set(plan.stock.get("verified_rotational_profile_ids", [])))
         ):
             state = "covered"
         elif review_state in {"review", "ai_provisional"}:
@@ -259,6 +268,17 @@ def evaluate_plan_coverage(
             ))
 
     issues: list[str] = []
+    if plan.manufacturing_requirements:
+        pending = [r for r in plan.manufacturing_requirements.requirements
+                   if r.verification_status not in {"verified", "verified_measurement", "engineer_approved"}]
+        if pending:
+            issues.append(f"{len(pending)} 项二维图纸尺寸、公差、材料或质量要求尚未验证；几何仿真不能替代尺寸检测和质量验收")
+        if plan.manufacturing_requirements.status != "complete":
+            issues.append("二维图纸与 CAD 的特征关联尚待审核")
+    if plan.material_profile and plan.material_profile.parameter_status == "unconfirmed":
+        issues.append("当前材料的切削参数尚未确认，只允许草案试算")
+    if plan.stock.get("drawing_evidence_changed"):
+        issues.append("图纸依据已变更，请重新应用毛坯规则并重算工序")
     source_solids = int(analysis.topology.get("source_solids", 1))
     selection_confirmed = bool(analysis.topology.get("selection_confirmed", 0))
     if source_solids > 1 and not selection_confirmed:

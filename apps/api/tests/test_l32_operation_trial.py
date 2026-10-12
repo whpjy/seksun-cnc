@@ -1,5 +1,6 @@
 import hashlib
 import json
+import pytest
 
 from app.agent.l32_operation_trial import (
     accept_trial,
@@ -27,6 +28,182 @@ from app.rotational_features import (
     TurningProfileFeature,
 )
 from types import SimpleNamespace
+
+
+def test_redundant_facing_cannot_be_accepted_even_with_forged_pass_flag():
+    source = job(operation("OP10", 10, "turn_facing"), operation("OP20", 20, "turn_facing"))
+    first, state = run_independent_trial(job=source, operation_id="OP10", rotational=rotational(), snapshot=snapshot(), state=None)
+    state = accept_trial(job=source, state=state, trial=first, operation_id="OP10")
+    second, state = run_independent_trial(job=source, operation_id="OP20", rotational=rotational(), snapshot=snapshot(), state=state)
+    assert second["reason"] == "no_material_removed"
+    assert not second["can_accept"]
+    with pytest.raises(ValueError, match="removes no material"):
+        accept_trial(job=source, state=state, trial={**second, "can_accept": True, "status": "passed"}, operation_id="OP20")
+
+
+def test_operation_captures_scope_while_geometry_changes_invalidate_evidence():
+    from app.agent.l32_operation_trial import capture_profile_authorization, _authorize_profile_for_draft_trial
+    planned = operation("OP10", 10, "turn_od_finishing")
+    geometry = rotational()
+    geometry.profiles[0].review_state = "ai_provisional"
+    geometry.profiles[0].provisional_decision = AIProvisionalProfileDecision(
+        scope="partial", z_min_mm=-30, z_max_mm=-10, diameter_min_mm=12, diameter_max_mm=12,
+        confidence=0.9, rationale="section verified", evidence_refs=["RP-1"],
+    )
+    capture_profile_authorization(planned, geometry)
+    source = job(planned)
+    signature = evidence_context_signature(source, geometry, snapshot())
+    geometry.profiles[0].provisional_decision.z_min_mm = -5
+    geometry.profiles[0].provisional_decision.z_max_mm = 0
+    assert evidence_context_signature(source, geometry, snapshot()) == signature
+    scoped, authorization, error = _authorize_profile_for_draft_trial(planned, geometry.profiles[0])
+    assert not error and scoped.points[0].z == -30 and scoped.points[-1].z == -10
+    geometry.profiles[0].points[0].radius += 0.5
+    assert evidence_context_signature(source, geometry, snapshot()) != signature
+    assert _authorize_profile_for_draft_trial(planned, geometry.profiles[0])[2]
+
+
+def test_coaxial_drilling_uses_model_entry_and_blocks_oversized_tool():
+    from app.models import CylindricalFeature
+    planned = operation("OP10", 10, "axial_drilling")
+    planned.tool = get_tool("DRILL-6.0")
+    planned.feature_ids = ["HF-1"]
+    planned.parameters.update(depth_mm=20, peck_depth_mm=1)
+    source = job(planned)
+    source.analysis.cylindrical_features = [CylindricalFeature(
+        id="HF-1", kind="hole", radius=3, diameter=6, length=30,
+        center=Vec3(x=0, y=0, z=-15), axis=Vec3(x=0, y=0, z=1), review_state="accepted")]
+    geometry = rotational()
+    geometry.profiles.append(RotationalProfile(
+        id="RP-INNER", axis_id="RA-1", side="inner", extraction_method="exact_section",
+        points=[RotationalProfilePoint(z=-30, radius=3), RotationalProfilePoint(z=0, radius=3)],
+        confidence=1, review_state="accepted"))
+    result, _ = run_independent_trial(job=source, operation_id="OP10", rotational=geometry, snapshot=snapshot(), state=None)
+    assert result["can_accept"], result
+    assert result["evidence"]["removed_volume_mm3"] > 0
+    cycles = [command for channel in result["toolpath"]["channels"] for command in channel["commands"] if command["type"] == "drill_cycle"]
+    assert cycles[0]["parameters"]["start_z_mm"] == 2
+    assert cycles[0]["parameters"]["end_z_mm"] == -20
+    planned.tool = get_tool("DRILL-8.0")
+    result, _ = run_independent_trial(job=source, operation_id="OP10", rotational=geometry, snapshot=snapshot(), state=None)
+    assert result["reason"] == "drill_exceeds_hole_diameter"
+
+
+def test_bore_parameter_cannot_create_material_void():
+    from app.agent.l32_operation_trial import _initial_bore_radius
+    planned = operation("OP10", 10, "turn_id_finishing")
+    planned.parameters["initial_bore_diameter_mm"] = 20
+    assert _initial_bore_radius(planned, None) == 0
+
+
+def finishing_contract_fixture():
+    rough = operation("OP10", 10, "turn_od_roughing")
+    rough.parameters.update(radial_allowance_mm=.3,depth_of_cut_mm=1)
+    finish = operation("OP20",20,"turn_od_finishing")
+    finish.parameters["radial_allowance_mm"] = 0
+    source = job(rough,finish)
+    geometry = rotational()
+    trial,state = run_independent_trial(job=source,operation_id=rough.id,rotational=geometry,snapshot=snapshot(),state=None)
+    assert trial["can_accept"] and trial["status"] == "warning",trial
+    state = accept_trial(job=source,state=state,trial=trial,operation_id=rough.id,acknowledge_warning=True,context_signature=trial["context_signature"])
+    return source,geometry,trial,state
+
+
+def test_partial_contour_interpolates_both_region_boundaries():
+    from app.rotational_features import clip_rotational_profile
+    clipped = clip_rotational_profile(profile(), -8, -4)
+    assert [(p.z,p.radius) for p in clipped.points] == [(-8,6.8),(-4,8.4)]
+
+
+@pytest.mark.parametrize("gap", [False, True])
+def test_split_finishers_must_cover_all_roughing_residual(gap):
+    rough = operation("ROUGH", 10, "turn_od_roughing")
+    rough.parameters.update(radial_allowance_mm=.3, depth_of_cut_mm=1)
+    first = operation("FINISH-A", 20, "turn_od_finishing")
+    second = operation("FINISH-B", 30, "turn_od_finishing")
+    first.parameters.update(radial_allowance_mm=0, profile_z_min_mm=-30, profile_z_max_mm=-5 if gap else -4.5)
+    second.parameters.update(radial_allowance_mm=0, profile_z_min_mm=-4 if gap else -5.5, profile_z_max_mm=0)
+    source, geometry = job(rough, first, second), rotational()
+    trial, state = run_independent_trial(job=source, operation_id=rough.id, rotational=geometry, snapshot=snapshot(), state=None)
+    contracts = trial["evidence"]["deferred_material_contracts"]
+    assert bool(contracts) is not gap
+    if not gap:
+        assert {c["responsible_operation_id"] for c in contracts} == {first.id, second.id}
+        samples = [s["z"] for c in contracts for s in c["target_samples"]]
+        assert len(samples) == len(set(samples))
+        state = accept_trial(job=source,state=state,trial=trial,operation_id=rough.id,
+            context_signature=trial["context_signature"],acknowledge_warning=True)
+        for finishing in [first,second]:
+            finish_trial,state = run_independent_trial(job=source,operation_id=finishing.id,
+                rotational=geometry,snapshot=snapshot(),state=state)
+            assert finish_trial["can_accept"],json.dumps({k:finish_trial.get(k) for k in ['operation_id','reason','evidence']})
+            state = accept_trial(job=source,state=state,trial=finish_trial,operation_id=finishing.id,
+                context_signature=finish_trial["context_signature"],acknowledge_warning=finish_trial["status"]=="warning")
+        assert not state_summary(source,state)["outstanding_deferred_material_contracts"]
+
+
+def test_explicit_finisher_accepts_roughing_residual_then_removes_it():
+    source,geometry,rough,state = finishing_contract_fixture()
+    contract = rough["evidence"]["deferred_material_contracts"][0]
+    assert contract["responsible_operation_id"] == "OP20"
+    assert all(6 <= item["radius_mm"] <= 10 for item in contract["target_samples"])
+    assert not state_summary(source,state)["provisional_operation_ids"]
+    assert state_summary(source,state)["outstanding_deferred_material_contracts"]
+    finish,state = run_independent_trial(job=source,operation_id="OP20",rotational=geometry,snapshot=snapshot(),state=state)
+    assert finish["can_accept"],finish
+    state = accept_trial(job=source,state=state,trial=finish,operation_id="OP20",context_signature=finish["context_signature"])
+    assert not state_summary(source,state)["outstanding_deferred_material_contracts"]
+    assert not state_summary(source,state)["unassigned_material_obligations"]
+
+
+def test_finisher_material_must_satisfy_contract_even_with_passing_verification(monkeypatch):
+    import app.agent.l32_operation_trial as trial_module
+    source,geometry,_,state = finishing_contract_fixture()
+    original = trial_module.compile_turning_draft
+    def retained_material(*args):
+        draft = original(*args)
+        for sample in draft.simulation.samples:
+            if -30 <= sample.z <= 0:
+                sample.outer_radius += .2
+        return draft
+    monkeypatch.setattr(trial_module,"compile_turning_draft",retained_material)
+    result,_ = run_independent_trial(job=source,operation_id="OP20",rotational=geometry,snapshot=snapshot(),state=state)
+    assert result["reason"] == "deferred_material_not_removed"
+    assert not result["can_accept"]
+
+
+def test_finisher_change_invalidates_roughing_contract_evidence():
+    source,_,_,state = finishing_contract_fixture()
+    source.plan.setups[0].operations[1].parameters["profile_z_min_mm"] = -10
+    assert not reconcile_state(source,state)["accepted"]
+
+
+def test_boring_entry_failure_reports_measured_and_required_radius():
+    from app.models import CylindricalFeature
+    drill = operation("OP10", 10, "axial_drilling")
+    drill.tool = get_tool("DRILL-8.0")
+    drill.feature_ids = ["HF-1"]
+    drill.parameters.update(depth_mm=30, peck_depth_mm=1)
+    rough = operation("OP20", 20, "turn_id_roughing")
+    rough.tool = get_tool("TURN-ID-R")
+    rough.feature_ids = ["RP-INNER"]
+    rough.parameters.update(radial_allowance_mm=.25, depth_of_cut_mm=.5, initial_bore_diameter_mm=20)
+    source = job(drill, rough)
+    source.analysis.cylindrical_features = [CylindricalFeature(id="HF-1", kind="hole", radius=6,
+        diameter=12, length=30, center=Vec3(x=0,y=0,z=-15), axis=Vec3(x=0,y=0,z=1),review_state="accepted")]
+    geometry = rotational()
+    geometry.profiles.append(RotationalProfile(id="RP-INNER",axis_id="RA-1",side="inner",extraction_method="exact_section",
+        review_state="accepted",confidence=1,points=[RotationalProfilePoint(z=-30,radius=6),RotationalProfilePoint(z=0,radius=6)]))
+    first, state = run_independent_trial(job=source,operation_id=drill.id,rotational=geometry,snapshot=snapshot(),state=None)
+    state = accept_trial(job=source,state=state,trial=first,operation_id=drill.id,context_signature=first["context_signature"])
+    blocked, _ = run_independent_trial(job=source,operation_id=rough.id,rotational=geometry,snapshot=snapshot(),state=state)
+    assert not blocked["can_accept"]
+    assert blocked["reason"] == "tool_not_reachable"
+    entry = next(check for check in blocked["evidence"]["reachability_checks"] if check["id"] == "boring_bar_entry")
+    assert entry["status"] == "failed"
+    assert entry["measured_value"] == 4
+    assert entry["limit_value"] == pytest.approx(5.2)
+    assert blocked["evidence"]["diagnostic_hints"]
 
 
 def analysis() -> GeometryAnalysis:
@@ -490,6 +667,7 @@ def test_default_grooving_capability_metadata_does_not_change_legacy_signature()
     source = operation("OP30", 30, "turn_od_finishing")
     payload = source.model_dump(mode="json")
     payload.pop("reference_profile_id", None)
+    payload.pop("profile_authorization", None)
     payload["tool"].pop("groove_profile", None)
     payload["tool"].pop("axial_contouring_supported", None)
     payload["tool"].pop("inventory_id", None)
@@ -589,3 +767,33 @@ def test_reconcile_invalidates_deferred_evidence_if_responsible_operation_is_rem
     source.plan.setups[0].operations = [finish]
 
     assert reconcile_state(source, state)["accepted"] == []
+def test_facing_uses_complete_reference_end_and_allowance_changes_material():
+    planned = operation("OP10", 10, "turn_facing")
+    planned.parameters.pop("face_z_mm")
+    source = job(planned)
+    geometry = rotational()
+    for point in geometry.profiles[0].points:
+        point.z += 7
+    source.plan.stock.update(z_min_mm=-25, z_max_mm=9)
+    first, _ = run_independent_trial(job=source, operation_id="OP10", rotational=geometry, snapshot=snapshot(), state=None)
+    assert first["can_accept"], first
+    assert first["evidence"]["effective_parameters"]["face_z_mm"] == 7
+    planned.parameters["stock_allowance_mm"] = .2
+    second, _ = run_independent_trial(job=source, operation_id="OP10", rotational=geometry, snapshot=snapshot(), state=None)
+    assert second["can_accept"], second
+    assert second["evidence"]["removed_volume_mm3"] < first["evidence"]["removed_volume_mm3"]
+    planned.parameters["depth_of_cut_mm"] = .1
+    third, _ = run_independent_trial(job=source, operation_id="OP10", rotational=geometry, snapshot=snapshot(), state=None)
+    assert third["evidence"]["command_count"] > second["evidence"]["command_count"]
+
+
+def test_partial_authorization_cannot_hide_facing_damage_to_full_part():
+    planned = operation("OP10", 10, "turn_facing")
+    planned.parameters["face_z_mm"] = -10
+    geometry = rotational()
+    geometry.profiles[0].review_state = "ai_provisional"
+    geometry.profiles[0].provisional_decision = AIProvisionalProfileDecision(
+        scope="partial", z_min_mm=-30, z_max_mm=-10, diameter_min_mm=12, diameter_max_mm=12,
+        confidence=.9, rationale="bounded test", evidence_refs=["RP-1"])
+    result, _ = run_independent_trial(job=job(planned), operation_id="OP10", rotational=geometry, snapshot=snapshot(), state=None)
+    assert result["reason"] == "profile_overcut" and not result["can_accept"]

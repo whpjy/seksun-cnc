@@ -32,6 +32,12 @@ class TurningReachabilityResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class TurningReachabilityError(ValueError):
+    def __init__(self, result: TurningReachabilityResult):
+        self.result = result
+        super().__init__("turning tool is not reachable: " + "; ".join(result.blocking_reasons))
+
+
 def _check(
     identifier: str, status: str, message: str,
     measured: float | str | None = None, limit: float | str | None = None,

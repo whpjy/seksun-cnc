@@ -12,7 +12,7 @@ from .rotational_features import RotationalProfile
 from .turning_draft import TurningDraftRequest, compile_turning_draft
 from .turning_reachability import TurningReachabilityResult
 from .turning_simulation import TurningSimulationResult
-from .turning_verification import TurningVerificationResult
+from .turning_verification import TurningVerificationResult, verify_turning_profile
 
 
 class TurningTransferDraftRequest(TurningDraftRequest):
@@ -210,7 +210,8 @@ def compile_synchronized_transfer_draft(
         toolpath=toolpath,
         state_transitions=states,
         simulation=base.simulation,
-        verification=base.verification,
+        verification=(verify_turning_profile(request.profile, base.simulation, tolerance_mm=.05)
+                      if request.profile is not None else None),
         reachability=base.reachability,
         warnings=[
             *base.warnings,

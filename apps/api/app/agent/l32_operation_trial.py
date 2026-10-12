@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from math import pi
+from math import pi, isfinite
 from typing import Any
 
 from cam.providers.turning import SUPPORTED_OPERATION_TYPES
@@ -13,6 +13,7 @@ from ..rotational_features import RotationalFeatureAnalysis, RotationalProfile, 
 from ..turning_draft import TurningDraftRequest, compile_turning_draft
 from ..turning_simulation import TurningStockSample
 from ..turning_verification import TurningVerificationResult, verify_turning_profile
+from ..turning_reachability import TurningReachabilityError
 from ..l32_front_groove import build_front_groove_geometry_draft
 
 
@@ -30,6 +31,8 @@ def operation_signature(operation: Operation) -> str:
     # actual binding changes the evidence identity.
     if operation_payload.get("reference_profile_id") is None:
         operation_payload.pop("reference_profile_id", None)
+    if operation_payload.get("profile_authorization") is None:
+        operation_payload.pop("profile_authorization", None)
     # Preserve signatures created before grooving-tool capability metadata was
     # introduced. Only explicit non-default capability data changes identity.
     tool_payload = operation_payload.get("tool")
@@ -54,12 +57,38 @@ def evidence_context_signature(
     rotational: RotationalFeatureAnalysis,
     snapshot: MachineConfigurationSnapshot,
 ) -> str:
+    analysis = job.analysis.model_dump(mode="json") if job.analysis else None
+    geometry = rotational.model_dump(mode="json")
+    uncaptured_ids = {
+        profile.id for operation in enabled_operations(job) if not operation.profile_authorization
+        if (profile := _profile_for_operation(operation, rotational)) is not None
+    }
+    if analysis:
+        analysis.pop("rotational_profile_decisions", None)
+        analysis["rotational_profile_reviews"] = {key: value for key, value in analysis.get("rotational_profile_reviews", {}).items() if value == "excluded"}
+    # Review choices are captured by each operation. Geometry remains immutable
+    # evidence; changing another region's provisional choice is not a stock edit.
+    for item in geometry.get("profiles", []):
+        item["excluded"] = item.get("review_state") == "excluded"
+        for key in (("reasons", "review_reasons") if item["id"] in uncaptured_ids else ("review_state", "provisional_decision", "reasons", "review_reasons")):
+            item.pop(key, None)
+    for item in geometry.get("axes", []):
+        item["excluded"] = item.get("review_state") == "excluded"
+        item.pop("review_state", None)
+        item.pop("review_reasons", None)
+    stock = dict(job.plan.stock) if job.plan else None
+    if stock:
+        for key in ("verified_prismatic_feature_ids", "nonrotational_material_verified", "verified_rotational_profile_ids", "verified_hole_feature_ids", "profile_review_state", "rotational_axis"):
+            stock.pop(key, None)
     payload = {
-        "analysis": job.analysis.model_dump(mode="json") if job.analysis else None,
-        "stock": job.plan.stock if job.plan else None,
-        "rotational": rotational.model_dump(mode="json"),
+        "analysis": analysis,
+        "stock": stock,
+        "rotational": geometry,
         "machine_configuration_hash": snapshot.configuration_hash,
     }
+    if job.drawing_analysis or (job.plan and (job.plan.ai_planning or {}).get("evidence_schema_version") == 2):
+        payload.update({"turning_execution_revision": "facing-v2-full-protection", "roughing_contract_revision": "finishing-v1", "drawing_evidence": job.drawing_analysis, "material": job.material,
+                        "material_parameters": job.plan.material_profile.model_dump(mode="json") if job.plan and job.plan.material_profile else None})
     serialized = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
@@ -213,12 +242,37 @@ def _reference_profile(
 def _authorize_profile_for_draft_trial(
     operation: Operation,
     profile: RotationalProfile,
+    stock_z_range: tuple[float, float] | None = None,
 ) -> tuple[RotationalProfile | None, dict[str, Any] | None, str | None]:
+    saved = operation.profile_authorization
+    if saved:
+        if profile.review_state == "excluded" or saved.get("geometry_signature") != _profile_geometry_signature(profile):
+            return None, None, "captured profile authorization no longer matches the geometry"
+        profile = profile.model_copy(deep=True)
+        profile.review_state = saved["review_state"]
+        if saved.get("provisional_decision"):
+            from ..rotational_features import AIProvisionalProfileDecision
+            profile.provisional_decision = AIProvisionalProfileDecision.model_validate(saved["provisional_decision"])
+    cutoff_blank = operation.type == "turn_cutoff"
+    if cutoff_blank:
+        z = operation.parameters.get("z_mm")
+        width = operation.parameters.get("cutting_width_mm", operation.tool.cutting_width_mm)
+        if stock_z_range is None:
+            return None, None, "cutoff requires the current job stock bounds"
+        if (not isinstance(z, (int, float)) or isinstance(z, bool) or not isfinite(z)
+                or not isinstance(width, (int, float)) or isinstance(width, bool) or not isfinite(width) or width <= 0):
+            return None, None, "cutoff requires a finite Z and positive kerf width"
+        if not stock_z_range[0] <= z <= stock_z_range[1]:
+            return None, None, "cutoff center lies outside the current solid blank"
+        if profile.side != "outer" or z + width / 2 > min(p.z for p in profile.points) + 1e-6:
+            return None, None, "cutoff kerf must remain outside the protected finished profile"
     if profile.review_state == "accepted":
         return profile, {"source": "human", "scope": "full"}, None
     if profile.review_state != "ai_provisional" or profile.provisional_decision is None:
         return None, None, f"rotational profile {profile.id} requires review or a bounded AI provisional decision"
     decision = profile.provisional_decision
+    if cutoff_blank and (decision.scope != "full" or decision.z_min_mm > min(p.z for p in profile.points) + 1e-6 or decision.z_max_mm < max(p.z for p in profile.points) - 1e-6):
+        return None, None, "cutoff requires full finished-profile protection, not partial contour authorization"
     try:
         scoped = clip_rotational_profile(profile, decision.z_min_mm, decision.z_max_mm)
     except ValueError as error:
@@ -230,7 +284,7 @@ def _authorize_profile_for_draft_trial(
     out_of_scope = [
         (key, float(value))
         for key, value in operation.parameters.items()
-        if key in target_z_keys
+        if key in target_z_keys and not (cutoff_blank and key == "z_mm")
         and isinstance(value, (int, float)) and not isinstance(value, bool)
         and not decision.z_min_mm - 1e-6 <= float(value) <= decision.z_max_mm + 1e-6
     ]
@@ -248,7 +302,27 @@ def _authorize_profile_for_draft_trial(
         "confidence": decision.confidence,
         "evidence_refs": decision.evidence_refs,
         "production_ready": False,
+        **({"cutoff_blank_authorized": True, "stock_z_min_mm": stock_z_range[0], "stock_z_max_mm": stock_z_range[1]} if cutoff_blank else {}),
     }, None
+
+
+def _profile_geometry_signature(profile: RotationalProfile) -> str:
+    payload = profile.model_dump(mode="json")
+    for key in ("review_state", "provisional_decision", "reasons", "review_reasons"):
+        payload.pop(key, None)
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def capture_profile_authorization(operation: Operation, rotational: RotationalFeatureAnalysis) -> None:
+    profile = _profile_for_operation(operation, rotational)
+    operation.profile_authorization = None
+    if profile and profile.review_state in {"accepted", "ai_provisional"}:
+        operation.profile_authorization = {
+            "profile_id": profile.id,
+            "geometry_signature": _profile_geometry_signature(profile),
+            "review_state": profile.review_state,
+            "provisional_decision": profile.provisional_decision.model_dump(mode="json") if profile.provisional_decision else None,
+        }
 
 
 def _simulation_range(
@@ -265,6 +339,11 @@ def _simulation_range(
     if reference_profile:
         values.extend(point.z for point in reference_profile.points)
     stock = job.plan.stock if job.plan else {}
+    if isinstance(stock.get("z_min_mm"), (int, float)) and isinstance(stock.get("z_max_mm"), (int, float)):
+        low, high = float(stock["z_min_mm"]), float(stock["z_max_mm"])
+        if low >= high or any(value < low - 1e-6 or value > high + 1e-6 for value in values):
+            raise ValueError("configured blank does not contain the finished profile")
+        return low, high
     finished_back_z = stock.get("finished_back_z_mm")
     if isinstance(finished_back_z, (int, float)) and not isinstance(finished_back_z, bool):
         values.append(float(finished_back_z))
@@ -351,12 +430,14 @@ def _initial_samples(state: dict[str, Any]) -> list[TurningStockSample] | None:
 
 
 def _initial_bore_radius(operation: Operation, samples: list[TurningStockSample] | None) -> float:
-    explicit = operation.parameters.get("initial_bore_diameter_mm")
-    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
-        return max(float(explicit) / 2, 0)
+    # A requested bore diameter cannot create a hole in the cumulative stock.
     if not samples:
         return 0
-    return max((sample.inner_radius for sample in samples), default=0)
+    start = operation.parameters.get("start_z_mm")
+    if isinstance(start, (int, float)):
+        return min(samples, key=lambda sample: abs(sample.z - float(start))).inner_radius
+    occupied = [sample for sample in samples if sample.outer_radius > sample.inner_radius + 1e-6]
+    return min((sample.inner_radius for sample in occupied), default=0)
 
 
 def _unchanged_rotational_envelope(
@@ -477,8 +558,9 @@ def _downstream_material_contracts(
 ) -> list[dict[str, Any]]:
     """Assign excess-stock samples only to explicit, executable downstream geometry.
 
-    Overcut can never be deferred. At present the strongest safe contract is an
-    exact-profile groove whose cutter strips cover every residual sample.
+    Overcut can never be deferred. A zero-allowance finisher must cover every
+    residual sample and later satisfy its material targets. Exact-profile
+    grooves retain their existing cutter-strip contracts.
     """
     deviations = [
         item for item in verification.deviations
@@ -492,6 +574,46 @@ def _downstream_material_contracts(
         return []
     profiles = {item.id: item for item in rotational.profiles}
     features = {item.id: item for item in rotational.features}
+    finishing_type = {"turn_od_roughing": "turn_od_finishing", "turn_id_roughing": "turn_id_finishing"}.get(operation.type)
+    source_profile = _profile_for_operation(operation, rotational)
+    if finishing_type and source_profile:
+        # Assign only to an explicit zero-allowance finisher on the same
+        # authorized geometry and side. Its actual material is checked later.
+        finishers = []
+        for downstream in operations[current_index + 1:]:
+            if not downstream.enabled or downstream.type != finishing_type or downstream.workpiece_side != operation.workpiece_side:
+                continue
+            target = _profile_for_operation(downstream, rotational)
+            if target is None or target.id != source_profile.id or float(downstream.parameters.get("radial_allowance_mm", 0)) != 0:
+                continue
+            authorized, _, error = _authorize_profile_for_draft_trial(downstream, target)
+            if error or authorized is None:
+                continue
+            low = max(min(p.z for p in authorized.points), float(downstream.parameters.get("profile_z_min_mm", min(p.z for p in authorized.points))))
+            high = min(max(p.z for p in authorized.points), float(downstream.parameters.get("profile_z_max_mm", max(p.z for p in authorized.points))))
+            finishers.append((downstream, low, high))
+        assignments = {}
+        for item in deviations:
+            eligible = [(op, min(item.z-low, high-item.z)) for op, low, high in finishers
+                        if low - 1e-6 <= item.z <= high + 1e-6]
+            if not eligible:
+                break
+            # Prefer the interior of overlapping finish regions; assigning an
+            # overlap sample at a clipped boundary can prevent its actual cleanup.
+            owner = max(eligible, key=lambda pair: pair[1])[0]
+            assignments.setdefault(owner.id, []).append(item)
+        else:
+            return [{"responsible_operation_id": downstream.id,
+                     "responsible_operation_signature": operation_signature(downstream),
+                     "responsible_operation_type": downstream.type,
+                     "profile_id": source_profile.id, "profile_side": source_profile.side,
+                     "feature_ids": [source_profile.id], "z_min_mm": min(item.z for item in assignments[downstream.id]),
+                     "z_max_mm": max(item.z for item in assignments[downstream.id]), "sample_count": len(assignments[downstream.id]),
+                     "target_samples": [{"z": item.z, "radius_mm": item.target_radius_mm} for item in assignments[downstream.id]],
+                     "tolerance_mm": float(verification.tolerance_mm),
+                     "contract": "remove_deferred_excess_stock_before_plan_finalization",
+                     "verification_version": DEFERRED_CONTRACT_VERSION}
+                    for downstream, _, _ in finishers if downstream.id in assignments]
     intervals: list[tuple[float, float, float, Operation, str]] = []
     for downstream in operations[current_index + 1:]:
         if downstream.type != "turn_grooving" or not downstream.enabled:
@@ -641,12 +763,16 @@ def _scoped_trial_profile(
     width = operation.tool.cutting_width_mm
     if feature is None or not width:
         return profile
+    # Feature indices refer to the original section, not its authorized slice.
+    source = next(item for item in rotational.profiles if item.id == profile.id)
     groove = build_front_groove_geometry_draft(
-        profile, feature, stock_radius_mm=stock_radius_mm,
+        source.model_copy(update={"review_state": "accepted"}), feature, stock_radius_mm=stock_radius_mm,
         actual_planned_tool_width_mm=float(width),
     )
     if not groove.actual_tool_fits_floor or not groove.strips:
         return profile
+    if min(item.z_min_mm for item in groove.strips) < min(p.z for p in profile.points) - 1e-6 or max(item.z_max_mm for item in groove.strips) > max(p.z for p in profile.points) + 1e-6:
+        raise ValueError("groove shoulders extend outside the authorized profile region")
     return clip_rotational_profile(
         profile,
         min(item.z_min_mm for item in groove.strips),
@@ -727,9 +853,12 @@ def run_independent_trial(
             "next_action": "revise_process_operation",
         }
         return result, reconciled
+    protection_profile = profile.model_copy(update={"review_state": "accepted"}) if profile is not None else None
+    if protection_profile is not None and reference_profile is not None and reference_profile.side == profile.side and reference_profile.axis_id == profile.axis_id:
+        protection_profile = reference_profile.model_copy(update={"review_state": "accepted"})
     if profile is not None:
         authorized_profile, authorization, authorization_error = _authorize_profile_for_draft_trial(
-            operation, profile,
+            operation, profile, (z_min, z_max),
         )
         if authorization_error or authorized_profile is None:
             result = {
@@ -771,8 +900,49 @@ def run_independent_trial(
             "next_action": "reset_operation_loop",
         }
         return result, reconciled
-    initial_bore = _initial_bore_radius(operation, samples)
+    bore_samples = samples
+    if trial_profile and operation.type in {"turn_id_roughing", "turn_id_finishing"} and samples:
+        bore_low = max(min(p.z for p in trial_profile.points), float(operation.parameters.get("profile_z_min_mm", min(p.z for p in trial_profile.points))))
+        bore_high = min(max(p.z for p in trial_profile.points), float(operation.parameters.get("profile_z_max_mm", max(p.z for p in trial_profile.points))))
+        bore_samples = [sample for sample in samples if bore_low - 1e-6 <= sample.z <= bore_high + 1e-6]
+    initial_bore = _initial_bore_radius(operation, bore_samples)
     trial_operation = operation
+    drill_protection_profile = None
+    if operation.type == "turn_facing" and protection_profile is not None:
+        trial_operation = operation.model_copy(deep=True)
+        direction = str(operation.parameters.get("cut_direction", "positive_z" if operation.workpiece_side == "back" else "negative_z"))
+        trial_operation.parameters["cut_direction"] = direction
+        trial_operation.parameters.setdefault("face_z_mm", (max if direction == "negative_z" else min)(p.z for p in protection_profile.points))
+        _, _, scope_error = _authorize_profile_for_draft_trial(trial_operation, _profile_for_operation(operation, rotational))
+        if scope_error:
+            return {**base, "status":"blocked", "can_accept":False, "reason":"profile_review_required", "detail":scope_error, "next_action":"inspect_or_provisionally_decide_profile"}, reconciled
+    if operation.type == "axial_drilling":
+        from ..machining_geometry import axial_hole, job_axis
+        axis = job_axis(job.model_dump(mode="json"), rotational.model_dump(mode="json"))
+        holes = [item for item in job.analysis.cylindrical_features if item.id in operation.feature_ids] if job.analysis else []
+        drill_protection_profile = next((item for item in rotational.profiles if item.side == "inner" and reference_profile and item.axis_id == reference_profile.axis_id), None)
+        if len(holes) != 1 or not axial_hole(holes[0].model_dump(mode="json"), axis) or drill_protection_profile is None or drill_protection_profile.review_state == "excluded":
+            return {**base, "status": "blocked", "can_accept": False, "reason": "unsupported_axial_hole", "detail": "Axial drilling requires one coaxial hole and a protected inner section.", "next_action": "inspect_geometry"}, reconciled
+        trial_operation = operation.model_copy(deep=True)
+        direction = str(operation.parameters.get("cut_direction", "positive_z" if operation.workpiece_side == "back" else "negative_z"))
+        trial_operation.parameters["cut_direction"] = direction
+        nominal_entry = max(p.z for p in reference_profile.points) if direction == "negative_z" else min(p.z for p in reference_profile.points)
+        if "start_z_mm" not in operation.parameters:
+            occupied = [sample.z for sample in (samples or []) if sample.outer_radius > sample.inner_radius + 1e-6]
+            stock_entry = (max(occupied) if direction == "negative_z" else min(occupied)) if occupied else z_max if direction == "negative_z" else z_min
+            entry = max(stock_entry, nominal_entry) if direction == "negative_z" else min(stock_entry, nominal_entry)
+            trial_operation.parameters["start_z_mm"] = entry
+            trial_operation.parameters["depth_mm"] = float(operation.parameters.get("depth_mm", 0)) + abs(entry - nominal_entry)
+        drill_start = float(trial_operation.parameters["start_z_mm"])
+        drill_end = drill_start + (-1 if direction == "negative_z" else 1) * float(trial_operation.parameters.get("depth_mm", 0))
+        cut_low, cut_high = sorted((drill_start, drill_end))
+        part_low, part_high = min(p.z for p in reference_profile.points), max(p.z for p in reference_profile.points)
+        protected_low, protected_high = min(p.z for p in drill_protection_profile.points), max(p.z for p in drill_protection_profile.points)
+        if max(cut_low, part_low) < protected_low - 0.05 or min(cut_high, part_high) > protected_high + 0.05:
+            return {**base, "status": "blocked", "can_accept": False, "reason": "drilling_outside_protected_bore", "next_action": "revise_parameters"}, reconciled
+        drill_protection_profile = drill_protection_profile.model_copy(update={"review_state": "accepted"})
+        if operation.tool.diameter_mm > holes[0].diameter + 0.05:
+            return {**base, "status": "blocked", "can_accept": False, "reason": "drill_exceeds_hole_diameter", "next_action": "change_tool"}, reconciled
     if operation.type == "turn_grooving" and trial_profile is not None and trial_profile is not profile:
         trial_operation = operation.model_copy(deep=True)
         trial_operation.parameters["exact_groove_envelope"] = True
@@ -801,9 +971,22 @@ def run_independent_trial(
         z_max_mm=z_max,
         resolution_mm=resolution_mm,
         initial_samples=samples,
+        record_material_frames=True,
     )
     try:
         draft = compile_turning_draft(job.id, request, snapshot)
+    except TurningReachabilityError as error:
+        checks = error.result.model_dump(mode="json")
+        failed = {item.id for item in error.result.checks if item.status == "failed"}
+        hints = []
+        if "boring_bar_entry" in failed:
+            hints.append("底孔不足以容纳镗杆；按 boring_bar_entry 的直径需求选择更大的底孔或更细镗杆，再验证残料和过切。")
+        if "profile_undercut" in failed:
+            hints.append("完整轮廓存在当前方向不可达区域；应分区域、分方向或使用适配刀具，不能缩小成品保护范围绕过验证。")
+        return {**base, "status": "blocked", "can_accept": False,
+                "reason": "tool_not_reachable", "detail": str(error), "reachability": checks,
+                "evidence": {"reachability_status": "failed", "reachability_checks": checks["checks"],
+                             "diagnostic_hints": hints}, "next_action": "review_tool_entry_and_profile_access"}, reconciled
     except (ValueError, OSError) as error:
         result = {
             **base,
@@ -815,8 +998,8 @@ def run_independent_trial(
 
     verification_status = draft.verification.status if draft.verification else None
     protection_verification = (
-        verify_turning_profile(profile, draft.simulation, tolerance_mm=0.05, expected_allowance_mm=0)
-        if profile is not None else None
+        verify_turning_profile(drill_protection_profile or protection_profile, draft.simulation, tolerance_mm=0.05, expected_allowance_mm=0)
+        if drill_protection_profile is not None or protection_profile is not None else None
     )
     protection_failed = bool(
         protection_verification
@@ -876,7 +1059,26 @@ def run_independent_trial(
         and not downstream_contracts
         and operation.type in {"turn_od_roughing", "turn_id_roughing"}
     )
-    can_accept = gate_status == "passed" or warning_can_be_acknowledged
+    no_material_removed = draft.simulation.metrics.removed_volume_mm3 <= 1e-6
+    if no_material_removed:
+        gate_status = "blocked"
+    can_accept = not no_material_removed and (gate_status == "passed" or warning_can_be_acknowledged)
+    assigned_contracts = [contract for record in reconciled["accepted"]
+                          for contract in record.get("deferred_material_contracts", [])
+                          if contract.get("responsible_operation_id") == operation.id and contract.get("target_samples")]
+    sample_by_z = {round(sample.z, 6): sample for sample in draft.simulation.samples}
+    unsatisfied = []
+    for contract in assigned_contracts:
+        for target in contract["target_samples"]:
+            sample = sample_by_z.get(round(float(target["z"]), 6))
+            radius = (sample.inner_radius if contract["profile_side"] == "inner" else sample.outer_radius) if sample else None
+            if radius is None or abs(radius - float(target["radius_mm"])) > float(contract["tolerance_mm"]) + 1e-6:
+                unsatisfied.append(target)
+    if unsatisfied:
+        return {**base, "status": "blocked", "can_accept": False, "reason": "deferred_material_not_removed",
+                "detail": "Assigned finishing operation has not removed its predecessor's residual material.",
+                "evidence": {"unsatisfied_sample_count": len(unsatisfied), "unsatisfied_z_range_mm": [min(s["z"] for s in unsatisfied), max(s["z"] for s in unsatisfied)]},
+                "next_action": "revise_finishing_scope_or_tool"}, reconciled
     verification_evidence = _verification_evidence(draft.verification)
     protection_evidence = _verification_evidence(protection_verification)
     diagnostic_hints: list[str] = []
@@ -915,7 +1117,8 @@ def run_independent_trial(
         "can_accept": can_accept,
         "requires_warning_acknowledgement": gate_status == "warning" and can_accept,
         "reason": (
-            None if can_accept else "profile_overcut" if protection_failed
+            None if can_accept else "no_material_removed" if no_material_removed
+            else "profile_overcut" if protection_failed
             else "deterministic_verification_failed" if failure_sources
             else "unresolved_trial_warning"
         ),
@@ -935,6 +1138,7 @@ def run_independent_trial(
         "diagnostic_hints": diagnostic_hints,
         "evidence": {
             "command_count": sum(len(channel.commands) for channel in draft.toolpath.channels),
+            "effective_parameters": trial_operation.parameters,
             "simulation_status": draft.simulation.status,
             "simulation_domain": {
                 "z_min_mm": z_min, "z_max_mm": z_max,
@@ -1014,6 +1218,8 @@ def accept_trial(
         raise ValueError("accepted material-state prefix changed after trial")
     if not trial.get("can_accept") or trial.get("status") not in {"passed", "warning"}:
         raise ValueError("deterministic trial did not pass the planning gate")
+    if operation.type not in NONROTATIONAL_OPERATION_TYPES and float((trial.get("evidence") or {}).get("removed_volume_mm3", 0)) <= 1e-6:
+        raise ValueError("operation removes no material; revise or remove this redundant operation")
     if trial.get("status") == "warning" and not acknowledge_warning:
         raise ValueError("warning trial requires explicit acknowledgement and rationale")
     simulation = trial.get("cumulative_simulation")

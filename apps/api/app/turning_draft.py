@@ -29,6 +29,7 @@ class TurningDraftRequest(BaseModel):
     radial_clearance_mm: float = Field(default=2, gt=0, le=20)
     axial_clearance_mm: float = Field(default=2, gt=0, le=20)
     initial_samples: list[TurningStockSample] | None = None
+    record_material_frames: bool = False
 
     @model_validator(mode="after")
     def validate_stock(self) -> "TurningDraftRequest":
@@ -117,7 +118,7 @@ def compile_turning_draft(
         if float(requested_rpm) > rpm_limit:
             raise ValueError(f"maximum_spindle_rpm exceeds configured spindle/tool limit: {rpm_limit}")
 
-    cut_direction = str(request.operation.parameters.get("cut_direction", "negative_z"))
+    cut_direction = str(request.operation.parameters.get("cut_direction", "positive_z" if request.operation.workpiece_side == "back" else "negative_z"))
     if cut_direction not in {"negative_z", "positive_z"}:
         raise ValueError("turning operation has an invalid cut direction")
     if request.operation.type == "turn_od_finishing":
@@ -151,12 +152,15 @@ def compile_turning_draft(
         axial_clearance_mm=request.axial_clearance_mm,
         channel_id=spindle.channel_id,
         cut_direction=cut_direction,
+        stock_z_min_mm=min((s.z for s in request.initial_samples if s.outer_radius > s.inner_radius + 1e-6), default=request.z_min_mm) if request.initial_samples else request.z_min_mm,
+        stock_z_max_mm=max((s.z for s in request.initial_samples if s.outer_radius > s.inner_radius + 1e-6), default=request.z_max_mm) if request.initial_samples else request.z_max_mm,
     )
     reachability = None
     if operation_profile is not None:
         reachability = assess_turning_reachability(request.operation, operation_profile, context)
         if reachability.status == "failed":
-            raise ValueError("turning tool is not reachable: " + "; ".join(reachability.blocking_reasons))
+            from .turning_reachability import TurningReachabilityError
+            raise TurningReachabilityError(reachability)
     toolpath = TurningProvider().generate(request.operation, context, operation_profile)
     simulation = simulate_turning_stock(
         toolpath,
@@ -166,6 +170,7 @@ def compile_turning_draft(
         z_max_mm=request.z_max_mm,
         resolution_mm=request.resolution_mm,
         initial_samples=request.initial_samples,
+        record_material_frames=request.record_material_frames,
     )
     verification = None
     thread_verification = None

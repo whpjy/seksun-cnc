@@ -32,7 +32,7 @@ export default function ResultCard({job,workspace,trials,events,sessionId,progra
     }catch(reason){setError(reason instanceof Error ? reason.message : "交付物读取失败");}finally{setBusy(false);}
   };
   return <div className="studio-result-card">
-    <strong>{result.label}</strong><span>{result.ready ? "已满足现有验证门禁" : "任务已结束 · 尚不可用于生产"}</span>
+    <strong>{result.label}</strong><span>{result.ready ? "已满足现有验证门禁" : "整件工艺路线尚未验证完成 · 尚不可用于生产"}</span>
     <p>{result.accepted.length} 道工序试算已接受{result.coverage ? ` · ${result.coverage.covered_count}/${result.coverage.target_count} 个制造目标完整覆盖` : ""}</p>
     <p>{programAvailable ? "加工程序已归档，可在 G 代码页查看" : genericProgramAvailable ? "已生成通用 G 代码 · 未完成实机适配" : "尚未归档 G 代码"}</p>
     <div className="studio-result-actions"><button onClick={()=>setPreview({label:"任务最终报告",text:text||"当前会话未提供最终报告。"})}><FileText size={13}/>查看报告</button><button onClick={onValidation}>查看未完成项</button></div>

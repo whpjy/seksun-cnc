@@ -2,9 +2,11 @@
 
 ## 当前链路
 
-`seksun-cnc` 当前以 STEP/STP 三维模型独立创建任务，不要求 PDF 工程图，也不依赖外部图纸解析服务。几何分析、工艺规划、CAM 生成和项目内置 Web 工作台都由 `seksun-cnc` 自身提供。
+3082 工艺工作台的新建任务现在配对上传 STEP/STP 与 PDF 工程图。三维几何分析由本项目 OCCT 工具执行；二维图纸由 PDF 文字提取、按文字方向校正的图纸渲染与已配置的视觉模型读取，不依赖独立的 measurement 服务。旧任务和 STEP-only API 导入保留兼容。
 
-任务会保存 STEP、几何分析和工艺规划结果。若已有外部解析器输出的制造要求，可通过下述统一接口导入；导入后结果会经标准化和特征重绑定进入工艺规划。
+任务保存原始 STEP、`drawing.pdf`、`drawing-analysis.json` 与几何/规划结果。`POST /api/v1/jobs/intake` 支持 multipart 的 `step` 和 `drawing`；MCP `create_job_from_step` 对应 `step_path` 和 `drawing_path`。图纸最大外径与 STEP 包络交叉检查后用于实心毛坯选择，默认直径增量为 0.2 mm，规则可以在页面修改。图纸材料及制造要求进入 Harness 草案上下文。
+
+二维视觉标注仍是初读候选，尺寸方向、数量与 CAD 候选不一致时显示待审核，不允许自动宣称公差、粗糙度或其他质量要求已验证。`GET /api/v1/jobs/{job_id}/drawing-analysis` 读取证据；`PUT /api/v1/jobs/{job_id}/drawing-analysis/confirm` 允许人工修正最大外径、材料与尺寸依据，变更将使旧刀路/验证失效。已有外部解析器输出也仍可通过下述统一接口导入。
 
 导入制造要求后，任务可额外保存：
 

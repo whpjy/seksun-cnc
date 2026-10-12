@@ -32,6 +32,8 @@ class TurningContext:
     channel_id: str = "main"
     cut_direction: Literal["negative_z", "positive_z"] = "negative_z"
     generator_version: str = "0.1.0"
+    stock_z_min_mm: float | None = None
+    stock_z_max_mm: float | None = None
 
     def __post_init__(self) -> None:
         if len(self.machine_snapshot_hash) != 64:
@@ -89,7 +91,7 @@ class TurningProvider:
         })
 
         if operation.type == "turn_facing":
-            _generate_facing(builder)
+            _generate_facing(builder, profile)
         elif operation.type == "turn_od_roughing":
             assert profile is not None
             _generate_od_roughing(builder, suppress_external_grooves(profile))
@@ -182,22 +184,40 @@ def _approach_z(value: float, context: TurningContext) -> float:
     return value + sign * context.axial_clearance_mm
 
 
-def _generate_facing(builder: _CommandBuilder) -> None:
-    face_z = _number(builder.operation, "face_z_mm", 0)
+def _generate_facing(builder: _CommandBuilder, profile: RotationalProfile | None = None) -> None:
+    sign = 1 if builder.context.cut_direction == "negative_z" else -1
+    if "face_z_mm" in builder.operation.parameters:
+        nominal = _number(builder.operation, "face_z_mm", 0)
+    elif profile is not None:
+        nominal = (max if sign == 1 else min)(p.z for p in profile.points)
+    else:
+        raise ValueError("facing requires a finished face position or a complete reference profile")
+    allowance = _number(builder.operation, "stock_allowance_mm", 0)
+    if allowance < 0:
+        raise ValueError("facing axial allowance cannot be negative")
+    face_z = nominal + sign * allowance
     center_overtravel = _number(builder.operation, "center_overtravel_mm", 0.2)
     if center_overtravel < 0:
         raise ValueError("center_overtravel_mm cannot be negative")
-    builder.add(
-        "rapid_move", axes={"X": builder.clearance_diameter, "Z": _approach_z(face_z, builder.context)},
-        safety_requirements=["work_spindle_running", "tool_offset_active"],
-    )
-    builder.add("feed_move", axes={"Z": face_z}, parameters={"cut_side": "external"})
-    builder.add("feed_move", axes={"X": -2 * center_overtravel}, parameters={
-        "cut_side": "facing",
-        "retain_direction": "negative_z" if builder.context.cut_direction == "negative_z" else "positive_z",
-    })
-    builder.add("rapid_move", axes={"X": builder.clearance_diameter})
-    builder.add("rapid_move", axes={"Z": _approach_z(face_z, builder.context)})
+    start = builder.context.stock_z_max_mm if sign == 1 else builder.context.stock_z_min_mm
+    faces = [face_z]
+    if start is not None and sign * (start - face_z) > 1e-9:
+        depth = _number(builder.operation, "depth_of_cut_mm", .5)
+        if depth <= 0:
+            raise ValueError("facing depth_of_cut_mm must be positive")
+        distance = sign * (start - face_z)
+        count = ceil(distance / depth)
+        if count > 10000:
+            raise ValueError("facing pass count exceeds safety limit")
+        faces = [start - sign * min(i * depth, distance) for i in range(1, count + 1)]
+    for cut_z in faces:
+        builder.add("rapid_move", axes={"X": builder.clearance_diameter, "Z": _approach_z(cut_z, builder.context)},
+                    safety_requirements=["work_spindle_running", "tool_offset_active"])
+        builder.add("feed_move", axes={"Z": cut_z}, parameters={"cut_side": "external"})
+        builder.add("feed_move", axes={"X": -2 * center_overtravel}, parameters={
+            "cut_side": "facing", "retain_direction": "negative_z" if sign == 1 else "positive_z"})
+        builder.add("rapid_move", axes={"X": builder.clearance_diameter})
+        builder.add("rapid_move", axes={"Z": _approach_z(cut_z, builder.context)})
 
 
 def _generate_od_finishing(builder: _CommandBuilder, profile: RotationalProfile) -> None:

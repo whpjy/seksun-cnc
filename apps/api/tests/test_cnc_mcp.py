@@ -5,6 +5,31 @@ import httpx
 
 import app.cnc_mcp as cnc_mcp
 
+
+def test_axial_drilling_catalog_excludes_radial_and_offset_holes():
+    from app.operation_library import operation_library_payload
+    axis = {"origin": {"x": 0, "y": 0, "z": 0}, "direction": {"x": 0, "y": 1, "z": 0}}
+    hole = {"kind": "hole", "diameter": 6, "length": 10, "review_state": "accepted", "center": {"x": 0, "y": 5, "z": 0}, "axis": {"x": 0, "y": -1, "z": 0}}
+    job = {"device_id": "citizen-cincom-l32", "plan": {"stock": {"rotational_axis": axis}}, "analysis": {"cylindrical_features": [
+        {**hole, "id": "HF-AXIAL"},
+        {**hole, "id": "HF-RADIAL", "axis": {"x": 1, "y": 0, "z": 0}},
+        {**hole, "id": "HF-OFFSET", "center": {"x": 2, "y": 5, "z": 0}},
+    ]}}
+    catalog = summarize_operation_catalog(operation_library_payload(), job, None)
+    drill = next(item for item in catalog["definitions"] if item["id"] == "axial_drilling")
+    assert [ref["id"] for ref in drill["valid_geometry_refs"]] == ["HF-AXIAL"]
+
+
+def test_capability_blocked_finalization_allows_only_incomplete_report(monkeypatch):
+    class Client:
+        def json(self, *args, **kwargs):
+            return {"status": "blocked", "reason": "capability_unavailable", "terminal": True, "completion_allowed": False}
+    monkeypatch.setattr(cnc_mcp, "_client", lambda: Client())
+    monkeypatch.setattr(cnc_mcp, "_resolve_job_id", lambda _: ("job-1", None))
+    result = cnc_mcp.finalize_harness_process_plan("job-1")
+    assert result["agent_directive"]["task_may_end"] is True
+    assert result["agent_directive"]["route_complete"] is False
+
 from app.cnc_mcp import (
     CncApiClient, CncApiError, attach_cnc_evidence_contract, resolve_step_import,
     summarize_geometry, summarize_job, summarize_operation_catalog, summarize_progress,

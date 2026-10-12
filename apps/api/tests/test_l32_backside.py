@@ -578,6 +578,34 @@ def test_binding_back_tooling_uses_sacrificial_cutoff_and_persists_whole_draft(
     assert (directory / "turning-backside-ir.json").is_file()
     assert (directory / "turning-backside-draft.json").is_file()
 
+    # A local back-side preview is not transfer evidence. First accept the actual
+    # front material prefix and generate a transfer bound to that same context.
+    from app.agent.l32_operation_trial import enabled_operations, run_independent_trial, accept_trial
+    from app.rotational_features import RotationalFeatureAnalysis
+    current = main.load_job(job_id)
+    # Match the 11 mm stock radius explicitly used throughout this regression.
+    current.plan.stock["diameter_mm"] = 22
+    main.save_job(directory, current)
+    geometry = RotationalFeatureAnalysis.model_validate_json((directory / "rotational-features.json").read_text())
+    machine = main.load_machine_snapshot(directory / "machine-configuration.json")
+    state = None
+    for front in [op for op in enabled_operations(current) if op.workpiece_side != "back"]:
+        trial, state = run_independent_trial(job=current, operation_id=front.id, rotational=geometry, snapshot=machine, state=state, resolution_mm=.5)
+        assert trial["can_accept"], trial
+        state = accept_trial(job=current, state=state, trial=trial, operation_id=front.id,
+            context_signature=trial["context_signature"], acknowledge_warning=trial["status"] == "warning",
+            decision_rationale="Explicit test fixture transfer review.")
+    main.write_json(directory / "harness-l32-operation-state.json", state)
+    cutoff = next(op for op in enabled_operations(current) if op.type == "turn_cutoff")
+    transfer = client.post(f"/api/v1/jobs/{job_id}/turning/transfer/draft", json={
+        "machine_instance_id": "l32-back-api", "operation": cutoff.model_dump(mode="json"),
+        "profile": geometry.profiles[0].model_dump(mode="json"), "stock_radius_mm": 11,
+        "z_min_mm": -30, "z_max_mm": 2, "resolution_mm": .5,
+        "approach_z_mm": -21, "pickoff_z_mm": -24, "grip_length_mm": 8,
+        "synchronization_rpm": 1200, "sub_spindle_clamp_confirmed": True,
+    })
+    assert transfer.status_code == 200, transfer.text
+
     whole = client.post(
         f"/api/v1/jobs/{job_id}/turning/whole-program/draft",
         json={
@@ -612,7 +640,8 @@ def test_binding_back_tooling_uses_sacrificial_cutoff_and_persists_whole_draft(
     assert snapshots[-1]["metrics"]["remaining_volume_mm3"] <= snapshots[-1]["metrics"]["initial_volume_mm3"]
     assert (directory / "turning-whole-program-draft.json").is_file()
     execution = json.loads((directory / "agent-l32-execution.json").read_text(encoding="utf-8"))
-    assert execution["status"] == "passed"
+    assert execution["status"] == "passed", json.dumps({"records": [
+        {key: item.get(key) for key in ["operation_id", "status", "blocking_reasons"]} for item in execution["records"]]}, ensure_ascii=False)
     assert execution["release_status"] == "DRAFT"
     assert execution["production_ready"] is False
     assert [item["operation_id"] for item in execution["records"]] == [
@@ -651,6 +680,13 @@ def test_binding_back_tooling_uses_sacrificial_cutoff_and_persists_whole_draft(
         },
     )
     assert omitted.status_code == 422, omitted.text
+    assert "workholding_evidence_missing" in omitted.json()["detail"]
+    regenerated_transfer = client.post(f"/api/v1/jobs/{job_id}/turning/transfer/draft",
+        json=json.loads(transfer.request.content))
+    assert regenerated_transfer.status_code == 200, regenerated_transfer.text
+    omitted = client.post(f"/api/v1/jobs/{job_id}/turning/whole-program/draft",
+        json=json.loads(omitted.request.content))
+    assert omitted.status_code == 422
     assert "omits enabled operations: OP99" in omitted.json()["detail"]
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import hashlib
 from math import isfinite, radians, tan
 import os
@@ -62,6 +63,9 @@ from .agent.process_strategies import (
 )
 from .benchmarks import example_catalog_payload
 from .coverage import evaluate_plan_coverage
+from .drawing_intake import DrawingDimensionReview, review_drawing_dimension
+from .side_hole_draft import build_side_hole_draft
+from .side_hole_check import router as side_hole_check_router
 from .remediation import apply_automatic_remediation, build_remediation_report
 from .rotational_features import (
     AIProvisionalProfileDecision, RotationalFeatureAnalysis, bind_thread_requirements,
@@ -88,6 +92,13 @@ from .inner_bore_chain import InnerBoreChainRequest, InnerBoreChainResult, compi
 from .agent.architecture import agent_architecture
 from .agent.events import build_agent_event
 from .agent.workspace import build_agent_workspace
+from .progress_translation import router as progress_translation_router
+from .process_preview import router as process_preview_router
+from .stock_selection import router as stock_selection_router
+from .process_rules import router as machining_policy_router
+from .candidate_route import router as candidate_route_router
+from .exact_target_protection import router as exact_target_protection_router
+from .geometry_revision import router as geometry_revision_router
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -154,6 +165,14 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Seksun CNC API", version="0.8.0", lifespan=lifespan)
+app.include_router(progress_translation_router)
+app.include_router(process_preview_router)
+app.include_router(stock_selection_router)
+app.include_router(machining_policy_router)
+app.include_router(candidate_route_router)
+app.include_router(side_hole_check_router)
+app.include_router(exact_target_protection_router)
+app.include_router(geometry_revision_router)
 origins = [item.strip() for item in os.getenv("CNC_CORS_ORIGINS", "http://localhost:5174").split(",") if item.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -1576,11 +1595,21 @@ def generate_turning_transfer_draft(
             raise ValueError("stored rotational profile must be accepted before transfer planning")
         if stored_profile.model_dump(mode="json") != request.profile.model_dump(mode="json"):
             raise ValueError("submitted rotational profile does not match the accepted stored profile")
+        from .workholding_evidence import bind_transfer_stock
+        state_path = directory / "harness-l32-operation-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else None
+        request, material_source = bind_transfer_stock(job, rotational, snapshot, request, state)
         result = compile_synchronized_transfer_draft(job_id, request, snapshot)
     except (OSError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     write_json(directory / "turning-transfer-ir.json", result.toolpath.model_dump(mode="json"))
     write_json(directory / "turning-transfer-draft.json", result.model_dump(mode="json"))
+    from .workholding_evidence import transfer_identity
+    write_json(directory / "turning-transfer-evidence.json", {
+        **transfer_identity(job, rotational, snapshot), "result": result.model_dump(mode="json"),
+        "profile_id": request.profile.id,
+        "material_source": material_source,
+    })
     return result
 
 
@@ -1921,9 +1950,13 @@ def generate_turning_whole_program_draft(
                 "whole-part L32 turning is blocked because the source solid is not fully rotational "
                 f"(transverse aspect ratio {transverse_aspect_ratio:.3f})"
             )
+        from .workholding_evidence import require_workholding
+        require_workholding(job, directory, rotational, snapshot)
         result = compile_whole_part_draft(
             job_id, request, job.plan, source_profile, snapshot,
         )
+        from .exact_target_protection import guard_compiled
+        guard_compiled(job,rotational,result)
         compiled_operations = {stage.operation_id for stage in result.stages}
         independently_compiled_types = {
             "pocket_roughing", "pocket_finishing",
@@ -1968,6 +2001,8 @@ def _create_l32_whole_program_with_agent_loop(job_id: str) -> WholePartDraftResu
     accepted_profile = next(
         (item for item in rotational.profiles if item.review_state == "accepted"), None,
     )
+    from .workholding_evidence import require_workholding
+    require_workholding(job, directory, rotational, load_machine_snapshot(directory / "machine-configuration.json"))
     # Whole-program validation may use a complete AI-provisional exact section,
     # but it must never silently promote an unreviewed or partial contour.
     source_profile = accepted_profile or max(
@@ -2289,6 +2324,22 @@ def validate_l32_agent_plan(job_id: str) -> dict[str, object]:
         raise HTTPException(status_code=409, detail="该验证工具仅适用于 L32 任务")
     if job.status != "completed" or not job.analysis or not job.plan:
         raise HTTPException(status_code=409, detail="需要已完成的几何分析与工艺草案")
+    from .candidate_route import get_candidate_route
+    from .exact_target_protection import audit_material, required
+    protection_geometry_path = job_directory(job_id)/"rotational-features.json"
+    geometry = RotationalFeatureAnalysis.model_validate_json(protection_geometry_path.read_text(encoding="utf-8")) if protection_geometry_path.is_file() else None
+    if geometry is not None and required(job,geometry):
+        protection = audit_material(job_id)
+        if protection["status"] != "passed":
+            return {"job_id":job_id,"status":"blocked","reason":"full_step_target_protection_failed",
+                "exact_target_protection":protection,"next_action":"replan_from_first_failed_operation",
+                "completion_allowed":False,"release_status":"DRAFT","production_ready":False}
+    workholding = get_candidate_route(job_id)["workholding"]
+    if workholding["status"] == "blocked":
+        return {"job_id": job_id, "status": "blocked", "reason": "workholding_evidence_missing",
+                "release_status": "DRAFT", "production_ready": False,
+                "simulation_status": "blocked", "workholding": workholding,
+                "next_action": "plan_and_verify_cutoff_transfer", "completion_allowed": False}
     with L32_AGENT_VALIDATION_LOCK:
         if job_id in L32_AGENT_VALIDATING_JOBS:
             raise HTTPException(status_code=409, detail="该任务正在执行 L32 智能体验证")
@@ -2607,6 +2658,11 @@ def get_l32_independent_operation_state(job_id: str) -> dict[str, object]:
             "next_action": "trial_l32_operation",
         })
     summary["latest_trial"] = latest_public or None
+    finalization = _optional_job_json(directory, "harness-l32-plan-finalization.json") or {}
+    if finalization.get("context_signature") == context_signature and finalization.get("accepted_operation_ids") == summary["accepted_operation_ids"]:
+        summary["planning_status"] = finalization.get("status")
+        summary["planning_reason"] = finalization.get("reason")
+        summary["unavailable_targets"] = finalization.get("unavailable_targets", [])
     return summary
 
 
@@ -2651,10 +2707,14 @@ def trial_l32_operation_independently(job_id: str, operation_id: str) -> dict[st
                 snapshot=snapshot, state=state,
                 nonrotational_evidence=nonrotational_evidence,
             )
+            from .exact_target_protection import guard_trial
+            result = guard_trial(job,rotational,result,reconciled)
         except (StopIteration, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         write_json(directory / "harness-l32-operation-state.json", reconciled)
         write_json(directory / "agent-l32-operation-trial.json", result)
+        if re.fullmatch(r"[A-Za-z0-9_-]+", operation_id):
+            write_json(directory / f"agent-l32-trial-{operation_id}.json", result)
         public = public_trial_result(result)
         public["artifacts"] = {
             "trial": f"/api/v1/jobs/{job_id}/files/agent-l32-operation-trial.json",
@@ -2701,12 +2761,15 @@ def accept_l32_independent_operation_trial(
     snapshot_path = directory / "machine-configuration.json"
     if not rotational_path.is_file() or not snapshot_path.is_file():
         raise HTTPException(status_code=409, detail="Rotational geometry or machine configuration evidence is missing")
+    rotational = RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8"))
     context_signature = evidence_context_signature(
         job,
-        RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8")),
+        rotational,
         load_machine_snapshot(snapshot_path),
     )
     try:
+        from .exact_target_protection import guard_trial
+        trial = guard_trial(job,rotational,trial,state)
         accepted = accept_trial(
             job=job, state=state, trial=trial, operation_id=operation_id,
             context_signature=context_signature,
@@ -3487,11 +3550,39 @@ def finalize_harness_l32_process_plan(job_id: str) -> dict[str, object]:
     job.plan.stock["nonrotational_material_verified"] = bool(
         progress.get("nonrotational_material_verified")
     )
+    from .machining_geometry import axial_hole, job_axis
+    from .turning_simulation import TurningSimulationResult
+    from .turning_verification import verify_turning_profile
+    rotational = RotationalFeatureAnalysis.model_validate_json(rotational_path.read_text(encoding="utf-8"))
+    axis = job_axis(job.model_dump(mode="json"), rotational.model_dump(mode="json"))
+    job.plan.stock["rotational_axis"] = axis
+    simulation = TurningSimulationResult.model_validate(state["accepted"][-1]["cumulative_simulation"])
+    verified_profiles = []
+    for profile in rotational.profiles:
+        if profile.review_state == "excluded":
+            continue
+        verification = verify_turning_profile(profile.model_copy(update={"review_state": "accepted"}), simulation, tolerance_mm=0.05)
+        if verification.status == "passed" and verification.metrics.evaluated_sample_count >= 2:
+            verified_profiles.append(profile.id)
+    job.plan.stock["verified_rotational_profile_ids"] = verified_profiles
+    verified_holes = []
+    if axis:
+        origin, direction = axis["origin"], axis["direction"]
+        norm = sum(float(direction[k]) ** 2 for k in "xyz") ** 0.5
+        for hole in job.analysis.cylindrical_features:
+            if not axial_hole(hole.model_dump(mode="json"), axis):
+                continue
+            center_z = sum((getattr(hole.center, k) - float(origin[k])) * float(direction[k]) / norm for k in "xyz")
+            low, high = center_z - hole.length / 2, center_z + hole.length / 2
+            samples = [sample for sample in simulation.samples if low + 0.05 <= sample.z <= high - 0.05]
+            if len(samples) >= 2 and all(abs(sample.inner_radius - hole.radius) <= 0.05 for sample in samples):
+                verified_holes.append(hole.id)
+    job.plan.stock["verified_hole_feature_ids"] = verified_holes
     coverage = evaluate_plan_coverage(job.analysis, job.plan)
     job.plan.coverage = coverage
     save_job(directory, job)
     write_json(directory / "plan.json", job.plan.model_dump(mode="json"))
-    if coverage.status == "incomplete":
+    if coverage.covered_count < coverage.target_count or not coverage.target_count:
         uncovered = [
             {
                 "id": target.id, "kind": target.kind, "label": target.label,
@@ -3501,13 +3592,27 @@ def finalize_harness_l32_process_plan(job_id: str) -> dict[str, object]:
             for target in coverage.targets if target.state != "covered"
         ]
         next_target = uncovered[0] if uncovered else None
+        from .cnc_mcp import summarize_operation_catalog
+        catalog = summarize_operation_catalog(operation_library_payload(), job.model_dump(mode="json"), rotational.model_dump(mode="json"))
+        available = {item["id"]: {ref["id"] for ref in item["valid_geometry_refs"]} for item in catalog["definitions"]}
+        def compatible_refs(target):
+            refs = set(target["source_feature_ids"])
+            if target["kind"] == "hole" and any(hole.id in refs and axial_hole(hole.model_dump(mode="json"), axis) for hole in job.analysis.cylindrical_features):
+                refs.update(profile.id for profile in rotational.profiles if profile.side == "inner")
+            return refs
+        capability_gaps = [target for target in uncovered if target["required_operation_types"] and any(
+            kind not in available or not compatible_refs(target).intersection(available[kind])
+            for kind in target["required_operation_types"])]
+        all_blocked = bool(uncovered) and len(capability_gaps) == len(uncovered)
         result = {
             **progress,
-            "status": "plan_incomplete",
-            "reason": "manufacturing_coverage_incomplete",
-            "terminal": False,
+            "status": "blocked" if all_blocked else "plan_incomplete",
+            "context_signature": context_signature,
+            "reason": "capability_unavailable" if all_blocked else "manufacturing_coverage_incomplete",
+            "terminal": all_blocked,
             "completion_allowed": False,
-            "must_continue_planning": True,
+            "must_continue_planning": not all_blocked,
+            "unavailable_targets": capability_gaps,
             "coverage": {
                 "status": coverage.status, "score": coverage.score,
                 "covered_count": coverage.covered_count, "target_count": coverage.target_count,
@@ -3531,8 +3636,10 @@ def finalize_harness_l32_process_plan(job_id: str) -> dict[str, object]:
                     "remove_process_operation",
                 ],
             },
-            "next_action": "add_next_uncovered_operation",
+            "next_action": "resolve_capability_gap" if all_blocked else "add_next_uncovered_operation",
         }
+        if all_blocked:
+            result["continuation"]["instruction"] = "Planning is blocked by unavailable machining capabilities. Report the missing capabilities and preserve DRAFT status; do not claim manufacturing completion."
         write_json(directory / "harness-l32-plan-finalization.json", result)
         publish_job_event(
             job_id, "harness_plan_finalize", "逐道试算已完成，但制造特征覆盖仍不完整", 90,
@@ -3555,7 +3662,8 @@ def finalize_harness_l32_process_plan(job_id: str) -> dict[str, object]:
             else "validated_draft" if passed
             else "blocked"
         ),
-        "reason": None if passed else "whole_plan_validation_failed",
+        "reason": None if passed else validation.get("reason", "whole_plan_validation_failed"),
+        "completion_allowed": passed,
         "coverage": {
             "status": coverage.status, "score": coverage.score,
             "covered_count": coverage.covered_count, "target_count": coverage.target_count,
@@ -5042,6 +5150,10 @@ def _analyze_new_job(
         )
         rotational = persist_rotational_analysis(directory, job, analysis)
         job.analysis = analysis
+        if job.drawing_filename:
+            from .drawing_intake import analyze_drawing
+            report("drawing_analysis", "正在读取二维图纸尺寸、材料与技术要求", 75)
+            analyze_drawing(directory, job, rotational)
         job.model_url = f"/api/v1/jobs/{job_id}/files/model.stl"
         job.status = "completed"
         save_job(directory, job)
@@ -5194,11 +5306,12 @@ async def start_job(
 @app.post("/api/v1/jobs/intake", response_model=JobResponse)
 async def intake_job_for_external_agent(
     step: UploadFile = File(...),
+    drawing: UploadFile | None = File(None),
     material: str = Form("待确认"),
     machine: str = Form("待确认"),
     device_id: str | None = Form(None),
 ) -> JobResponse:
-    """Upload and analyze STEP geometry without creating a process plan."""
+    """Upload paired STEP/PDF evidence without creating a process plan."""
     filename = Path(step.filename or "part.step").name
     if Path(filename).suffix.lower() not in {".step", ".stp"}:
         raise HTTPException(status_code=400, detail="Only STEP/STP files are supported")
@@ -5221,9 +5334,39 @@ async def intake_job_for_external_agent(
                 raise HTTPException(status_code=413, detail="STEP file exceeds upload limit")
             output.write(chunk)
 
+    drawing_filename = None
+    if drawing:
+        drawing_filename = Path(drawing.filename or "drawing.pdf").name
+        if Path(drawing_filename).suffix.lower() != ".pdf":
+            shutil.rmtree(directory, ignore_errors=True)
+            raise HTTPException(400, "二维图纸只支持 PDF 文件")
+        drawing_size = 0
+        with (directory / "drawing.pdf").open("wb") as output:
+            while chunk := await drawing.read(1024 * 1024):
+                drawing_size += len(chunk)
+                if drawing_size > MAX_UPLOAD_BYTES:
+                    shutil.rmtree(directory, ignore_errors=True)
+                    raise HTTPException(413, "PDF 文件超过上传限制")
+                output.write(chunk)
+        with (directory / "drawing.pdf").open("rb") as source:
+            header = source.read(1024)
+        if b"%PDF-" not in header:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise HTTPException(400, "文件内容不是有效 PDF 图纸")
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(directory / "drawing.pdf")
+            if reader.is_encrypted or not 1 <= len(reader.pages) <= 12:
+                raise ValueError("unsupported PDF pages or encryption")
+        except Exception as error:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise HTTPException(422, "PDF 无法读取：请提供未加密的 1–12 页完整二维图纸") from error
+
     job = JobResponse(
         id=job_id, status="processing", filename=filename, created_at=utc_now(),
         material=material, machine=machine, device_id=device_id,
+        drawing_filename=drawing_filename,
+        drawing_url=f"/api/v1/jobs/{job_id}/files/drawing.pdf" if drawing else None,
     )
     save_job(directory, job)
     with JOB_EVENT_CONDITION:
@@ -5951,7 +6094,11 @@ def initialize_harness_process_draft(job_id: str) -> JobResponse:
             return job
         raise HTTPException(status_code=409, detail="任务已经存在非 Harness 工艺方案，不能覆盖")
 
-    plan = build_process_plan(job.analysis, material=job.material, machine=job.machine)
+    from .drawing_intake import drawing_requirements
+    if job.drawing_filename and not (job.drawing_analysis or {}).get("stock_ready"):
+        raise HTTPException(409, "二维图纸最大外径或材料尚未确认，请先核对图纸依据")
+    plan = build_process_plan(job.analysis, material=job.material, machine=job.machine,
+                              requirements=drawing_requirements(job.drawing_analysis))
     for setup in plan.setups:
         setup.operations = []
     plan.title = f"Harness 自主工艺草案 · {job.filename}"
@@ -5969,14 +6116,31 @@ def initialize_harness_process_draft(job_id: str) -> JobResponse:
         "planning_owner": "deepseek_harness",
         "planning_mode": "operation_by_operation",
         "baseline_operations_imported": False,
+        "evidence_schema_version": 2,
         "release_status": "DRAFT",
     }
+    from .process_rules import load_machining_policy, FEATURE_PROCESS_LOGIC
+    plan.ai_planning["machining_policy"] = load_machining_policy().model_dump(mode="json")
+    plan.ai_planning["feature_process_logic"] = FEATURE_PROCESS_LOGIC
     plan.coverage = evaluate_plan_coverage(job.analysis, plan)
     plan.manufacturing_route = build_manufacturing_route(job.analysis, plan)
     plan.knowledge_assessment = assess_plan_knowledge(job.analysis, plan)
     job.plan = plan
     directory = job_directory(job_id)
+    from .stock_selection import _job_stock, _select_for_job, load_stock_rule
+    # _job_stock reads the persisted geometry but this new plan is not yet saved.
+    if job.device_id == "citizen-cincom-l32":
+        _, _, stock_profile, stock_axis = _job_stock(job_id)
+        plan.stock.update(_select_for_job(job, stock_profile, stock_axis, load_stock_rule()))
+        plan.stock["rotational_axis"] = stock_axis
+    if plan.material_profile and plan.material_profile.parameter_status == "unconfirmed":
+        plan.warnings.append(plan.material_profile.parameter_source)
+        plan.blocking_reasons.append("图纸材料对应的切削参数尚未经客户确认")
     provision_default_l32_planning_instance(job, directory)
+    if job.device_id == "citizen-cincom-l32":
+        from .candidate_route import propose_route
+        route_geometry = RotationalFeatureAnalysis.model_validate_json((directory / "rotational-features.json").read_text(encoding="utf-8"))
+        write_json(directory / "candidate-route.json", propose_route(job, route_geometry).model_dump(mode="json"))
     save_job(directory, job)
     write_json(directory / "plan.json", plan.model_dump(mode="json"))
     publish_job_event(
@@ -5991,6 +6155,116 @@ def initialize_harness_process_draft(job_id: str) -> JobResponse:
         viewer={"kind": "model", "url": job.model_url},
     )
     return job
+
+
+@app.get("/api/v1/jobs/{job_id}/drawing-analysis")
+def get_drawing_analysis(job_id: str) -> dict:
+    job = load_job(job_id)
+    if not job.drawing_filename:
+        raise HTTPException(404, "此任务没有配对二维图纸")
+    return job.drawing_analysis or {"status": "processing", "stock_ready": False}
+
+
+@app.put("/api/v1/jobs/{job_id}/drawing-analysis/confirm", response_model=JobResponse)
+def confirm_drawing_analysis(job_id: str, evidence: dict) -> JobResponse:
+    from .drawing_intake import DrawingEvidence, drawing_requirements, validate_evidence
+    from pydantic import ValidationError
+    job = load_job(job_id)
+    if not job.drawing_filename or job.status != "completed":
+        raise HTTPException(409, "配对图纸与模型分析尚未完成")
+    if job_id in L32_OPERATION_TRIALING_JOBS or job_id in L32_ROLLING_LOOP_JOBS:
+        raise HTTPException(409, "工序正在计算，请结束后再确认图纸")
+    old = job.drawing_analysis or {}
+    # The engineer may correct stock-critical fields; retain all extracted PMI.
+    allowed = {"maximum_outer_diameter_mm", "material", "maximum_outer_diameter_evidence"}
+    try:
+        parsed = DrawingEvidence.model_validate({**old, **{k: v for k, v in evidence.items() if k in allowed}})
+    except ValidationError as error:
+        raise HTTPException(422, "请填写有效的图纸最大外径和材料") from error
+    audit = validate_evidence(parsed, old.get("model_maximum_outer_diameter_mm"), confirmed=True)
+    if not audit["stock_ready"]:
+        raise HTTPException(409, "；".join(audit["issues"]))
+    audit.update({k: old[k] for k in ("sha256", "filename", "page_count", "geometry_candidates", "geometry_review_issues", "requirements_status", "requirements_notice", "recognition") if k in old})
+    audit["revision_counter"] = int(old.get("revision_counter", 0)) + 1
+    job.drawing_analysis = audit
+    job.material = parsed.material
+    directory = job_directory(job_id)
+    write_json(directory / "drawing-analysis.json", audit)
+    if job.plan:
+        from .catalogs import resolve_material
+        job.plan.material_profile = resolve_material(job.material)
+        job.plan.manufacturing_requirements = drawing_requirements(audit)
+        for setup in job.plan.setups:
+            for operation in setup.operations:
+                operation.status = "proposed"
+                operation.generation_state = "dirty"
+        job.plan.stock["drawing_evidence_changed"] = True
+        return _save_manual_plan_change(job_id, job)
+    save_job(directory, job)
+    return job
+
+
+@app.put("/api/v1/jobs/{job_id}/drawing-dimensions/{requirement_id}/review", response_model=JobResponse)
+def confirm_drawing_dimension(job_id: str, requirement_id: str, request: DrawingDimensionReview) -> JobResponse:
+    from .drawing_intake import drawing_requirements
+    from .stock_selection import _job_stock
+    job = load_job(job_id)
+    if job.status != "completed" or not job.analysis or not job.plan or not job.drawing_analysis:
+        raise HTTPException(409, "请先完成配对图纸分析并建立工艺草案")
+    if job_id in L32_OPERATION_TRIALING_JOBS or job_id in L32_ROLLING_LOOP_JOBS or job_id in CAM_STREAMING_JOBS or job_id in AI_REVIEWING_JOBS:
+        raise HTTPException(409, "任务正在计算或审查，请结束后再审核图纸")
+    try:
+        _, _, _, axis = _job_stock(job_id)
+        audit = review_drawing_dimension(job, requirement_id, request, confirmed_at=utc_now(), axis=axis)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    job.drawing_analysis = audit
+    generated = drawing_requirements(audit)
+    existing = job.plan.manufacturing_requirements
+    if existing:
+        # One reading review must not discard other bindings or measurement evidence.
+        requirements = existing.model_copy(deep=True)
+        updated = next(row for row in generated.requirements if row.id == requirement_id)
+        position = next((i for i, row in enumerate(requirements.requirements) if row.id == requirement_id), None)
+        if position is None:
+            requirements.requirements.append(updated)
+        else:
+            requirements.requirements[position] = updated
+        requirements.status = "review"
+        requirements.unresolved_requirement_ids = [row.id for row in requirements.requirements
+            if row.mapping_status in {"unmapped", "ambiguous"} or row.verification_status not in {"verified", "verified_measurement", "engineer_approved"}]
+        requirements.summary.update({"total":len(requirements.requirements),
+                                     "matched":sum(row.mapping_status == "matched" for row in requirements.requirements)})
+        job.plan.manufacturing_requirements = requirements
+    else:
+        job.plan.manufacturing_requirements = generated
+    for setup in job.plan.setups:
+        for operation in setup.operations:
+            operation.status = "proposed"
+            operation.generation_state = "dirty"
+    directory = job_directory(job_id)
+    write_json(directory / "drawing-analysis.json", audit)
+    write_json(directory / "manufacturing-requirements.json", job.plan.manufacturing_requirements.model_dump(mode="json"))
+    return _save_manual_plan_change(job_id, job)
+
+
+@app.get("/api/v1/jobs/{job_id}/side-hole-draft")
+def get_side_hole_draft(job_id: str, feature_ids: str, tool_diameter_mm: float | None = None) -> dict:
+    from .stock_selection import _job_stock
+    job, _, _, axis = _job_stock(job_id)
+    if not job.analysis or not job.plan:
+        raise HTTPException(409, "请先完成几何分析和毛坯选择")
+    identifiers = feature_ids.split(",")
+    if len(identifiers) > 200:
+        raise HTTPException(422, "一次最多选择 200 个孔")
+    features = {f.id: f.model_dump(mode="json") for f in job.analysis.cylindrical_features}
+    if any(identifier not in features for identifier in identifiers):
+        raise HTTPException(422, "所选孔特征不存在")
+    try:
+        return build_side_hole_draft([features[i] for i in identifiers], axis,
+                                    float(job.plan.stock.get("diameter_mm") or 0), tool_diameter_mm=tool_diameter_mm)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
 
 
 @app.get("/api/v1/jobs", response_model=list[JobHistoryItem])
@@ -7252,7 +7526,7 @@ def download_generic_nc_bundle(job_id: str) -> Response:
 @app.get("/api/v1/jobs/{job_id}/files/{filename}")
 def get_job_file(job_id: str, filename: str) -> FileResponse:
     allowed = {
-        "model.stl", "drawing.pdf", "analysis.json", "rotational-features.json", "plan.json",
+        "model.stl", "drawing.pdf", "drawing-analysis.json", "analysis.json", "rotational-features.json", "plan.json",
         "manufacturing-specification.json", "manufacturing-requirements.json", "measurement-link.json",
         "planning-guidance.json", "agent-plan.json", "agent-evaluation.json", "operation-audit.json",
         "agent-execution.json", "agent-world-model.json", "agent-orchestrator.json",
@@ -7501,9 +7775,20 @@ def _validate_operation_geometry(job: JobResponse, definition, feature_ids: list
     unknown = [feature_id for feature_id in feature_ids if _feature_type(job, feature_id) is None]
     if unknown:
         raise HTTPException(status_code=422, detail=f"找不到几何引用: {', '.join(unknown)}")
+    def compatible(feature_id: str) -> bool:
+        if _feature_type(job, feature_id) in requirement.accepts:
+            return True
+        if "axial_hole" not in requirement.accepts or not job.analysis:
+            return False
+        from .machining_geometry import axial_hole, job_axis
+        rotational_path = job_directory(job.id) / "rotational-features.json"
+        rotational = json.loads(rotational_path.read_text(encoding="utf-8")) if rotational_path.is_file() else None
+        axis = job_axis(job.model_dump(mode="json"), rotational)
+        return any(item.id == feature_id and axial_hole(item.model_dump(mode="json"), axis)
+                   for item in job.analysis.cylindrical_features)
     incompatible = [
         feature_id for feature_id in feature_ids
-        if _feature_type(job, feature_id) not in requirement.accepts
+        if not compatible(feature_id)
     ]
     if incompatible:
         actual = ", ".join(f"{item}:{_feature_type(job, item)}" for item in incompatible)
@@ -7592,10 +7877,13 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
                 raise ValueError("插入位置不属于当前装夹")
             insert_index = after_index+1
             neighbour = setup.operations[after_index]
+        from .process_rules import operation_policy_parameters
+        policy = (job.plan.ai_planning or {}).get("machining_policy", {})
+        parameters = operation_policy_parameters(definition.id, request.parameters, policy)
         operation = create_operation_instance(
             id=operation_id, sequence=next_sequence, type=definition.id,
             name=request.name or definition.name, feature_ids=request.feature_ids, tool=tool,
-            parameters=request.parameters,
+            parameters=parameters,
             rationale=request.rationale or [
                 "Harness 基于当前几何、设备和已验证工序状态提出"
                 if request.source == "recommendation"
@@ -7621,6 +7909,10 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
         )
         operation.reference_profile_id = request.reference_profile_id
         apply_cutting_parameters(operation, resolve_material(job.material), resolve_machine(job.machine))
+        if l32_agent_draft and (job_directory(job_id) / "rotational-features.json").is_file():
+            from .agent.l32_operation_trial import capture_profile_authorization
+            capture_profile_authorization(operation, RotationalFeatureAnalysis.model_validate_json(
+                (job_directory(job_id) / "rotational-features.json").read_text(encoding="utf-8")))
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     setup.operations.insert(insert_index,operation)
@@ -7679,6 +7971,10 @@ def update_manual_operation(job_id: str, setup_id: str, operation_id: str, reque
         raise HTTPException(status_code=422, detail=str(error)) from error
     operation.status = "proposed"
     operation.generation_state = "dirty"
+    if job.device_id == "citizen-cincom-l32" and (job_directory(job_id) / "rotational-features.json").is_file() and (not operation.profile_authorization or request.feature_ids is not None or request.reference_profile_id is not None or any(key in (request.parameters or {}) for key in ("profile_z_min_mm", "profile_z_max_mm", "face_z_mm", "z_mm", "groove_start_z_mm", "groove_end_z_mm"))):
+        from .agent.l32_operation_trial import capture_profile_authorization
+        capture_profile_authorization(operation, RotationalFeatureAnalysis.model_validate_json(
+            (job_directory(job_id) / "rotational-features.json").read_text(encoding="utf-8")))
     return _save_manual_plan_change(job_id, job)
 
 

@@ -134,7 +134,12 @@ def resolve_material(value: str) -> MaterialProfile:
         aliases = {profile.id.lower(), profile.name.lower(), profile.id.replace("al-", "").lower()}
         if normalized in aliases or any(alias in normalized for alias in aliases):
             return profile.model_copy(deep=True)
-    return MATERIALS[0].model_copy(deep=True)
+    reference = MATERIALS[-1].model_copy(deep=True)
+    reference.id = "unconfirmed-material"
+    reference.name = value.strip() or "材料待确认"
+    reference.parameter_status = "unconfirmed"
+    reference.parameter_source = "仅借用 SUS304 参数作草案计算占位；此材料参数尚未经客户确认"
+    return reference
 
 
 def resolve_machine(value: str) -> MachineProfile:

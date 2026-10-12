@@ -19,6 +19,7 @@ from .models import Operation, ProcessPlan
 from .rotational_features import RotationalProfile, clip_rotational_profile
 from .toolpath_ir import ToolpathChannel, ToolpathCommand, ToolpathProgram, toolpath_program_hash
 from .turning_draft import TurningDraftRequest, compile_turning_draft
+from .turning_simulation import simulate_turning_stock
 from .turning_verification import verify_turning_profile
 from .turning_transfer import (
     TurningTransferDraftRequest, WorkpieceTransferState,
@@ -179,6 +180,20 @@ def compile_whole_part_draft(
         ) if has_front_form else None
     )
 
+    # Transfer evidence must start after all actual front toolpaths, just as the
+    # complete two-channel simulation does. Standalone drafts start from blanks.
+    front_groups = [result.toolpath.channels[0].commands for result in front_results]
+    if front_chain is not None:
+        front_groups.append(front_chain.toolpath.channels[0].commands)
+    front_program = ToolpathProgram(
+        coordinate_convention="diameter-x_z", machine_snapshot_hash=snapshot.configuration_hash,
+        plan_revision=max(operation.definition_version for operation in operations.values()),
+        channels=[ToolpathChannel(id="main", commands=_renumber(
+            [command for group in front_groups for command in group], "main"))],
+    )
+    front_material = simulate_turning_stock(front_program, stock_radius_mm=request.stock_radius_mm,
+        initial_bore_radius_mm=request.initial_bore_radius_mm, z_min_mm=z_min,
+        z_max_mm=z_max, resolution_mm=request.resolution_mm)
     transfer = compile_synchronized_transfer_draft(
         job_id,
         TurningTransferDraftRequest(
@@ -190,6 +205,7 @@ def compile_whole_part_draft(
             z_min_mm=z_min,
             z_max_mm=z_max,
             resolution_mm=request.resolution_mm,
+            initial_samples=front_material.samples,
             approach_z_mm=request.approach_z_mm,
             pickoff_z_mm=request.pickoff_z_mm,
             grip_length_mm=request.grip_length_mm,
@@ -250,9 +266,7 @@ def compile_whole_part_draft(
         ) if has_back_region else None
     )
 
-    main_groups = [result.toolpath.channels[0].commands for result in front_results]
-    if front_chain is not None:
-        main_groups.append(front_chain.toolpath.channels[0].commands)
+    main_groups = list(front_groups)
     main_groups.append(next(channel.commands for channel in transfer.toolpath.channels if channel.id == "main"))
     sub_groups = [next(channel.commands for channel in transfer.toolpath.channels if channel.id == "sub")]
     sub_groups.extend(result.draft.toolpath.channels[0].commands for result in backside_results)

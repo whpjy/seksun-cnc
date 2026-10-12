@@ -132,6 +132,7 @@ export type TurningStageView = {
   after_samples: TurningStockSample[];
   axis_origin: Vec3;
   axis_direction: Vec3;
+  material_frames?: { progress: number; samples: TurningStockSample[]; operation_id: string }[];
 };
 
 export type CamResult = {
@@ -1027,6 +1028,7 @@ export type Job = {
   model_url: string | null;
   drawing_filename?: string | null;
   drawing_url?: string | null;
+  drawing_analysis?: import("./process-studio/DrawingEvidence").DrawingAudit | null;
   measurement_job_id?: string | null;
   error: string | null;
   analysis: {

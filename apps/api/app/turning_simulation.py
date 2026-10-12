@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from math import ceil, hypot, pi, sqrt
-from typing import Literal
+from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -32,6 +32,7 @@ class TurningSimulationResult(BaseModel):
     samples: list[TurningStockSample]
     metrics: TurningSimulationMetrics
     warnings: list[str] = Field(default_factory=list)
+    material_frames: list[dict] = Field(default_factory=list)
 
 
 def _sample_count(z_min: float, z_max: float, resolution: float) -> int:
@@ -54,6 +55,7 @@ def _sweep_nose_circle(
     z_values: list[float], outer: list[float], inner: list[float],
     *, start_x: float, start_z: float, end_x: float, end_z: float,
     nose_radius: float, cut_side: str, resolution: float,
+    on_progress: Callable[[float], None] | None = None,
 ) -> None:
     start_radius, end_radius = abs(start_x) / 2, abs(end_x) / 2
     path_length = hypot(end_z - start_z, end_radius - start_radius)
@@ -74,6 +76,8 @@ def _sweep_nose_circle(
             else:
                 surface_radius = center_radius + radial_reach
                 inner[index] = min(max(inner[index], surface_radius), outer[index])
+        if on_progress and (step_index % max(1, steps // 4) == 0 or step_index == steps):
+            on_progress(step_index / steps)
 
 
 def simulate_turning_stock(
@@ -85,6 +89,7 @@ def simulate_turning_stock(
     resolution_mm: float = 0.1,
     initial_bore_radius_mm: float = 0,
     initial_samples: list[TurningStockSample] | None = None,
+    record_material_frames: bool = False,
 ) -> TurningSimulationResult:
     if program.coordinate_convention != "diameter-x_z":
         raise ValueError("turning simulation requires diameter-x_z Toolpath IR")
@@ -127,9 +132,27 @@ def simulate_turning_stock(
     used_nose_circle = False
     used_thread_envelope = False
 
+    frames: list[dict] = []
+    saved_outer, saved_inner = list(outer), list(inner)
+    command_index = -1
+    command_count = sum(len(channel.commands) for channel in program.channels)
+    stride = max(1, ceil(command_count / 256))
+    def capture(index: int, fraction: float = 1, force: bool = False) -> None:
+        if not record_material_frames or (not force and index % stride):
+            return
+        changes = []
+        for sample_index, (out_radius, in_radius) in enumerate(zip(outer, inner)):
+            if out_radius != saved_outer[sample_index] or in_radius != saved_inner[sample_index]:
+                changes.append([sample_index, out_radius, in_radius])
+                saved_outer[sample_index], saved_inner[sample_index] = out_radius, in_radius
+        if changes or force:
+            frames.append({"command_index": index, "fraction": fraction, "changes": changes})
+
     for channel in program.channels:
         position: dict[str, float] = {}
         for command in channel.commands:
+            capture(command_index)
+            command_index += 1
             previous = dict(position)
             position.update({axis.upper(): float(value) for axis, value in command.axes.items()})
             if command.type == "thread_cut":
@@ -172,7 +195,9 @@ def simulate_turning_stock(
             if cut_side == "facing":
                 retain = str(command.parameters.get("retain_direction", "negative_z"))
                 for index, z_value in enumerate(z_values):
-                    removed = z_value > end_z + 1e-9 if retain == "negative_z" else z_value < end_z - 1e-9
+                    # Samples are serialized to six decimal places. Preserve
+                    # the finished plane across that roundoff, never a grid cell.
+                    removed = z_value > end_z + 1e-6 if retain == "negative_z" else z_value < end_z - 1e-6
                     if removed:
                         outer[index] = inner[index]
                 continue
@@ -183,6 +208,7 @@ def simulate_turning_stock(
                     z_values, outer, inner,
                     start_x=start_x, start_z=start_z, end_x=end_x, end_z=end_z,
                     nose_radius=nose_radius, cut_side=cut_side, resolution=resolution_mm,
+                    on_progress=(lambda fraction: capture(command_index, fraction)) if record_material_frames else None,
                 )
                 used_nose_circle = True
                 continue
@@ -200,6 +226,7 @@ def simulate_turning_stock(
                 else:
                     inner[index] = min(max(inner[index], radius), outer[index])
 
+    capture(command_index, force=True)
     slice_length = (z_max_mm - z_min_mm) / (count - 1)
     initial_areas = [
         pi * max(out_radius * out_radius - in_radius * in_radius, 0)
@@ -214,6 +241,7 @@ def simulate_turning_stock(
     removed_volume = max(initial_volume - remaining_volume, 0)
     removal_percent = removed_volume / initial_volume * 100 if initial_volume else 0
     return TurningSimulationResult(
+        material_frames=frames,
         approximation=(
             "thread_root_envelope" if used_thread_envelope
             else "mixed_centerline_and_nose_circle" if used_nose_circle

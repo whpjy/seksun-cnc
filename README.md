@@ -1,5 +1,9 @@
 # Seksun CNC
 
+3082 工艺工作台的“跟随智能体”可读取逐道 L32 试算证据：计算时定位刀路，结果到达后自动回放。默认累计模式从初始毛坯开始，沿实际刀路显示仿真器记录的 Z-R 材料变化，后一道沿用前一道余料，最终停在实际计算结果；可切换单工序、暂停、拖动和回到毛坯。普通进给记录刀尖扫掠的中间状态，语义循环按求解器的指令完成状态更新。缺失或失效的前序证据不补造形状，累计模式不可用时显示原因。失败试算标明未通过；工序、几何或前序材料变化后清除旧回放。自由查看停止自动切换和播放，重复轮询不覆盖手动暂停。当前材料回放基于轴对称车削求解结果，不等同于任意三维铣削或生产放行。预览接口为 `GET /api/v1/jobs/{job_id}/agent/l32/operations/{operation_id}/preview`，累计接口为 `GET /api/v1/jobs/{job_id}/agent/l32/playback?through_operation_id=OP20`；逐道证据只从接入后开始归档，旧记录有完整刀路时可只读重算中间状态，并校验最终余料一致性。
+
+相关验证：API 的 `tests/test_process_preview.py`，Web 的 `tests/machining-preview.test.mjs` 和 `tests/machining-follow.e2e.mjs`。浏览器测试默认在临时目录运行真实求解器生成独立证据，设置 `MACHINING_TEST_JOB` 可检查指定任务，不修改工程任务。
+
 ## v0.9 原生 FreeCAD CAM
 
 - `cam.FCStd` 现在保存可编辑的 FreeCAD Path `Job`、`ToolController` 与原生工序对象，不再用手工拼接的通用 `Path::Feature` 代替 CAM 工序。
@@ -165,3 +169,5 @@ v0.4 的 10 个真实 STEP 批量结果保存在本地 `.seksun-cnc/batch-result
 二维图纸、制造要求统一契约及 STEP AP242 PMI 接入路线见 [docs/drawing-pmi-integration.md](docs/drawing-pmi-integration.md)。
 
 智能体的加工意图、语义工序角色、策略注册与验证契约见 [docs/cnc-process-strategy-framework.md](docs/cnc-process-strategy-framework.md)。
+
+L32 实心毛坯选择、页面规则配置与已有任务更新说明见 [docs/stock-selection.md](docs/stock-selection.md)。
