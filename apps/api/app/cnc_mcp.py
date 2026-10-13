@@ -8,6 +8,7 @@ API, which is the single source of truth for machine constraints and artifacts.
 from __future__ import annotations
 
 import os
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,19 @@ DEFAULT_API_BASE_URL = "http://127.0.0.1:8090"
 
 class CncApiError(RuntimeError):
     """A bounded error suitable for presentation to an agent."""
+
+
+def _mcp_json_value(value: Any) -> Any:
+    """Normalize signed geometry zero for Harness's lossless JSON boundary."""
+    if isinstance(value, dict):
+        return {key: _mcp_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_mcp_json_value(item) for item in value]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise CncApiError("CNC API 返回非有限数值，不能作为工艺证据")
+        return 0.0 if value == 0 else value
+    return value
 
 
 class CncApiClient:
@@ -57,7 +71,7 @@ class CncApiClient:
 
     def json(self, method: str, path: str, **kwargs: Any) -> dict[str, Any] | list[Any]:
         try:
-            return self.request(method, path, **kwargs).json()
+            return _mcp_json_value(self.request(method, path, **kwargs).json())
         except ValueError as exc:
             raise CncApiError(f"CNC API 返回了无效 JSON：{path}") from exc
 
@@ -305,6 +319,12 @@ def collect_geometry_references(
             reference = references[str(item["id"])]
             reference["compatible_geometry_types"] = ["cylindrical_hole"]
             reference["machining_access"] = "radial_or_offset"
+            from math import sqrt
+            a=(axis or {}).get('direction') or {}
+            b=item.get('axis') or {}
+            norm=sqrt(sum(float(a.get(k,0))**2 for k in 'xyz')*sum(float(b.get(k,0))**2 for k in 'xyz'))
+            if norm>1e-9 and abs(sum(float(a.get(k,0))*float(b.get(k,0)) for k in 'xyz')/norm)<=.001 and item.get('angular_span_degrees',360)>=359.9:
+                reference['compatible_geometry_types'].append('radial_hole')
             if axial_hole(item, axis):
                 reference["compatible_geometry_types"].append("axial_hole")
                 reference["machining_access"] = "coaxial"
@@ -355,6 +375,7 @@ def summarize_operation_catalog(
     """Return only operations executable by the current agent loop and their legal geometry IDs."""
     l32 = job.get("device_id") == "citizen-cincom-l32"
     l32_nonrotational = {
+        "radial_drilling", "radial_hole_finishing",
         "pocket_roughing", "pocket_finishing",
         "live_tool_contour_roughing", "live_tool_contour_finishing",
     }
@@ -372,6 +393,9 @@ def summarize_operation_catalog(
         compatible = [reference for reference in references
                       if reference.get("review_state") != "excluded"
                       and accepts.intersection(reference.get("compatible_geometry_types", [reference["geometry_type"]]))]
+        if l32 and item.get('id') in {'radial_drilling','radial_hole_finishing'}:
+            compatible=[ref for ref in compatible if ref.get('machining_access')=='radial_or_offset'
+                        and ref.get('review_state')=='accepted']
         minimum = int((item.get("geometry") or {}).get("minimum_selection") or 1)
         if not agent_supported or len(compatible) < minimum:
             unavailable.append(item.get("id"))
@@ -752,7 +776,17 @@ def inspect_side_hole_draft(feature_ids: list[str], job_id: str = "", tool_diame
     if tool_diameter_mm is not None:
         query["tool_diameter_mm"] = tool_diameter_mm
     result = _client().json("GET", f"/api/v1/jobs/{resolved}/side-hole-draft?{urlencode(query)}")
-    return {**result, "job_id": resolved, "next_action": "confirm_drawing_binding_and_machine_access_then_report_missing_exact_3d_executor"}
+    return {**result, "job_id": resolved, "next_action": "compare_hole_bottom_strategies_and_confirm_tool_machine_evidence"}
+
+
+@mcp.tool()
+def compare_side_hole_strategies(feature_ids:list[str],drill_geometry:dict[str,Any],job_id:str='',tool_diameter_mm:float|None=None)->dict[str,Any]:
+    """Compare direct drilling, tip-length backoff and a BRep-linked flat-bottom finish. Nominal CAD diagnostics only; never grants acceptance or drawing tolerance compliance."""
+    from urllib.parse import urlencode
+    resolved,_=_resolve_job_id(job_id)
+    query={'feature_ids':','.join(feature_ids)}
+    if tool_diameter_mm is not None:query['tool_diameter_mm']=tool_diameter_mm
+    return _client().json('POST',f'/api/v1/jobs/{resolved}/side-hole-strategies?{urlencode(query)}',json=drill_geometry)
 
 
 @mcp.tool()

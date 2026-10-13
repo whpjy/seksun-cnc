@@ -21,6 +21,7 @@ class TurningDraftRequest(BaseModel):
     machine_instance_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
     operation: Operation
     profile: RotationalProfile | None = None
+    protection_profile: RotationalProfile | None = None
     stock_radius_mm: float = Field(gt=0)
     initial_bore_radius_mm: float = Field(default=0, ge=0)
     z_min_mm: float
@@ -154,6 +155,7 @@ def compile_turning_draft(
         cut_direction=cut_direction,
         stock_z_min_mm=min((s.z for s in request.initial_samples if s.outer_radius > s.inner_radius + 1e-6), default=request.z_min_mm) if request.initial_samples else request.z_min_mm,
         stock_z_max_mm=max((s.z for s in request.initial_samples if s.outer_radius > s.inner_radius + 1e-6), default=request.z_max_mm) if request.initial_samples else request.z_max_mm,
+        compensation_reference_profile=request.protection_profile or request.profile,
     )
     reachability = None
     if operation_profile is not None:

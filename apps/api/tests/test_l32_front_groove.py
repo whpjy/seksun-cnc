@@ -48,3 +48,14 @@ def test_proposed_tool_cannot_exceed_exact_floor_width():
             profile,feature,stock_radius_mm=2.8,actual_planned_tool_width_mm=2.0,
             proposed_tool_width_mm=1.1,
         )
+
+
+def test_unequal_lands_keep_the_entire_higher_shoulder():
+    profile=RotationalProfile(id="RP-UNEQUAL",axis_id="RA-1",side="outer",extraction_method="exact_section",review_state="accepted",confidence=1,
+        points=[RotationalProfilePoint(z=z,radius=r) for z,r in [(-6,12),(-5,12),(-4,11.8),(-3,11),(-1,11),(0,11.5),(1,11.5)]])
+    feature=TurningProfileFeature(id="G1",profile_id=profile.id,kind="external_groove_candidate",z_start=-3,z_end=-1,
+        radius_start=11,radius_end=11,width_mm=2,depth_mm=.5,source_point_indices=[3,4],confidence=1)
+    draft=build_front_groove_geometry_draft(profile,feature,stock_radius_mm=12.1,actual_planned_tool_width_mm=.4)
+    assert draft.strips[0].z_min_mm == -5
+    assert draft.strips[-1].z_max_mm == 0
+    assert any(strip.z_min_mm <= -4.5 <= strip.z_max_mm for strip in draft.strips)

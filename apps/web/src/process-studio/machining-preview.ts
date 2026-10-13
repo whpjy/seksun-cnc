@@ -3,6 +3,7 @@ import type { ToolpathSegment, TurningStageView, TurningStockSample, Vec3 } from
 export type MachiningPreview = {
   operation_id: string; revision: string; status: string; reason?: string | null; can_accept: boolean;
   evidence: { removed_volume_mm3?: number; verification_status?: string; profile_protection_status?: string;
+    material_domain?:string;stock_mesh_url?:string;
     diagnostic_hints?: string[];
     reachability_checks?: { id: string; status: string; message: string; measured_value?: number | string; limit_value?: number | string }[] };
   axis: { origin: Vec3; direction: Vec3 } | null;

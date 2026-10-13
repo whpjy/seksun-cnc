@@ -201,7 +201,7 @@ def test_compile_turning_draft_limits_toolpath_to_declared_front_region() -> Non
     assert result.verification is not None
 
 
-def test_regional_draft_rejects_oversized_nose_and_detected_overcut() -> None:
+def test_regional_draft_rejects_oversized_nose_and_uses_safe_corner_offset() -> None:
     profile = RotationalProfile(
         id="RP-1", axis_id="RA-1", side="outer", extraction_method="exact_section",
         points=[
@@ -238,12 +238,8 @@ def test_regional_draft_rejects_oversized_nose_and_detected_overcut() -> None:
         operation=operation, profile=profile,
         z_min_mm=-1, z_max_mm=5, resolution_mm=0.1,
     )
-    try:
-        compile_turning_draft("a" * 32, request, _snapshot())
-    except ValueError as error:
-        assert "regional turning DRAFT verification failed" in str(error)
-    else:
-        raise AssertionError("regional overcut must be blocked")
+    result = compile_turning_draft("a" * 32, request, _snapshot())
+    assert result.verification.metrics.overcut_sample_count == 0
 
 
 def test_regional_finish_keeps_small_nose_outside_sharp_outward_shoulder() -> None:

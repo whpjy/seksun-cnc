@@ -81,7 +81,7 @@ def propose_route(job: JobResponse, geometry: RotationalFeatureAnalysis) -> Cand
         add("INNER-ROUGH", "内孔粗加工（按残料需要）", inner, ["turn_id_roughing"], "按实测仿真孔径与余量决定粗镗；有倒扣时分区域、分方向规划。", parents, blockers, True)
         add("INNER-FINISH", "内孔精加工", inner, ["turn_id_finishing"], "完成内孔轮廓，核对公差与粗糙度；不能把底孔或粗镗当作内孔完成。", parents, blockers)
     if side:
-        add("SIDE-HOLES", "偏置或径向孔加工", side, ["drilling"], "按孔轴线、偏置位置及动力刀具能力规划；加工时机需结合装夹确认。", blockers=["尚缺正式 L32 侧孔工序的连续实体试算链，参考检查不能接受工序"])
+        add("SIDE-HOLES", "偏置或径向孔加工", side, ["radial_drilling", "radial_hole_finishing"], "按孔轴线和偏置规划；钻尖与孔底冲突时比较预钻回退及平底修整，残料必须由明确的后续工序清除。", blockers=["必须核对钻尖与孔底冲突，并补齐实刀、机床坐标、刀位行程与夹具验证；参考检查不能接受工序"])
     if outer:
         add("BACK", "背面处理（按可达性需要）", outer + inner, ["turn_facing", "turn_od_finishing", "turn_id_finishing"], "仅在正面无法完成的区域需要；两套装夹模板不代表必须夹持两次。", blockers=["确认待加工背面区域、接料和夹持方案"], conditional=True)
         add("CUTOFF", "切断与接料（按供料方式需要）", outer, ["turn_cutoff"], "棒料加工时确认切离位置与接料；顺序取决于供料与装夹方案。", blockers=["确认棒料供料、切断面及接料流程"], conditional=True)

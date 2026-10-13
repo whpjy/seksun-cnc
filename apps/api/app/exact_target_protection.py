@@ -41,7 +41,7 @@ def check_material(job, geometry, stages):
     payload["selected_solid_index"] = int(job.analysis.topology.get("selected_solid_index",1))
     if not payload["axis"]:
         raise ValueError("Full STEP protection requires the bound rotational axis")
-    signature = cached_preview_signature("full-step-protection-v1",source,payload)
+    signature = cached_preview_signature("full-step-protection-v6-preserved-material",source,payload)
     cache_dir = directory / "exact-target-protection"
     cache_dir.mkdir(exist_ok=True)
     cache = cache_dir / f"{signature}.json"
@@ -64,6 +64,40 @@ def check_material(job, geometry, stages):
 def guard_trial(job, geometry, result, state):
     if not result.get("can_accept") or not required(job,geometry):
         return result
+    evidence=result.get('evidence') or {}
+    if evidence.get('material_domain')=='exact_3d_occ':
+        try:
+            from .main import job_directory
+            from .radial_drilling_trial import bound_solid,inherited_protection,physical_tool_matches
+            from .radial_setup import load_setup
+            from .side_hole_tool import SideDrillGeometry,SideFlatGeometry
+            path=bound_solid(job_directory(job.id),result,result.get('context_signature'))
+            stored=json.loads((path.parent/'evidence.json').read_text(encoding='utf-8'))
+            native=evidence.get('native_result') or {}
+            if stored.get('native_result')!=native or stored.get('material_state')!=evidence.get('material_state'):
+                raise ValueError('Stored native material evidence differs from the trial')
+            previous=(state or {}).get('accepted') or []
+            initial=inherited_protection(previous[-1] if previous else None)
+            raw_initial=native.get('initial_missing_target_mm3')
+            if initial['status']!='passed' and (raw_initial is None or raw_initial>.0001):
+                raise ValueError('Initial 3D material protection has no valid evidence')
+            if native.get('target_protection_status')!='passed' or native.get('target_contact_mm3',1)>.0001:
+                raise ValueError('Native cutting sweep contacts the STEP target')
+            operation=next(o for s in job.plan.setups for o in s.operations if o.id==result['operation_id'])
+            setup=load_setup(job)
+            if not setup or operation.parameters.get('radial_setup_revision')!=setup['revision']:
+                raise ValueError('Radial coordinates changed or are missing')
+            tool=(SideFlatGeometry if operation.type=='radial_hole_finishing' else SideDrillGeometry)(**evidence['draft']['drill_geometry'])
+            station=setup['configuration'].get('operation_stations',{}).get(operation.id,setup['configuration']['station'])
+            if not physical_tool_matches(job,operation,tool,station):
+                raise ValueError('Physical tool confirmation changed or does not match')
+            report={'status':'passed','scope':'bound_3d_solid_zero_target_contact_with_initial_protection',
+                'initial_material_protection':initial,'raw_initial_missing_target_mm3':raw_initial,
+                'target_contact_mm3':native['target_contact_mm3'],'material_sha256':evidence['material_state']['sha256']}
+        except (OSError,ValueError,KeyError,StopIteration) as error:
+            return {**result,'status':'blocked','can_accept':False,'reason':'bound_3d_target_protection_unavailable',
+                'detail':str(error),'evidence':{**evidence,'exact_target_protection':{'status':'unavailable','scope':'exact_3d_occ'}}}
+        return {**result,'evidence':{**evidence,'exact_target_protection':report}}
     material = result.get("cumulative_simulation")
     if not material:
         return result
@@ -72,14 +106,15 @@ def guard_trial(job, geometry, result, state):
               {"operation_id":result["operation_id"],"samples":material["samples"]}]
     try:
         report = check_material(job,geometry,stages)
-    except (OSError,ValueError,StopIteration,subprocess.SubprocessError):
-        report = {"status":"unavailable","detail":"完整 STEP 实体保护检查未产生有效证据。"}
+    except (OSError,ValueError,StopIteration,subprocess.SubprocessError) as error:
+        report = {"status":"unavailable","detail":"完整 STEP 实体保护检查未产生有效证据。",
+                  "executor_error_type":type(error).__name__}
     evidence = {**(result.get("evidence") or {}),"exact_target_protection":report}
     if report["status"] != "passed":
         earlier = any(s["operation_id"]=="BEFORE" and s["status"]=="failed" for s in report.get("stages",[]))
         return {**result,"evidence":evidence,"status":"blocked","can_accept":False,
-            "reason":"previous_step_target_damage" if earlier else "full_step_target_protection_failed",
-            "detail":"前序材料已缺少 STEP 成品实体，先定位并重算前序。" if earlier else "二维轮廓试算不能证明完整 STEP 成品未被过切。",
+            "reason":"full_step_target_protection_unavailable" if report["status"]=="unavailable" else "previous_step_target_damage" if earlier else "full_step_target_protection_failed",
+            "detail":"完整 STEP 检查引擎未返回有效证据，不能判断是否过切；先复查执行引擎。" if report["status"]=="unavailable" else "前序材料已缺少 STEP 成品实体，先定位并重算前序。" if earlier else "二维轮廓试算不能证明完整 STEP 成品未被过切。",
             "next_action":"inspect_l32_material_protection_then_replan"}
     return {**result,"evidence":evidence}
 
@@ -99,6 +134,16 @@ def audit_material(job_id: str):
     path = directory/"harness-l32-operation-state.json"
     state = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
     accepted = reconcile_state(job,state,context)["accepted"]
+    if any((r.get('evidence') or {}).get('material_state') for r in accepted):
+        # Never rebuild radial holes from an unchanged rotational envelope.
+        try:
+            from .radial_drilling_trial import bound_solid
+            for r in accepted:
+                if (r.get('evidence') or {}).get('material_state'):bound_solid(directory,r,context)
+        except ValueError as error:raise HTTPException(409,str(error)) from error
+        return {'status':'review','job_id':job_id,'context_signature':context,'production_ready':False,
+            'scope':'exact_3d_occ','detail':'已存在三维连续材料；回转包络不能证明孔底及成品完整性。请核对各道已绑定的实体试算证据。',
+            'stages':[{'operation_id':r['operation_id'],'status':(r.get('evidence') or {}).get('exact_target_protection',{}).get('status','review')} for r in accepted]}
     try:
         report = check_material(job,geometry,[{"operation_id":"INITIAL","samples":None}]+[
             {"operation_id":r["operation_id"],"samples":r["cumulative_simulation"]["samples"]} for r in accepted])

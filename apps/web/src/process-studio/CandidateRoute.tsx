@@ -5,7 +5,7 @@ type Step = {
   prerequisite_ids: string[]; blockers: string[]; conditional: boolean;
   operation_ids: string[]; status: "pending" | "established" | "trial_accepted";
 };
-type Route = { steps: Step[]; note: string; exact_target_protection?: {status:string;first_failed_operation_id?:string;radial_tolerance_mm:number;stages:{operation_id:string;status:string;missing_target_mm3:number;protected_missing_target_mm3:number}[]}; workholding?: { status: string; blockers: string[]; material_source?: {source: string; source_operation_id?: string} }; material_profiles?: {
+  type Route = { steps: Step[]; note: string; exact_target_protection?: {status:string;first_failed_operation_id?:string;radial_tolerance_mm:number;stages:{operation_id:string;status:string;missing_target_mm3:number|null;protected_missing_target_mm3:number}[]}; workholding?: { status: string; blockers: string[]; material_source?: {source: string; source_operation_id?: string} }; material_profiles?: {
   profile_id: string; side: string; status: string; source_operation_id: string;
   evaluated_sample_count: number;
   overcut_sample_count: number; excess_stock_sample_count: number;
@@ -42,6 +42,7 @@ export default function CandidateRoute({ jobId, onSelect }: {
   }, [jobId]);
   if (!route) return error ? <p className="studio-warning">{error}</p> : null;
   const names = new Map(route.steps.map(step => [step.id, step.name]));
+    const latestProtection = route.exact_target_protection?.stages.at(-1);
   const pending = route.steps.filter(step => !step.conditional && step.status === "pending").length;
   return <details className="studio-candidate-route" open aria-label="候选加工步骤">
     <summary>候选加工步骤 · {pending} 项待建立</summary>
@@ -51,8 +52,10 @@ export default function CandidateRoute({ jobId, onSelect }: {
       <p className="studio-panel-empty">完整 STEP 与累计车削包络比较，径向几何容差 {route.exact_target_protection.radial_tolerance_mm} mm；此检查不代表机床碰撞验证。</p>
       {route.exact_target_protection.status === "failed" ? <>
         <p className="studio-warning">发现成品实体缺失 · 最早失败工序 {route.exact_target_protection.first_failed_operation_id}，需要重算前序。</p>
-        <p className="studio-warning">当前累计缺失成品体积 {route.exact_target_protection.stages.at(-1)?.missing_target_mm3.toFixed(2)} mm³</p>
+        <p className="studio-warning">{typeof latestProtection?.missing_target_mm3 === "number" ? `当前累计缺失成品体积 ${latestProtection.missing_target_mm3.toFixed(2)} mm³` : "原始差集未返回有效体积"}</p>
+        <p className="studio-warning">容差比较后缺失成品体积 {latestProtection?.protected_missing_target_mm3.toFixed(2)} mm³</p>
       </> : <p className="studio-panel-empty">径向几何容差内未发现成品实体缺失 · 仍为草案验证</p>}
+      {latestProtection?.missing_target_mm3 === null && <p className="studio-panel-empty">原始差集体积未知；容差保护检查已完成，未将未知体积计为零。</p>}
     </div>}
     {route.workholding && route.workholding.status !== "not_required" && <div aria-label="背面加工转接检查">
       <h4 className="studio-validation-title">背面加工转接检查</h4>

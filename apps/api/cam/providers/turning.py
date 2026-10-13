@@ -31,9 +31,10 @@ class TurningContext:
     axial_clearance_mm: float = 2.0
     channel_id: str = "main"
     cut_direction: Literal["negative_z", "positive_z"] = "negative_z"
-    generator_version: str = "0.1.0"
+    generator_version: str = "0.3.0"
     stock_z_min_mm: float | None = None
     stock_z_max_mm: float | None = None
+    compensation_reference_profile: RotationalProfile | None = None
 
     def __post_init__(self) -> None:
         if len(self.machine_snapshot_hash) != 64:
@@ -48,7 +49,7 @@ class TurningContext:
 
 class TurningProvider:
     id = "turning"
-    version = "0.1.0"
+    version = "0.3.0"
 
     def supports(self, operation: Operation) -> bool:
         return operation.type in SUPPORTED_OPERATION_TYPES
@@ -176,7 +177,8 @@ def _positive(operation: Operation, key: str) -> float:
 
 
 def _ordered_points(profile: RotationalProfile, direction: str) -> list[RotationalProfilePoint]:
-    return sorted(profile.points, key=lambda item: item.z, reverse=direction == "negative_z")
+    points = sorted(profile.points, key=lambda item: item.z)
+    return list(reversed(points)) if direction == "negative_z" else points
 
 
 def _approach_z(value: float, context: TurningContext) -> float:
@@ -225,13 +227,12 @@ def _generate_od_finishing(builder: _CommandBuilder, profile: RotationalProfile)
     if allowance < 0:
         raise ValueError("radial_allowance_mm cannot be negative")
     nose_radius = float(builder.operation.tool.nose_radius_mm or 0)
-    points = sorted(
-        compensate_profile_for_nose(
-            profile, nose_radius_mm=nose_radius, allowance_mm=allowance,
-        ),
-        key=lambda item: item.z,
-        reverse=builder.context.cut_direction == "negative_z",
+    points = compensate_profile_for_nose(
+        profile, nose_radius_mm=nose_radius, allowance_mm=allowance,
+        boundary_reference=builder.context.compensation_reference_profile,
     )
+    if builder.context.cut_direction == "negative_z":
+        points.reverse()
     first = points[0]
     builder.add(
         "rapid_move",
@@ -246,6 +247,7 @@ def _generate_od_finishing(builder: _CommandBuilder, profile: RotationalProfile)
         builder.add("rapid_move", axes={"Z": first.z})
         builder.add("feed_move", axes={"X": 2 * first.radius}, parameters=nose_parameters)
     else:
+        builder.add("rapid_move", axes={"Z": first.z})
         builder.add(
             "feed_move", axes={"X": 2 * first.radius, "Z": first.z},
             parameters=nose_parameters,
@@ -326,6 +328,7 @@ def _generate_od_roughing(builder: _CommandBuilder, profile: RotationalProfile) 
                     parameters={"cut_side": "external"},
                 )
             else:
+                builder.add("rapid_move", axes={"Z": start_z})
                 builder.add(
                     "feed_move", axes={"X": 2 * radius, "Z": start_z},
                     parameters={"cut_side": "external"},
@@ -388,6 +391,7 @@ def _generate_id_roughing(builder: _CommandBuilder, profile: RotationalProfile) 
                 axes={"X": builder.bore_clearance_diameter, "Z": _approach_z(start_z, builder.context)},
                 safety_requirements=["initial_bore_confirmed", "work_spindle_running", "tool_offset_active"],
             )
+            builder.add("rapid_move", axes={"Z": start_z})
             builder.add("feed_move", axes={"X": 2 * radius, "Z": start_z}, parameters={"cut_side": "internal"})
             builder.add("feed_move", axes={"X": 2 * radius, "Z": end_z}, parameters={"cut_side": "internal"})
             builder.add("rapid_move", axes={"X": builder.bore_clearance_diameter})
@@ -404,13 +408,12 @@ def _generate_id_finishing(builder: _CommandBuilder, profile: RotationalProfile)
     if any(point.radius < allowance for point in profile.points):
         raise ValueError("inner finishing allowance exceeds profile radius")
     nose_radius = float(builder.operation.tool.nose_radius_mm or 0)
-    points = sorted(
-        compensate_profile_for_nose(
-            profile, nose_radius_mm=nose_radius, allowance_mm=allowance,
-        ),
-        key=lambda item: (item.z, item.radius),
-        reverse=builder.context.cut_direction == "negative_z",
+    points = compensate_profile_for_nose(
+        profile, nose_radius_mm=nose_radius, allowance_mm=allowance,
+        boundary_reference=builder.context.compensation_reference_profile,
     )
+    if builder.context.cut_direction == "negative_z":
+        points.reverse()
     first = points[0]
     builder.add(
         "rapid_move",
@@ -421,6 +424,7 @@ def _generate_id_finishing(builder: _CommandBuilder, profile: RotationalProfile)
         "cut_side": "internal", "position_role": "nose_center",
         "tool_nose_radius_mm": nose_radius,
     }
+    builder.add("rapid_move", axes={"Z": first.z})
     builder.add("feed_move", axes={"X": 2 * first.radius, "Z": first.z}, parameters=nose_parameters)
     for point in points[1:]:
         builder.add("feed_move", axes={"X": 2 * point.radius, "Z": point.z}, parameters=nose_parameters)
@@ -609,13 +613,12 @@ def _generate_grooving(
     if tip_radius <= 0 or abs(2 * tip_radius - tool_width) > 1e-6:
         raise ValueError("full-radius grooving insert radius must equal half its cutting width")
 
-    contour = sorted(
-        compensate_profile_for_nose(
-            profile, nose_radius_mm=tip_radius, allowance_mm=allowance,
-        ),
-        key=lambda item: (item.z, item.radius),
-        reverse=builder.context.cut_direction == "negative_z",
+    contour = compensate_profile_for_nose(
+        profile, nose_radius_mm=tip_radius, allowance_mm=allowance,
+        boundary_reference=builder.context.compensation_reference_profile,
     )
+    if builder.context.cut_direction == "negative_z":
+        contour.reverse()
     if len(contour) < 2:
         raise ValueError("full-radius contour grooving requires at least two profile points")
     first = contour[0]
@@ -633,6 +636,7 @@ def _generate_grooving(
         "tool_nose_radius_mm": tip_radius,
         "groove_strategy": "full_radius_contour",
     }
+    builder.add("rapid_move", axes={"Z": first.z})
     builder.add(
         "feed_move", axes={"X": 2 * first.radius, "Z": first.z},
         parameters=contour_parameters,

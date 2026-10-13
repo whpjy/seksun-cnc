@@ -16,8 +16,9 @@ def _segment_normal(
     if length <= 1e-12:
         return (0, 0)
     normal_z, normal_r = -dr / length, dz / length
-    desired_radial_sign = 1 if side == "outer" else -1
-    if normal_r * desired_radial_sign < 0:
+    # Profiles traverse increasing Z. At a radial shoulder normal_r is zero,
+    # so its sign cannot decide which side contains free space.
+    if side == "inner":
         normal_z, normal_r = -normal_z, -normal_r
     return normal_z, normal_r
 
@@ -27,6 +28,7 @@ def compensate_profile_for_nose(
     *,
     nose_radius_mm: float,
     allowance_mm: float = 0,
+    boundary_reference: RotationalProfile | None = None,
 ) -> list[RotationalProfilePoint]:
     """Offset a Z-R profile to an explicit circular insert-nose center path.
 
@@ -35,7 +37,22 @@ def compensate_profile_for_nose(
     """
     if nose_radius_mm < 0 or allowance_mm < 0:
         raise ValueError("nose radius and allowance must be non-negative")
-    points = sorted(profile.points, key=lambda item: (item.z, item.radius))
+    points = sorted(profile.points, key=lambda item: item.z)
+    if boundary_reference is not None:
+        if (boundary_reference.id, boundary_reference.axis_id, boundary_reference.side) != (profile.id, profile.axis_id, profile.side):
+            raise ValueError("compensation boundary reference does not match the machining profile")
+        reference = sorted(boundary_reference.points, key=lambda item: item.z)
+        if points[0].z < reference[0].z-1e-6 or points[-1].z > reference[-1].z+1e-6:
+            raise ValueError("compensation boundary reference does not cover the machining region")
+        before = [p for p in reference if p.z < points[0].z-1e-9]
+        after = [p for p in reference if p.z > points[-1].z+1e-9]
+        augmented = ([before[-1]] if before else []) + points + ([after[0]] if after else [])
+        compensated = compensate_profile_for_nose(
+            profile.model_copy(update={"points":augmented}), nose_radius_mm=nose_radius_mm,
+            allowance_mm=allowance_mm,
+        )
+        start = 1 if before else 0
+        return compensated[start:start+len(points)]
     material_offset = allowance_mm if profile.side == "outer" else -allowance_mm
     if nose_radius_mm <= 1e-12:
         return [
@@ -73,12 +90,7 @@ def compensate_profile_for_nose(
                 previous_direction[0] * next_direction[1]
                 - previous_direction[1] * next_direction[0]
             )
-            outward_corner = (
-                denominator < -1e-12
-                if profile.side == "outer"
-                else denominator > 1e-12
-            )
-            if outward_corner:
+            if abs(denominator) > 1e-12:
                 previous_offset = (
                     point.z + nose_radius_mm * segment_normals[index - 1][0],
                     point.radius + material_offset + nose_radius_mm * segment_normals[index - 1][1],

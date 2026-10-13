@@ -96,6 +96,19 @@ def build_front_groove_geometry_draft(
         raise ValueError("groove shoulders cannot be bounded by exact outer lands")
     z_min = profile.points[left_lands[-1]].z
     z_max = profile.points[right_lands[0]].z
+    # Unequal shoulders cannot share a radius threshold: the lower land would
+    # truncate the higher flank. Bound each side by its own adjacent cylinder.
+    floor_radius = max(feature.radius_start,feature.radius_end)
+    for index in range(left_index-1,-1,-1):
+        a,b=profile.points[index:index+2]
+        if b.z-a.z>1e-6 and abs(b.radius-a.radius)<=1e-6 and min(a.radius,b.radius)>floor_radius+1e-6:
+            z_min=b.z
+            break
+    for index in range(right_index+1,len(profile.points)-1):
+        a,b=profile.points[index:index+2]
+        if b.z-a.z>1e-6 and abs(b.radius-a.radius)<=1e-6 and min(a.radius,b.radius)>floor_radius+1e-6:
+            z_max=a.z
+            break
     if z_max-z_min < proposed_tool_width_mm:
         raise ValueError("proposed tool does not fit the full groove region")
     # Half-width overlap eliminates unswept axial bands between plunges.

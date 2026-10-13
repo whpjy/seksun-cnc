@@ -508,6 +508,24 @@ std::optional<RotationalSectionCandidate> collect_rotational_section(
     std::vector<RotationalSectionPoint> outer;
     std::vector<RotationalSectionPoint> inner;
     int inner_groups = 0;
+    // An axial face contains several radii at one Z. Preserve the two
+    // one-sided limits instead of joining the smaller radius to a previous
+    // station (which invents a taper at a square bore shoulder).
+    const double probe_offset = std::max(1e-8, diagonal * 1e-9);
+    const auto limits_at = [&](double station, double probe) {
+        std::vector<double> values;
+        for (const auto& trace : section_traces) {
+            for (std::size_t i = 1; i < trace.size(); ++i) {
+                const auto& a = trace[i - 1];
+                const auto& b = trace[i];
+                if (std::abs(b.z - a.z) < 1e-12) continue;
+                if (probe < std::min(a.z, b.z) || probe > std::max(a.z, b.z)) continue;
+                const double radius = a.radius + (station - a.z) * (b.radius - a.radius) / (b.z - a.z);
+                if (radius > radius_tolerance) values.push_back(radius);
+            }
+        }
+        return values;
+    };
     for (const auto& group : groups) {
         const double z = std::accumulate(
             group.begin(), group.end(), 0.0,
@@ -538,8 +556,29 @@ std::optional<RotationalSectionCandidate> collect_rotational_section(
         }
         if (radii.empty()) continue;
         const auto [minimum, maximum] = std::minmax_element(radii.begin(), radii.end());
-        outer.push_back({z, *maximum});
-        if (*maximum - *minimum > radius_tolerance * 2) {
+        const auto before = limits_at(z, z - probe_offset);
+        const auto after = limits_at(z, z + probe_offset);
+        bool inner_step = false;
+        bool outer_step = false;
+        if (!before.empty() && !after.empty()) {
+            const auto [before_min, before_max] = std::minmax_element(before.begin(), before.end());
+            const auto [after_min, after_max] = std::minmax_element(after.begin(), after.end());
+            outer_step = std::abs(*before_max - *after_max) > radius_tolerance * 2;
+            if (outer_step) {
+                outer.push_back({z, *before_max});
+                outer.push_back({z, *after_max});
+            }
+            inner_step = *before_max - *before_min > radius_tolerance * 2
+                && *after_max - *after_min > radius_tolerance * 2
+                && std::abs(*before_min - *after_min) > radius_tolerance * 2;
+            if (inner_step) {
+                inner.push_back({z, *before_min});
+                inner.push_back({z, *after_min});
+                ++inner_groups;
+            }
+        }
+        if (!outer_step) outer.push_back({z, *maximum});
+        if (!inner_step && *maximum - *minimum > radius_tolerance * 2) {
             inner.push_back({z, *minimum});
             ++inner_groups;
         }

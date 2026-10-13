@@ -53,6 +53,11 @@ def operation_preview(job_id: str, operation_id: str) -> dict:
             or result.get("accepted_prefix_signatures") != [item["operation_signature"] for item in prefix]):
         raise HTTPException(409, "工序或前序材料已改变，等待重新试算")
     simulation = result.get("cumulative_simulation") or {}
+    exact_3d=(result.get('evidence') or {}).get('material_domain')=='exact_3d_occ'
+    if exact_3d:
+        from .radial_drilling_trial import bound_solid
+        try:bound_solid(directory,result,context)
+        except ValueError as error:raise HTTPException(409,str(error)) from error
     after = simulation.get("samples") or []
     before = (prefix[-1].get("cumulative_simulation") or {}).get("samples", []) if prefix else []
     if after and not before:
@@ -75,8 +80,8 @@ def operation_preview(job_id: str, operation_id: str) -> dict:
         "evidence": result.get("evidence", {}), "toolpath": result.get("toolpath"),
         "axis": axis.model_dump(mode="json") if axis else None,
         "channel_id": channel, "source_cutoff_z": source_cutoff_z, "coordinate_frame": "source_model",
-        "before_samples": before, "after_samples": after,
-        "material_frames": frames,
+        "before_samples": [] if exact_3d else before, "after_samples": [] if exact_3d else after,
+        "material_frames": [] if exact_3d else frames,
     }
 
 

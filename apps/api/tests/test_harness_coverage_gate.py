@@ -46,9 +46,9 @@ def test_finalization_distinguishes_available_boring_from_unsupported_radial_dri
     assert result["coverage"]["covered_count"] == 1
     assert result["coverage"]["target_count"] == 2
     assert result["completion_allowed"] is False
-    assert result["terminal"] is not coaxial
-    assert result["status"] == ("plan_incomplete" if coaxial else "blocked")
-    assert result["must_continue_planning"] is coaxial
+    assert result["terminal"] is False
+    assert result["status"] == "plan_incomplete"
+    assert result["must_continue_planning"] is True
     # Publishing derived coverage evidence must not invalidate the stock prefix.
     summary = main.get_l32_independent_operation_state(source.id)
     assert summary["accepted_operation_ids"] == ["OP10"]

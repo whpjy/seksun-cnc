@@ -867,6 +867,7 @@ export type OperationDefinition = {
 };
 
 export type Tool = {
+  inventory_id?: string | null;
   id: string; name: string; kind: string; diameter_mm: number; flute_count: number; max_rpm: number; catalog_match: boolean;
   flute_length_mm: number; stickout_mm: number; holder_diameter_mm: number;
   nose_radius_mm?: number | null; cutting_width_mm?: number | null; insert_shape?: string | null;

@@ -17,9 +17,17 @@ type PhysicalTool = {
   measured_cutting_width_mm: number | null;
   measured_stickout_mm: number | null;
   measured_holder_diameter_mm: number | null;
+  measured_flute_length_mm:number|null;
+  measured_shank_diameter_mm:number|null;
+  measured_holder_length_mm:number|null;
+  measured_point_angle_deg:number|null;
+  physical_geometry_verified:boolean;
+  center_cutting_verified:boolean;
+  capability_verified_by:string;
+  capability_verification_reference:string;
   notes: string;
   active: boolean;
-  verification_state: "recorded";
+  verification_state: "recorded" | "capability_verified";
 };
 
 type ToolForm = {
@@ -32,6 +40,14 @@ type ToolForm = {
   measured_cutting_width_mm: string;
   measured_stickout_mm: string;
   measured_holder_diameter_mm: string;
+  measured_flute_length_mm:string;
+  measured_shank_diameter_mm:string;
+  measured_holder_length_mm:string;
+  measured_point_angle_deg:string;
+  physical_geometry_verified:boolean;
+  center_cutting_verified:boolean;
+  capability_verified_by:string;
+  capability_verification_reference:string;
   notes: string;
   active: boolean;
 };
@@ -40,6 +56,8 @@ const EMPTY_FORM: ToolForm = {
   inventory_id: "", catalog_tool_id: "", custom_name: "", custom_kind: "grooving", station: "", measured_diameter_mm: "",
   measured_cutting_width_mm: "", measured_stickout_mm: "",
   measured_holder_diameter_mm: "", notes: "", active: true,
+  measured_flute_length_mm:'',measured_shank_diameter_mm:'',measured_holder_length_mm:'',measured_point_angle_deg:'',
+  physical_geometry_verified:false,center_cutting_verified:false,capability_verified_by:'',capability_verification_reference:'',
 };
 
 function nullableNumber(value: string): number | null {
@@ -97,6 +115,12 @@ export function ToolLibraryPanel({
       measured_cutting_width_mm: String(tool.measured_cutting_width_mm ?? ""),
       measured_stickout_mm: String(tool.measured_stickout_mm ?? ""),
       measured_holder_diameter_mm: String(tool.measured_holder_diameter_mm ?? ""),
+      measured_flute_length_mm:String(tool.measured_flute_length_mm ?? ''),
+      measured_shank_diameter_mm:String(tool.measured_shank_diameter_mm ?? ''),
+      measured_holder_length_mm:String(tool.measured_holder_length_mm ?? ''),
+      measured_point_angle_deg:String(tool.measured_point_angle_deg ?? ''),
+      physical_geometry_verified:tool.physical_geometry_verified || false,center_cutting_verified:tool.center_cutting_verified || false,
+      capability_verified_by:tool.capability_verified_by || '',capability_verification_reference:tool.capability_verification_reference || '',
       notes: tool.notes, active: tool.active,
     } : { ...EMPTY_FORM });
     setShowForm(true);
@@ -112,6 +136,7 @@ export function ToolLibraryPanel({
         method: editingId ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          ...tools.find(t=>t.inventory_id===editingId),
           inventory_id: form.inventory_id.trim(), catalog_tool_id: form.catalog_tool_id,
           custom_name: form.catalog_tool_id ? "" : form.custom_name.trim(),
           custom_kind: form.catalog_tool_id ? "" : form.custom_kind,
@@ -119,6 +144,12 @@ export function ToolLibraryPanel({
           measured_cutting_width_mm: nullableNumber(form.measured_cutting_width_mm),
           measured_stickout_mm: nullableNumber(form.measured_stickout_mm),
           measured_holder_diameter_mm: nullableNumber(form.measured_holder_diameter_mm),
+          measured_flute_length_mm:nullableNumber(form.measured_flute_length_mm),
+          measured_shank_diameter_mm:nullableNumber(form.measured_shank_diameter_mm),
+          measured_holder_length_mm:nullableNumber(form.measured_holder_length_mm),
+          measured_point_angle_deg:nullableNumber(form.measured_point_angle_deg),
+          physical_geometry_verified:form.physical_geometry_verified,center_cutting_verified:form.center_cutting_verified,
+          capability_verified_by:form.capability_verified_by,capability_verification_reference:form.capability_verification_reference,
           notes: form.notes.trim(), active: form.active,
         }),
       });
@@ -144,6 +175,7 @@ export function ToolLibraryPanel({
       <button aria-label="关闭刀具库" onClick={onClose}><X size={15} /></button>
     </header>
     <div className="tool-library-controls">
+      {machineInstanceId && !readOnly && <button onClick={()=>beginEdit()}>登记现场刀具</button>}
       <label className="tool-library-search"><Search size={13} /><input aria-label="搜索刀具" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="编号、名称或刀位" /></label>
     </div>
     <div className="tool-library-content">
@@ -167,6 +199,18 @@ export function ToolLibraryPanel({
               <label>实测伸出 mm<input type="number" min="0.001" step="0.001" value={form.measured_stickout_mm} onChange={(event) => setForm({ ...form, measured_stickout_mm: event.target.value })} /></label>
               <label>夹持直径 mm<input type="number" min="0.001" step="0.001" value={form.measured_holder_diameter_mm} onChange={(event) => setForm({ ...form, measured_holder_diameter_mm: event.target.value })} /></label>
             </div>
+            {['drill','end_mill'].includes(selectedTemplate?.kind ?? form.custom_kind) && <>
+              <div className="tool-library-form-grid">
+                <label>实测刃长 mm<input type="number" min="0.001" step="any" value={form.measured_flute_length_mm} onChange={e=>setForm({...form,measured_flute_length_mm:e.target.value})}/></label>
+                <label>实测刀杆直径 mm<input type="number" min="0.001" step="any" value={form.measured_shank_diameter_mm} onChange={e=>setForm({...form,measured_shank_diameter_mm:e.target.value})}/></label>
+                <label>实测刀柄长度 mm<input type="number" min="0.001" step="any" value={form.measured_holder_length_mm} onChange={e=>setForm({...form,measured_holder_length_mm:e.target.value})}/></label>
+                {(selectedTemplate?.kind ?? form.custom_kind)==='drill' && <label>实测钻尖角 °<input type="number" min="90" max="150" step="any" value={form.measured_point_angle_deg} onChange={e=>setForm({...form,measured_point_angle_deg:e.target.value})}/></label>}
+              </div>
+              <label>确认人<input value={form.capability_verified_by} maxLength={120} onChange={e=>setForm({...form,capability_verified_by:e.target.value})}/></label>
+              <label>实测记录或厂家规格依据<input value={form.capability_verification_reference} maxLength={240} onChange={e=>setForm({...form,capability_verification_reference:e.target.value})}/></label>
+              <label><input type="checkbox" checked={form.physical_geometry_verified} onChange={e=>setForm({...form,physical_geometry_verified:e.target.checked,center_cutting_verified:e.target.checked && form.center_cutting_verified})}/>确认上述完整实刀尺寸（伸出从钻尖或平底量起）</label>
+              {(selectedTemplate?.kind ?? form.custom_kind)==='end_mill' && <label><input type="checkbox" disabled={!form.physical_geometry_verified} checked={form.center_cutting_verified} onChange={e=>setForm({...form,center_cutting_verified:e.target.checked})}/>确认平底刀具可中心切削</label>}
+            </>}
             <label>备注<textarea rows={2} value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} /></label>
             {editingId && <label className="tool-library-active"><input type="checkbox" checked={form.active} onChange={(event) => setForm({ ...form, active: event.target.checked })} />在用</label>}
             <div className="tool-library-form-actions"><button onClick={() => setShowForm(false)}>取消</button><button className="primary" disabled={saving || !form.inventory_id.trim() || (!selectedTemplate && (!form.custom_name.trim() || !form.custom_kind))} onClick={saveTool}>{saving ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}保存记录</button></div>

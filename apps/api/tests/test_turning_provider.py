@@ -8,6 +8,37 @@ from app.turning_verification import verify_turning_profile
 from cam.providers.turning import TurningContext, TurningProvider
 
 
+def test_regional_boring_enters_radially_and_preserves_the_adjacent_neck():
+    from app.rotational_features import clip_rotational_profile
+    full = RotationalProfile(id="RP-INNER-1",axis_id="RA-1",side="inner",extraction_method="exact_section",
+        points=[RotationalProfilePoint(z=z,radius=r) for z,r in [(-10,10),(0,10),(1,8),(5,8)]],confidence=1,review_state="accepted")
+    region = clip_rotational_profile(full,-10,0)
+    op = operation("turn_id_finishing","TURN-ID-F",radial_allowance_mm=0)
+    ctx = TurningContext(machine_snapshot_hash="a"*64,stock_radius_mm=12,initial_bore_radius_mm=8,
+        compensation_reference_profile=full)
+    program = TurningProvider().generate(op,ctx,region)
+    commands = program.channels[0].commands
+    first_cut = next(i for i,c in enumerate(commands) if c.type=="feed_move")
+    assert commands[first_cut-1].type=="rapid_move"
+    assert commands[first_cut-1].axes["Z"]==commands[first_cut].axes["Z"]
+    stock = simulate_turning_stock(program,stock_radius_mm=12,initial_bore_radius_mm=8,z_min_mm=-12,z_max_mm=7,resolution_mm=.01)
+    verification = verify_turning_profile(full,stock,tolerance_mm=.005)
+    assert verification.metrics.maximum_overcut_mm < 1e-6
+
+
+def test_regional_bore_roughing_does_not_diagonally_cut_the_smaller_entry():
+    from app.rotational_features import clip_rotational_profile
+    full=RotationalProfile(id="RP-INNER-1",axis_id="RA-1",side="inner",extraction_method="exact_section",
+        points=[RotationalProfilePoint(z=z,radius=r) for z,r in [(-10,10),(0,10),(1,8),(5,8)]],confidence=1,review_state="accepted")
+    region=clip_rotational_profile(full,0,1)
+    op=operation("turn_id_roughing","TURN-ID-R",radial_allowance_mm=.25,depth_of_cut_mm=.5)
+    ctx=TurningContext(machine_snapshot_hash="a"*64,stock_radius_mm=12,initial_bore_radius_mm=6)
+    program=TurningProvider().generate(op,ctx,region)
+    stock=simulate_turning_stock(program,stock_radius_mm=12,initial_bore_radius_mm=6,z_min_mm=-12,z_max_mm=7,resolution_mm=.01)
+    verification=verify_turning_profile(full,stock)
+    assert verification.metrics.maximum_overcut_mm < 1e-6
+
+
 def operation(kind: str, tool_id: str = "TURN-OD-R", **parameters) -> Operation:
     defaults = {
         "spindle_mode": "constant_surface_speed",

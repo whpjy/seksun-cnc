@@ -17,6 +17,7 @@ import ResourceLibrary from "./ResourceLibrary";
 import { StockRuleDialog, StockSelectionPanel } from "./StockSelection";
 import { DrawingEvidencePanel } from "./DrawingEvidence";
 import CandidateRoute from "./CandidateRoute";
+import {RadialSetupPanel} from './RadialSetupPanel';
 import type { StockSelectionData } from "./StockSelection";
 import useFloatingConsole from "./useFloatingConsole";
 import { operationState, outcome } from "./results";
@@ -424,6 +425,7 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
   const stableWorkAxis = useMemo(() => axis, [axis?.x, axis?.y, axis?.z]);
   const consoleCompact = consoleMinimized && !questionWaiting;
   const activePreview = machining?.operation_id === selectedOperation ? machining : null;
+  const solidPreviewUrl=stage==='simulation' && activePreview?.evidence.material_domain==='exact_3d_occ' ? activePreview.evidence.stock_mesh_url : undefined;
   const chainReady = Boolean(playbackChain?.complete && playbackChain.previews.at(-1)?.operation_id === selectedOperation);
   const effectivePlaybackMode = playbackMode === "cumulative" && chainReady ? "cumulative" : "single";
   const trialSegments = useMemo(() => effectivePlaybackMode === "cumulative" ? playbackChain!.previews.flatMap(previewSegments) : activePreview ? previewSegments(activePreview) : emptySegments, [effectivePlaybackMode, playbackChain, activePreview]);
@@ -443,15 +445,15 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
     {resourceOpen && <ResourceLibrary machineInstanceId={job?.machine_instance_id} onClose={() => setResourceOpen(false)} />}
     {stockRulesOpen && <StockRuleDialog onClose={() => setStockRulesOpen(false)} onSaved={() => setStockRuleRevision(value => value + 1)} />}
     <section className={`studio-canvas${stage === "gcode" ? " studio-code-canvas" : ""}`} onPointerDown={event => { if ((event.target as HTMLElement).tagName === "CANVAS") changeFollowing(false); }}>
-      {job?.model_url && stage !== "gcode" && <ModelViewer modelUrl={job.model_url} features={stockSelected ? emptyFeatures : features} selectedFeatureIds={stockSelected ? emptyIds : viewedFeatures} onSelectFeature={inspectFeature}
+      {job?.model_url && stage !== "gcode" && <ModelViewer modelUrl={solidPreviewUrl || job.model_url} features={stockSelected || solidPreviewUrl ? emptyFeatures : features} selectedFeatureIds={stockSelected || solidPreviewUrl ? emptyIds : viewedFeatures} onSelectFeature={inspectFeature}
         viewMode={stockSelected ? "仿真" : stage === "features" ? "特征" : stage === "process" ? "工艺" : stage === "toolpath" ? "刀路" : "仿真"}
-        toolpathSegments={stage === "toolpath" || stage === "simulation" ? visibleSegments : emptySegments} topologyEdges={stockSelected ? undefined : job.analysis?.visual_edges}
+        toolpathSegments={stage === "toolpath" || stage === "simulation" ? visibleSegments : emptySegments} topologyEdges={stockSelected || solidPreviewUrl ? undefined : job.analysis?.visual_edges}
         activeOperationId={selectedOperation} activeOperationLabel={stockSelected ? "毛坯选择" : operation?.name} workAxis={stableWorkAxis}
         showFeatureSummary={false} showFeatureAnnotations={stage === "features"} operationContextVisible={!stockSelected}
         releaseContextOnCleanup backgroundColor={0xdce7f1}
         isolatedFeatureId={stage === "features" && selectedFeatures.length === 1 ? selectedFeatures[0] : null}
         compositionInsetLeftRatio={0} compositionInsetRightRatio={0}
-        simulation={stage === "simulation" && !stockSelected && !trialMaterial ? cam?.simulation : null} animateToolpath={!stockSelected && (stage === "simulation" || stage === "toolpath")}
+        simulation={stage === "simulation" && !stockSelected && !trialMaterial && !solidPreviewUrl ? cam?.simulation : null} animateToolpath={!stockSelected && !solidPreviewUrl && (stage === "simulation" || stage === "toolpath")}
         autoPlay={following && visibleSegments.length > 0} playbackRevision={previewRevision} playbackMode={effectivePlaybackMode} onPlaybackModeChange={setPlaybackMode} cumulativeAvailable={chainReady}
         turningStage={stockSelected ? stockSelection?.view : stage === "simulation" ? trialMaterial : null}
         materialSnapshotUrls={stage === "simulation" && !stockSelected && !activePreview ? snapshots.urls : emptyIds} materialSnapshotStages={stage === "simulation" && !stockSelected && !activePreview ? snapshots.stages : undefined}
@@ -464,6 +466,7 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
       {stage === "gcode" && <GCodePanel key={task?.jobId} jobId={task?.jobId} existingUrl={gcodeUrl} onAvailability={setGenericProgramAvailable} onProgramStates={setProgramStates} selectedOperationId={selectedOperation} onSelectOperationId={setSelectedOperation} detailsVisible={details} />}
       {details && job && <aside className={`studio-inspector${stage === "features" ? " studio-feature-inspector" : ""}`}><header><div><small>ENGINEERING DETAILS</small><strong>{stage === "features" ? `制造特征 · ${features.length}` : stage === "process" ? "装夹与工序" : stage === "toolpath" ? "刀路轨迹" : stage === "gcode" ? "工序代码" : "验证结果"}</strong></div><button aria-label="收起详情" onClick={() => setDetails(false)}><X size={16} /></button></header>
         <div className="studio-inspector-body">
+          {stage==='process' && job.device_id==='citizen-cincom-l32' && job.plan && <RadialSetupPanel key={job.id} job={job} running={liveRunning} onChanged={updated=>{setJob(updated);setCam(null);setTrials(null);setMachining(null);setPlaybackChain(null);}}/>}
           {job.drawing_filename && <DrawingEvidencePanel key={`${job.id}-${job.drawing_analysis?.status}-${stockSelected}`} job={job} running={liveRunning} onChanged={updated => { setJob(updated); setCam(null); setTrials(null); setMachining(null); setPlaybackChain(null); setStockRuleRevision(v => v + 1); }} />}
           {job.device_id === "citizen-cincom-l32" && job.plan && stage !== "features" && stage !== "gcode" && <div className="studio-stock-step"><button className={`studio-operation ${stockSelected ? "selected" : ""}`} onClick={inspectStock} aria-label="第一步：毛坯选择"><span>01</span><div><strong>毛坯选择</strong><small>实心圆棒{stockSelection ? ` · Ø${stockSelection.stock.diameter_mm.toFixed(3)} × ${stockSelection.stock.length_mm.toFixed(3)} mm` : " · 点击查看"}</small><em className="studio-operation-status">点击显示加工前毛坯</em></div></button></div>}
           {stockSelected && task?.jobId ? <><StockSelectionPanel key={task.jobId} data={stockSelection} jobId={task.jobId} running={liveRunning} onRules={() => setStockRulesOpen(true)} onChanged={updated => { setJob(updated); setCam(null); setTrials(null); setMachining(null); setPlaybackChain(null); }} />{stockError && <p className="stock-note" role="status">{stockError}</p>}</> : <>
@@ -476,6 +479,7 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
               {activePreview && <div className="studio-evidence"><strong>{activePreview.can_accept ? "试算可接受（DRAFT）" : "试算未通过"}</strong><small>{activePreview.reason === "profile_overcut" ? "检测到过切" : activePreview.reason ? "存在阻断，需修正后重新试算" : "仍需整件验证"}</small><span>本次试算材料去除</span><b>{activePreview.evidence.removed_volume_mm3?.toFixed(2) || "—"} mm³</b></div>}
               {activePreview?.evidence.reachability_checks?.filter(check => check.status === "failed").map(check => <p className="studio-warning" key={check.id}>{check.message}{check.id === "boring_bar_entry" && typeof check.measured_value === "number" && typeof check.limit_value === "number" ? `：现有孔径 Ø${(2 * check.measured_value).toFixed(2)} mm，当前镗杆要求至少 Ø${(2 * check.limit_value).toFixed(2)} mm` : ""}</p>)}
               {activePreview?.evidence.diagnostic_hints?.map((hint, index) => <p className="studio-warning" key={`hint-${index}`}>{hint}</p>)}
+              {solidPreviewUrl && <p className="stock-note">当前显示本次三维实体试算的真实剩余材料快照；尚无逐刀动画。{activePreview?.can_accept?'仍需整件验证。':'工序尚未接受，不能作为最终成品。'}</p>}
               <div className="studio-kv"><span>已接受工序</span><b>{trials?.accepted_operation_ids.length || 0} / {operations.length}</b></div>
               {operations.map(item => <button className="studio-target" key={item.id} onClick={() => inspectOperation(item.id)}><strong>{item.name}</strong><small>{operationState(item.id,trials,workspace)} · {snapshots.stages.some(snapshot => snapshot.operationId === item.id) ? "点击定位并查看材料去除" : "点击定位 · 未归档材料快照"}</small></button>)}
               <h4 className="studio-validation-title">累计材料去除</h4>

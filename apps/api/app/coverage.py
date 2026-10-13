@@ -68,6 +68,8 @@ def evaluate_plan_coverage(
             from .machining_geometry import axial_hole
             coaxial = plan.stock.get("type") == "round_bar" and axial_hole(feature.model_dump(mode="json"), plan.stock.get("rotational_axis"))
             required = {"axial_drilling"} if coaxial and feature.diameter <= 12 else {"turn_id_finishing"} if coaxial else {"drilling"} if feature.diameter <= 12 else {"helical_boring"}
+            if plan.stock.get('type')=='round_bar' and not coaxial:
+                required=({'radial_hole_finishing'} if any(o.type=='radial_hole_finishing' for o in by_feature[feature.id]) else {'radial_drilling'}) if feature.diameter<=12 else required
             add_feature_target(
                 feature, "hole", required,
                 f"Ø{feature.diameter:g} {feature.end_type} hole",

@@ -1,5 +1,6 @@
 """Isolated exact solid check; never promotes reference holes to accepted operations."""
 import json
+import hashlib
 import re
 import subprocess
 from pathlib import Path
@@ -17,14 +18,26 @@ def check_material_context(job, rotational, snapshot, state):
     accepted=reconcile_state(job,state,context)["accepted"]
     operations={o.id:o for s in job.plan.setups for o in s.operations}
     if any(operations[r["operation_id"]].type in NONROTATIONAL_OPERATION_TYPES for r in accepted):
-        raise HTTPException(409,"前序已有非回转加工，尚无可复用的连续实体状态；不能用回转包络补回已去除材料")
+        from .radial_drilling_trial import bound_solid
+        from .main import job_directory
+        try:
+            solid=bound_solid(job_directory(job.id),accepted[-1],context)
+        except ValueError as error:
+            raise HTTPException(409,"前序已有非回转加工，缺少有效连续实体；不能用回转包络补回已去除材料") from error
+        return {'samples':None,'input_stock_brep':str(solid),'input_stock_sha256':hashlib.sha256(solid.read_bytes()).hexdigest(),
+            'z_range_mm':list(_simulation_range(job,_reference_profile(job,rotational))),
+            'stock_source':'accepted_continuous_solid','bound_machine_instance_id':job.machine_instance_id,
+            'bound_machine_configuration_hash':job.machine_configuration_hash,
+            'accepted_operation_ids':[r['operation_id'] for r in accepted],
+            'accepted_prefix_signatures':[r['operation_signature'] for r in accepted],'context_signature':context}
     samples=(accepted[-1].get("cumulative_simulation") or {}).get("samples") if accepted else None
     if accepted and not samples:
         raise HTTPException(409,"前序材料记录不完整，请先重算")
     return {"samples":samples,"z_range_mm":list(_simulation_range(job,_reference_profile(job,rotational))),
             "stock_source":"accepted_turning_envelope" if accepted else "initial_solid_blank",
             "bound_machine_instance_id":job.machine_instance_id,"bound_machine_configuration_hash":job.machine_configuration_hash,
-            "accepted_operation_ids":[r["operation_id"] for r in accepted],"context_signature":context}
+            "accepted_operation_ids":[r["operation_id"] for r in accepted],
+            "accepted_prefix_signatures":[r['operation_signature'] for r in accepted],"context_signature":context}
 
 
 @router.post("/api/v1/jobs/{job_id}/side-hole-check")
@@ -57,7 +70,7 @@ def check_side_holes(job_id:str,feature_ids:str,tool_diameter_mm:float|None=None
     source=directory/job.filename
     if not source.is_file():
         raise HTTPException(404,"原始 STEP 不存在")
-    signature=cached_preview_signature("side-hole-check-v4",source,payload)
+    signature=cached_preview_signature("side-hole-check-v5-unknown-difference",source,payload)
     output=directory/"side-hole-checks"/signature
     cache=output/"evidence.json"
     if cache.is_file() and (output/"remaining-stock.stl").is_file():
@@ -110,3 +123,14 @@ def side_hole_stock_mesh(job_id:str,revision:str):
     if not path.is_file():
         raise HTTPException(404,"材料快照不存在")
     return FileResponse(path,media_type="model/stl",filename="side-hole-remaining-stock.stl")
+
+
+@router.get('/api/v1/jobs/{job_id}/radial-material/{revision}/remaining-stock.stl')
+def radial_trial_stock_mesh(job_id:str,revision:str):
+    from .main import job_directory
+    if not re.fullmatch(r'[a-f0-9]{64}',revision):
+        raise HTTPException(404,'材料快照不存在')
+    path=job_directory(job_id)/'radial-material'/revision/'remaining-stock.stl'
+    if not path.is_file():
+        raise HTTPException(404,'材料快照不存在')
+    return FileResponse(path,media_type='model/stl',filename='radial-trial-remaining-stock.stl')

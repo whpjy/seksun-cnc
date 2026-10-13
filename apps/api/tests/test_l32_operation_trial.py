@@ -663,7 +663,7 @@ def groove_profile() -> RotationalProfile:
     )
 
 
-def test_default_grooving_capability_metadata_does_not_change_legacy_signature() -> None:
+def test_default_grooving_metadata_preserves_current_signature_but_expires_old_contours() -> None:
     source = operation("OP30", 30, "turn_od_finishing")
     payload = source.model_dump(mode="json")
     payload.pop("reference_profile_id", None)
@@ -671,11 +671,16 @@ def test_default_grooving_capability_metadata_does_not_change_legacy_signature()
     payload["tool"].pop("groove_profile", None)
     payload["tool"].pop("axial_contouring_supported", None)
     payload["tool"].pop("inventory_id", None)
+    legacy = hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    payload["contour_execution_revision"] = "ordered-square-shoulder-v3"
     expected = hashlib.sha256(json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
 
     assert operation_signature(source) == expected
+    assert operation_signature(source) != legacy
 
 
 def test_excess_stock_can_be_assigned_to_exact_downstream_groove() -> None:

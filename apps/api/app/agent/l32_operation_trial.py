@@ -20,6 +20,7 @@ from ..l32_front_groove import build_front_groove_geometry_draft
 STATE_SCHEMA_VERSION = "1.1.0"
 DEFERRED_CONTRACT_VERSION = "1.1.0"
 NONROTATIONAL_OPERATION_TYPES = {
+    "radial_drilling", "radial_hole_finishing",
     "pocket_roughing", "pocket_finishing",
     "live_tool_contour_roughing", "live_tool_contour_finishing",
 }
@@ -27,6 +28,8 @@ NONROTATIONAL_OPERATION_TYPES = {
 
 def operation_signature(operation: Operation) -> str:
     operation_payload = operation.model_dump(mode="json")
+    if operation.type in {"turn_od_roughing", "turn_od_finishing", "turn_id_roughing", "turn_id_finishing", "turn_grooving"}:
+        operation_payload["contour_execution_revision"] = "ordered-square-shoulder-v3"
     # Preserve signatures produced before reference_profile_id existed. Only an
     # actual binding changes the evidence identity.
     if operation_payload.get("reference_profile_id") is None:
@@ -188,6 +191,8 @@ def state_summary(job: JobResponse, state: dict[str, Any] | None) -> dict[str, A
         (item.get("evidence") or {}).get("nonrotational_material_verified") is True
         for item in accepted
     )
+    verified_hole_feature_ids = sorted({str(f) for item in accepted
+        for f in (item.get('evidence') or {}).get('verified_hole_feature_ids', [])})
     next_operation = operations[len(accepted)] if len(accepted) < len(operations) else None
     return {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -206,6 +211,7 @@ def state_summary(job: JobResponse, state: dict[str, Any] | None) -> dict[str, A
         "outstanding_deferred_material_contracts": outstanding_contracts,
         "unassigned_material_obligations": unassigned_obligations,
         "verified_prismatic_feature_ids": verified_prismatic_feature_ids,
+        "verified_hole_feature_ids": verified_hole_feature_ids,
         "nonrotational_material_verified": nonrotational_material_verified,
         "release_status": "DRAFT",
         "production_ready": False,
@@ -502,6 +508,13 @@ def _run_nonrotational_trial(
         key for key in required if evidence.get(key) != "passed"
     )
     can_accept = not missing and not failed
+    contracts = evidence.get('deferred_material_contracts') or []
+    assigned = [c for r in reconciled['accepted'] for c in r.get('deferred_material_contracts', [])
+                if c.get('domain') == 'exact_3d_hole' and c.get('responsible_operation_id') == operation.id]
+    verified = set(evidence.get('verified_hole_feature_ids') or [])
+    if any(not set(c.get('feature_ids') or []) <= verified for c in assigned):
+        can_accept = False
+        failed.append('deferred_hole_material_not_cleared')
     cumulative = _unchanged_rotational_envelope(
         state=reconciled, stock_radius_mm=stock_radius_mm,
         z_min_mm=z_min_mm, z_max_mm=z_max_mm, resolution_mm=resolution_mm,
@@ -509,10 +522,10 @@ def _run_nonrotational_trial(
     feature_ids = list(dict.fromkeys(operation.feature_ids)) if can_accept else []
     result = {
         **base,
-        "status": "passed" if can_accept else "blocked",
-        "acceptance_state": "accepted",
+        "status": ("warning" if contracts else "passed") if can_accept else "blocked",
+        "acceptance_state": "provisional" if contracts else "accepted",
         "can_accept": can_accept,
-        "requires_warning_acknowledgement": False,
+        "requires_warning_acknowledgement": bool(contracts),
         "reason": None if can_accept else (
             "incomplete_nonrotational_evidence" if missing else "nonrotational_verification_failed"
         ),
@@ -541,7 +554,8 @@ def _run_nonrotational_trial(
             "nonrotational_material_verified": bool(
                 operation.type == "live_tool_contour_finishing" and can_accept
             ),
-            "deferred_material_contracts": [],
+            "verified_hole_feature_ids": evidence.get('verified_hole_feature_ids', []) if can_accept and operation.type in {'radial_drilling','radial_hole_finishing'} else [],
+            "deferred_material_contracts": contracts,
             "unassigned_material_obligations": [],
             "downstream_capability_gaps": [],
         },
@@ -832,12 +846,18 @@ def run_independent_trial(
         raise ValueError("process draft is missing a numeric stock diameter")
     reference_profile = _reference_profile(job, rotational)
     z_min, z_max = _simulation_range(job, reference_profile)
-    if operation.type in NONROTATIONAL_OPERATION_TYPES:
+    if operation.type in NONROTATIONAL_OPERATION_TYPES or (operation.type=='turn_cutoff' and (nonrotational_evidence or {}).get('material_domain')=='exact_3d_occ'):
         return _run_nonrotational_trial(
             base=base, reconciled=reconciled, operation=operation,
             evidence=nonrotational_evidence, stock_radius_mm=float(stock_diameter) / 2,
             z_min_mm=z_min, z_max_mm=z_max, resolution_mm=resolution_mm,
         )
+
+    if any((r.get('evidence') or {}).get('material_state') for r in reconciled['accepted']):
+        return ({**base,'status':'blocked','can_accept':False,
+            'reason':'continuous_solid_turning_executor_required',
+            'detail':'已有连续三维材料，不能用回转包络补回径向孔；先接入继承实体的车削执行器。',
+            'next_action':'resolve_material_executor'},reconciled)
 
     profile = _profile_for_operation(operation, rotational)
     profile_required = operation.type in {
@@ -965,6 +985,7 @@ def run_independent_trial(
         machine_instance_id=snapshot.instance.id,
         operation=trial_operation,
         profile=trial_profile,
+        protection_profile=protection_profile,
         stock_radius_mm=float(stock_diameter) / 2,
         initial_bore_radius_mm=initial_bore,
         z_min_mm=z_min,

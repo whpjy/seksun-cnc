@@ -68,3 +68,27 @@ def test_compensation_rejects_inner_path_crossing_centerline() -> None:
         compensate_profile_for_nose(
             profile("inner", [(-5, 0.1), (0, 0.1)]), nose_radius_mm=0.2,
         )
+
+
+def test_regional_inner_compensation_uses_adjacent_taper_to_protect_boundary():
+    full = profile("inner", [(-10,10), (0,10), (1,8), (5,8)])
+    region = full.model_copy(update={"points":full.points[:2]})
+    isolated = compensate_profile_for_nose(region,nose_radius_mm=.2)
+    protected = compensate_profile_for_nose(region,nose_radius_mm=.2,boundary_reference=full)
+    assert isolated[-1].z == 0
+    assert protected[-1].z < -.1
+    assert protected[-1].radius == pytest.approx(9.8)
+
+
+def test_boundary_reference_cannot_substitute_another_geometry():
+    original = profile("inner", [(-10,10),(0,10)])
+    unrelated = original.model_copy(update={"id":"OTHER"})
+    with pytest.raises(ValueError,match="does not match"):
+        compensate_profile_for_nose(original,nose_radius_mm=.2,boundary_reference=unrelated)
+
+
+def test_inner_square_shoulder_keeps_contour_order_and_offsets_into_large_bore():
+    compensated=compensate_profile_for_nose(
+        profile("inner", [(-10,10),(0,10),(0,8),(5,8)]),nose_radius_mm=.2)
+    assert [(p.z,p.radius) for p in compensated] == pytest.approx([
+        (-10,9.8),(-.2,9.8),(-.2,7.8),(5,7.8)])

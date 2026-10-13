@@ -6,6 +6,22 @@ import httpx
 import app.cnc_mcp as cnc_mcp
 
 
+def test_api_client_normalizes_nested_negative_geometry_zero():
+    import math
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "stock": {"axis": [-0.0, 0.0, -1.25]}, "enabled": True,
+    }))
+    result = CncApiClient(transport=transport).json("GET", "/job")
+    assert math.copysign(1, result["stock"]["axis"][0]) == 1
+    assert result["stock"]["axis"][2] == -1.25 and result["enabled"] is True
+
+
+def test_mcp_json_rejects_nonfinite_engineering_evidence():
+    import pytest
+    with pytest.raises(CncApiError, match="非有限"):
+        cnc_mcp._mcp_json_value({"radius": float("nan")})
+
+
 def test_axial_drilling_catalog_excludes_radial_and_offset_holes():
     from app.operation_library import operation_library_payload
     axis = {"origin": {"x": 0, "y": 0, "z": 0}, "direction": {"x": 0, "y": 1, "z": 0}}

@@ -37,7 +37,7 @@ def create_geometry_revision(job_id: str):
         revised=initialize_harness_process_draft(id)
         revised.plan.title=f"修复重识别 · {revised.filename}（工序待重算）"
         revised.plan.ai_planning.update(geometry_revision_source_job_id=job_id,
-            geometry_profile_algorithm="section-curve-intersections-v2")
+            geometry_profile_algorithm="section-one-sided-shoulders-v3")
         save_job(directory,revised)
         write_json(directory/"plan.json",revised.plan.model_dump(mode="json"))
         return {"job_id":id,"source_job_id":job_id,"filename":revised.filename,

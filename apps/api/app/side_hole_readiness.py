@@ -51,9 +51,11 @@ def side_hole_readiness(result, draft, machine, context):
     if context["stock_source"] == "initial_solid_blank":
         add("process_sequence", "review", "本次从初始毛坯开始，没有已接受前序",
             "先确定实际工序顺序；该试算不代表已经车削或钻孔的整件状态")
-    else:
+    elif context['stock_source']=='accepted_turning_envelope':
         add("continuous_solid", "review", "前序材料采用车削采样包络保守重建",
             "正式接受前接入可延续的连续实体材料记录")
+    else:
+        add('continuous_solid','passed','继承已接受且哈希匹配的连续实体材料','继续保留材料哈希与前序绑定')
     excess = metric("remaining_excess_stock_mm3")
     add("whole_part_geometry", "review", f"整件相对 STEP 仍有多余材料 {excess:.6f} mm³" if excess is not None else "尚缺整件多余材料结果",
         "逐项规划其余特征；本次侧孔检查不能证明整件制造目标全部覆盖")

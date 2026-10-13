@@ -66,6 +66,8 @@ from .coverage import evaluate_plan_coverage
 from .drawing_intake import DrawingDimensionReview, review_drawing_dimension
 from .side_hole_draft import build_side_hole_draft
 from .side_hole_check import router as side_hole_check_router
+from .side_hole_strategy import router as side_hole_strategy_router
+from .radial_setup import router as radial_setup_router
 from .remediation import apply_automatic_remediation, build_remediation_report
 from .rotational_features import (
     AIProvisionalProfileDecision, RotationalFeatureAnalysis, bind_thread_requirements,
@@ -171,6 +173,8 @@ app.include_router(stock_selection_router)
 app.include_router(machining_policy_router)
 app.include_router(candidate_route_router)
 app.include_router(side_hole_check_router)
+app.include_router(side_hole_strategy_router)
+app.include_router(radial_setup_router)
 app.include_router(exact_target_protection_router)
 app.include_router(geometry_revision_router)
 origins = [item.strip() for item in os.getenv("CNC_CORS_ORIGINS", "http://localhost:5174").split(",") if item.strip()]
@@ -2294,6 +2298,8 @@ def _create_l32_whole_program_with_agent_loop(job_id: str) -> WholePartDraftResu
                 f"{whole_error}; 已完成 {sum(item['status'] == 'passed' for item in trial_records)} "
                 "道前序工序试算，阻断证据已归档"
             ) from whole_error
+    from .exact_target_protection import guard_compiled
+    guard_compiled(job, rotational, result)
     if accepted_profile is None:
         result.warnings.append("本次智能体试算使用尚待人工确认的回转轮廓，不得用于生产放行。")
     if job.analysis:
@@ -2443,6 +2449,12 @@ def _l32_nonrotational_trial_evidence(
     job_id: str, operation: Operation, *, job: JobResponse | None = None,
 ) -> dict[str, object] | None:
     """Build deterministic OCC evidence for indexed L32 milling operations."""
+    if operation.type in {'radial_drilling', 'radial_hole_finishing'}:
+        from .radial_drilling_trial import radial_trial_evidence
+        return radial_trial_evidence(job or load_job(job_id),operation)
+    if operation.type=='turn_cutoff':
+        from .continuous_cutoff_trial import cutoff_trial_evidence
+        return cutoff_trial_evidence(job or load_job(job_id),operation)
     if operation.type not in {
         "pocket_roughing", "pocket_finishing",
         "live_tool_contour_roughing", "live_tool_contour_finishing",
@@ -3565,7 +3577,7 @@ def finalize_harness_l32_process_plan(job_id: str) -> dict[str, object]:
         if verification.status == "passed" and verification.metrics.evaluated_sample_count >= 2:
             verified_profiles.append(profile.id)
     job.plan.stock["verified_rotational_profile_ids"] = verified_profiles
-    verified_holes = []
+    verified_holes = list(progress.get('verified_hole_feature_ids', []))
     if axis:
         origin, direction = axis["origin"], axis["direction"]
         norm = sum(float(direction[k]) ** 2 for k in "xyz") ** 0.5
@@ -7778,6 +7790,17 @@ def _validate_operation_geometry(job: JobResponse, definition, feature_ids: list
     def compatible(feature_id: str) -> bool:
         if _feature_type(job, feature_id) in requirement.accepts:
             return True
+        if 'radial_hole' in requirement.accepts and job.analysis and job.plan:
+            from .side_hole_draft import build_side_hole_draft
+            from .machining_geometry import job_axis
+            path=job_directory(job.id)/'rotational-features.json'
+            rotational=json.loads(path.read_text(encoding='utf-8')) if path.is_file() else None
+            selected=next((f for f in job.analysis.cylindrical_features if f.id==feature_id),None)
+            if selected:
+                try:
+                    build_side_hole_draft([selected.model_dump(mode='json')],job_axis(job.model_dump(mode='json'),rotational),float(job.plan.stock['diameter_mm']))
+                    return True
+                except (ValueError,KeyError,TypeError):return False
         if "axial_hole" not in requirement.accepts or not job.analysis:
             return False
         from .machining_geometry import axial_hole, job_axis
@@ -7854,6 +7877,7 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
         and (
             definition.engine.provider == "turning"
             or definition.id in {
+                "radial_drilling", "radial_hole_finishing",
                 "pocket_roughing", "pocket_finishing",
                 "live_tool_contour_roughing", "live_tool_contour_finishing",
             }
@@ -7908,6 +7932,11 @@ def create_manual_operation(job_id: str, setup_id: str, request: OperationCreate
             ),
         )
         operation.reference_profile_id = request.reference_profile_id
+        if operation.type in {'radial_drilling', 'radial_hole_finishing', 'turn_cutoff'}:
+            from .radial_setup import load_setup
+            radial_setup = load_setup(job)
+            if radial_setup:
+                operation.parameters['radial_setup_revision'] = radial_setup['revision']
         apply_cutting_parameters(operation, resolve_material(job.material), resolve_machine(job.machine))
         if l32_agent_draft and (job_directory(job_id) / "rotational-features.json").is_file():
             from .agent.l32_operation_trial import capture_profile_authorization
