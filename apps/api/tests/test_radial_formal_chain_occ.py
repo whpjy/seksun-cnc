@@ -4,7 +4,8 @@ import pytest
 from app.engines import resolve_executable,run_freecad_adapter
 
 @pytest.mark.skipif(not resolve_executable('FreeCADCmd'),reason='requires real OCC')
-def test_measured_test_setup_accepts_pilot_then_flat_finish_and_blocks_unverified_cutoff(tmp_path,monkeypatch):
+@pytest.mark.parametrize('complete_transfer',[False,True])
+def test_measured_test_setup_accepts_pilot_then_flat_finish_and_blocks_unverified_cutoff(tmp_path,monkeypatch,complete_transfer):
     from app import main
     from app.models import CylindricalFeature,Vec3
     from app.catalogs import get_tool
@@ -21,6 +22,10 @@ def test_measured_test_setup_accepts_pilot_then_flat_finish_and_blocks_unverifie
     from app.rotational_features import RotationalProfilePoint
     geometry.profiles[0].points=[RotationalProfilePoint(z=-10,radius=10),RotationalProfilePoint(z=0,radius=10)]
     source.plan.stock.update(z_min_mm=-12,z_max_mm=2)
+    if complete_transfer:
+        from app.bar_holding import BarHolding,extend_stock
+        source.plan.stock=extend_stock(source.plan.stock,cut,BarHolding(operation_id=cut.id,grip_length_mm=6,clamp_confirmed=True,
+            verified_by='synthetic',evidence='SYNTHETIC ONLY',expected_stock_signature='test'))
     source.analysis.cylindrical_features=[CylindricalFeature(id='H1',kind='hole',radius=1,diameter=2,length=5,
         center=Vec3(x=7.5,y=0,z=-5),axis=Vec3(x=1,y=0,z=0),review_state='accepted')]
     instance=snapshot().instance.model_copy(update={'installed_modules':['U30B']})
@@ -75,3 +80,30 @@ Part.makeBox(1,1,1,App.Vector(100,100,100)).exportStep({str(tmp_path/'fixture.st
     assert evidence['material_removal_status']=='passed'
     trial,_=run_independent_trial(job=source,operation_id=cut.id,rotational=geometry,snapshot=machine,state=state,nonrotational_evidence=evidence)
     assert not trial['can_accept'] and trial['evidence']['machine_capability_status']=='review'
+    # A measured tool and a force declaration cannot bypass missing bar stock
+    # or the independent dynamic transfer gate.
+    from app.cutoff_setup import CutoffSetup,save_setup
+    cut_record=record_physical_tool(source.machine_instance_id,ToolInventoryInput(inventory_id='CUT-SYNTHETIC',catalog_tool_id='TURN-CUTOFF-2',
+        station='T07',measured_cutting_width_mm=2,measured_cutting_reach_mm=25,measured_blade_height_mm=5,measured_stickout_mm=30,
+        measured_holder_width_mm=10,measured_holder_height_mm=10,measured_holder_length_mm=20,cutoff_geometry_verified=True,
+        capability_verified_by='synthetic tester',capability_verification_reference='SYNTHETIC TEST ONLY'),cut.tool)
+    records.append(cut_record)
+    motion={'open_bore_diameter_mm':26,'envelope_outer_diameter_mm':36,'body_length_mm':5,'approach_distance_mm':15,'withdrawal_distance_mm':20,
+        'z2_origin_mm':0,'z2_sign':1,'z2_limits':[-100,100],'x2_position_mm':0,'x2_limits':[-100,100],
+        'envelope_confirmed':True,'evidence':'SYNTHETIC envelope only'} if complete_transfer else None
+    save_setup(source.id,cut.id,CutoffSetup(inventory_id=cut_record.inventory_id,station='T07',end_radius_mm=0,
+        grip_z_min_mm=-2,grip_z_max_mm=0,grip_diameter_mm=24,minimum_grip_length_mm=1,retained_side='+Z',
+        synchronization_rpm=1000,clamp_force_n=200,required_clamp_force_n=100,clamp_confirmed=True,
+        verified_by='synthetic tester',evidence='SYNTHETIC TEST ONLY',sub_spindle_motion=motion))
+    evidence=main._l32_nonrotational_trial_evidence(source.id,cut,job=source)
+    assert evidence['native_result']['tool_clearance']['status']=='passed',evidence
+    assert evidence['native_result']['retention']['geometry_status']==('passed' if complete_transfer else 'failed')
+    assert evidence['native_result']['retention']['force_confirmation_status']=='passed'
+    assert evidence['native_result']['retention']['transfer_motion_status']==('passed' if complete_transfer else 'not_run')
+    trial,_=run_independent_trial(job=source,operation_id=cut.id,rotational=geometry,snapshot=machine,state=state,nonrotational_evidence=evidence)
+    trial=guard_trial(source,geometry,trial,state)
+    assert trial['can_accept']==complete_transfer,trial
+    if complete_transfer:
+        final=accept_trial(job=source,state=state,trial=trial,operation_id=cut.id,context_signature=trial['context_signature'])
+        assert state_summary(source,final)['accepted_count']==3
+        assert final['production_ready'] is False

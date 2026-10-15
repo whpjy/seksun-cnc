@@ -48,6 +48,37 @@ def excess_trial() -> dict:
     }
 
 
+def test_split_strategy_keeps_full_finish_and_declares_engineering_tool_blocker():
+    geom = RotationalFeatureAnalysis(source_file="part.step", status="candidate", profiles=[profile()],
+        features=[TurningProfileFeature(id="G1", profile_id="RP-1", kind="external_groove_candidate",
+            z_start=-4, z_end=-1, radius_start=4, radius_end=4, width_mm=3, depth_mm=1,
+            source_point_indices=[0, 1], confidence=1, review_state="review")])
+    proposal = propose_l32_operation_repairs(operation(), excess_trial(), profile(), rotational=geom)
+    split = proposal["split_strategy"]
+    assert split and not split["can_accept"] and split["retrial_roughing_required"]
+    assert [s["type"] for s in split["steps"]] == ["turn_od_finishing", "turn_grooving", "turn_od_finishing"]
+    assert split["steps"][-1]["parameters"]["profile_z_min_mm"] == -10
+    assert split["steps"][-1]["parameters"]["profile_z_max_mm"] == 0
+    assert split["steps"][1]["physical_inventory_binding_required"]
+    assert split["steps"][1]["blockers"]
+    assert proposal["fallback_next_action"] == "build_split_outer_contour_draft_and_retrial_prefix"
+    deferred = {"status": "blocked", "reason": "deferred_material_not_removed",
+                "evidence": {"unsatisfied_sample_count": 2, "unsatisfied_z_range_mm": [-3, -2]}}
+    assert propose_l32_operation_repairs(operation(), deferred, profile(), rotational=geom)["split_strategy"]
+    assert propose_l32_operation_repairs(operation(region_complete=False), excess_trial(), profile(), rotational=geom)["split_strategy"] is None
+    partial = operation()
+    partial.profile_authorization = {"provisional_decision": {"z_min_mm": -5, "z_max_mm": 0}}
+    assert propose_l32_operation_repairs(partial, excess_trial(), profile(), rotational=geom)["split_strategy"] is None
+    reverse = operation("TURN-OD-L-MICRO-F")
+    reverse.parameters["cut_direction"] = "positive_z"
+    reverse_split = propose_l32_operation_repairs(reverse, excess_trial(), profile(), rotational=geom)["split_strategy"]
+    assert reverse_split["steps"][0]["parameters"]["profile_z_min_mm"] == -10
+    assert reverse_split["steps"][0]["parameters"]["profile_z_max_mm"] == -1
+    assert get_tool(reverse_split["steps"][0]["tool_id"]).hand == "left"
+    geom.features[0].review_state = "excluded"
+    assert propose_l32_operation_repairs(operation(), excess_trial(), profile(), rotational=geom)["split_strategy"] is None
+
+
 def test_proposes_smaller_nose_from_geometric_excess_stock() -> None:
     result = propose_l32_operation_repairs(operation(), excess_trial(), profile())
 

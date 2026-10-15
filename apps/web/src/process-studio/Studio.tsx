@@ -18,6 +18,8 @@ import { StockRuleDialog, StockSelectionPanel } from "./StockSelection";
 import { DrawingEvidencePanel } from "./DrawingEvidence";
 import CandidateRoute from "./CandidateRoute";
 import {RadialSetupPanel} from './RadialSetupPanel';
+import {CutoffSetupPanel} from './CutoffSetupPanel';
+import {BarHoldingPanel} from './BarHoldingPanel';
 import type { StockSelectionData } from "./StockSelection";
 import useFloatingConsole from "./useFloatingConsole";
 import { operationState, outcome } from "./results";
@@ -467,6 +469,8 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
       {details && job && <aside className={`studio-inspector${stage === "features" ? " studio-feature-inspector" : ""}`}><header><div><small>ENGINEERING DETAILS</small><strong>{stage === "features" ? `制造特征 · ${features.length}` : stage === "process" ? "装夹与工序" : stage === "toolpath" ? "刀路轨迹" : stage === "gcode" ? "工序代码" : "验证结果"}</strong></div><button aria-label="收起详情" onClick={() => setDetails(false)}><X size={16} /></button></header>
         <div className="studio-inspector-body">
           {stage==='process' && job.device_id==='citizen-cincom-l32' && job.plan && <RadialSetupPanel key={job.id} job={job} running={liveRunning} onChanged={updated=>{setJob(updated);setCam(null);setTrials(null);setMachining(null);setPlaybackChain(null);}}/>}
+          {stage==='process' && job.device_id==='citizen-cincom-l32' && job.plan && <CutoffSetupPanel key={job.id} job={job} running={liveRunning} onChanged={updated=>{setJob(updated);setCam(null);setTrials(null);setMachining(null);setPlaybackChain(null);}}/>}
+          {stage==='process' && job.device_id==='citizen-cincom-l32' && job.plan && <BarHoldingPanel key={job.id} job={job} running={liveRunning} onChanged={updated=>{setJob(updated);setCam(null);setTrials(null);setMachining(null);setPlaybackChain(null);}}/>}
           {job.drawing_filename && <DrawingEvidencePanel key={`${job.id}-${job.drawing_analysis?.status}-${stockSelected}`} job={job} running={liveRunning} onChanged={updated => { setJob(updated); setCam(null); setTrials(null); setMachining(null); setPlaybackChain(null); setStockRuleRevision(v => v + 1); }} />}
           {job.device_id === "citizen-cincom-l32" && job.plan && stage !== "features" && stage !== "gcode" && <div className="studio-stock-step"><button className={`studio-operation ${stockSelected ? "selected" : ""}`} onClick={inspectStock} aria-label="第一步：毛坯选择"><span>01</span><div><strong>毛坯选择</strong><small>实心圆棒{stockSelection ? ` · Ø${stockSelection.stock.diameter_mm.toFixed(3)} × ${stockSelection.stock.length_mm.toFixed(3)} mm` : " · 点击查看"}</small><em className="studio-operation-status">点击显示加工前毛坯</em></div></button></div>}
           {stockSelected && task?.jobId ? <><StockSelectionPanel key={task.jobId} data={stockSelection} jobId={task.jobId} running={liveRunning} onRules={() => setStockRulesOpen(true)} onChanged={updated => { setJob(updated); setCam(null); setTrials(null); setMachining(null); setPlaybackChain(null); }} />{stockError && <p className="stock-note" role="status">{stockError}</p>}</> : <>

@@ -12,7 +12,14 @@ def compare(source,payload,output):
     for name,draft in [('direct',payload['drafts']['direct']),('backoff',payload['drafts']['backoff']),('flat_finish',payload['drafts']['flat_finish'])]:
         initial={**common,'draft':draft}
         if name=='flat_finish':initial['input_stock_brep']=str(output/'backoff'/'remaining-stock.brep')
-        native=check(source,initial,output/name)
+        try:
+            if name=='flat_finish' and backed is None:raise ValueError('前序回退钻削没有有效实体，不能计算连续平底修整')
+            native=check(source,initial,output/name)
+        except (ValueError,RuntimeError) as error:
+            rows.append({'id':name,'name':{'direct':'直接钻削','backoff':'回退钻深','flat_finish':'回退钻深后平底精加工'}[name],
+                'target_contact_mm3':None,'remaining_hole_stock_mm3':None,'removed_volume_mm3':None,
+                'geometry_status':'unavailable','detail':str(error),'can_accept':False})
+            continue
         if name=='backoff':backed=native
         contact=native['target_contact_mm3']+(backed['target_contact_mm3'] if name=='flat_finish' else 0)
         residual=native['remaining_cylindrical_segments_mm3']
@@ -24,6 +31,8 @@ def compare(source,payload,output):
             'native':native,'can_accept':False})
     result={'strategies':rows,'scope':'nominal_cylindrical_segment_strategy_comparison','can_accept':False,'production_ready':False}
     if payload.get('cutoff'):
+        result['cutoff_continuation']={'status':'not_run','detail':'前序平底修整未产生通过几何检查的连续实体，切断未计算','can_accept':False}
+    if payload.get('cutoff') and rows[-1].get('geometry_status')=='passed':
         import Part,MeshPart
         from continuous_cutoff import cutoff
         kerf=payload['cutoff']

@@ -141,6 +141,8 @@ def apply_job_stock_rule(job_id: str):
     if selected["diameter_mm"] > 38 or selected["length_mm"] > 320:
         raise HTTPException(422, "所选毛坯超出 L32 已知加工尺寸范围")
     job.plan.stock.update(selected)
+    # A freshly selected blank needs a fresh main-spindle holding confirmation.
+    job.plan.stock.pop('main_bar_holding',None)
     job.plan.stock.pop("drawing_evidence_changed", None)
     job.plan.stock["rotational_axis"] = axis
     for key in ("verified_rotational_profile_ids", "verified_hole_feature_ids", "verified_prismatic_feature_ids", "nonrotational_material_verified"):

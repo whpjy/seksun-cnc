@@ -68,6 +68,8 @@ from .side_hole_draft import build_side_hole_draft
 from .side_hole_check import router as side_hole_check_router
 from .side_hole_strategy import router as side_hole_strategy_router
 from .radial_setup import router as radial_setup_router
+from .cutoff_setup import router as cutoff_setup_router
+from .bar_holding import router as bar_holding_router
 from .remediation import apply_automatic_remediation, build_remediation_report
 from .rotational_features import (
     AIProvisionalProfileDecision, RotationalFeatureAnalysis, bind_thread_requirements,
@@ -175,6 +177,8 @@ app.include_router(candidate_route_router)
 app.include_router(side_hole_check_router)
 app.include_router(side_hole_strategy_router)
 app.include_router(radial_setup_router)
+app.include_router(cutoff_setup_router)
+app.include_router(bar_holding_router)
 app.include_router(exact_target_protection_router)
 app.include_router(geometry_revision_router)
 origins = [item.strip() for item in os.getenv("CNC_CORS_ORIGINS", "http://localhost:5174").split(",") if item.strip()]
@@ -3363,6 +3367,7 @@ def auto_evaluate_l32_operation_repairs(job_id: str, operation_id: str) -> dict[
         payload.update({
             "status": (
                 evaluation.get("status") if recommended_candidate_id
+                else "split_strategy_required" if proposal.get("split_strategy")
                 else "capability_required"
                 if not recommended_candidate_id and proposal.get("capability_requirements")
                 else evaluation.get("status")
@@ -3383,9 +3388,9 @@ def auto_evaluate_l32_operation_repairs(job_id: str, operation_id: str) -> dict[
         })
     else:
         payload.update({
-            "status": "observation_required",
+            "status": "split_strategy_required" if proposal.get("split_strategy") else "observation_required",
             "recommended_candidate_id": None,
-            "next_action": proposal.get("next_action"),
+            "next_action": proposal.get("fallback_next_action") if proposal.get("split_strategy") else proposal.get("next_action"),
         })
     write_json(directory / "agent-l32-auto-repair.json", payload)
     publish_job_event(

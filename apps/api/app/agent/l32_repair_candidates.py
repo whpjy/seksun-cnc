@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from math import isfinite
 
 from ..catalogs import TOOL_DEFINITIONS
 from ..l32_front_groove import build_front_groove_geometry_draft
@@ -37,7 +38,79 @@ def _deviation_range(trial: dict[str, Any], kind: str) -> tuple[float, float] | 
         if isinstance(item, dict) and item.get("kind") == kind
         and isinstance(item.get("z"), (int, float)) and not isinstance(item.get("z"), bool)
     ]
-    return (min(values), max(values)) if values else None
+    if values:
+        return min(values), max(values)
+    if kind == "excess_stock" and trial.get("reason") == "deferred_material_not_removed":
+        # The responsibility gate can return before the verification payload is
+        # attached. Its deterministic unsatisfied range is still residual proof.
+        region = (trial.get("evidence") or {}).get("unsatisfied_z_range_mm")
+        if (isinstance(region, (list, tuple)) and len(region) == 2
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) and isfinite(v) for v in region)
+                and region[0] <= region[1]):
+            return float(region[0]), float(region[1])
+    return None
+
+
+def propose_outer_contour_split(
+    operation: Operation, trial: dict[str, Any], profile: RotationalProfile | None,
+    rotational: RotationalFeatureAnalysis | None,
+) -> dict[str, Any] | None:
+    """Describe a complete multi-operation draft; never promote a partial cut."""
+    if (operation.type != "turn_od_finishing" or profile is None or profile.side != "outer"
+            or rotational is None or operation.parameters.get("profile_region_complete") is False):
+        return None
+    low, high = min(p.z for p in profile.points), max(p.z for p in profile.points)
+    decision = (operation.profile_authorization or {}).get("provisional_decision") or {}
+    if decision and (decision["z_min_mm"] > low + 1e-6 or decision["z_max_mm"] < high - 1e-6):
+        return None
+    if (float(operation.parameters.get("profile_z_min_mm", low)) > low + 1e-6
+            or float(operation.parameters.get("profile_z_max_mm", high)) < high - 1e-6):
+        return None
+    residual = _deviation_range(trial, "excess_stock")
+    if not residual:
+        return None
+    grooves = sorted((f for f in rotational.features
+        if f.profile_id == profile.id and f.kind == "external_groove_candidate"
+        and f.review_state != "excluded" and f.depth_mm > 0 and f.width_mm > 0
+        and f.z_end >= residual[0] and f.z_start <= residual[1]), key=lambda f: f.z_start)
+    tools = _compatible_tools(operation)
+    if not grooves or not tools:
+        return None
+    finish = tools[0]
+    positive = operation.parameters.get("cut_direction", "negative_z") == "positive_z"
+    entry_low, entry_high = ((low, min(f.z_end for f in grooves)) if positive
+                             else (max(f.z_start for f in grooves), high))
+    common = {"radial_allowance_mm": 0, "axial_allowance_mm": 0,
+              "cut_direction": "positive_z" if positive else "negative_z"}
+    steps = []
+    if entry_high > entry_low + 1e-6:
+        steps.append({"id": "entry_finish", "type": "turn_od_finishing",
+            "name": "入口侧外轮廓精车", "feature_ids": [profile.id], "reference_profile_id": profile.id,
+            "tool_id": finish["id"], "parameters": {**common,
+                "profile_z_min_mm": entry_low, "profile_z_max_mm": entry_high}})
+    for feature in grooves:
+        tool = next((t for t in sorted(TOOL_DEFINITIONS, key=lambda t: float(t.get("cutting_width_mm") or 999))
+            if t.get("kind") == "grooving" and t.get("groove_profile") == "full_radius"
+            and t.get("axial_contouring_supported") is True
+            and 0 < float(t.get("cutting_width_mm") or 0) <= feature.width_mm), None)
+        steps.append({"id": f"cleanup_{feature.id}", "type": "turn_grooving",
+            "name": "凹低区轮廓补加工", "feature_ids": [feature.id], "reference_profile_id": profile.id,
+            "tool_id": tool["id"] if tool else None,
+            "catalog_match": bool(tool and tool.get("catalog_match", True)),
+            "physical_inventory_binding_required": True,
+            "parameters": {"groove_strategy": "full_radius_contour",
+                "groove_width_mm": tool["cutting_width_mm"] if tool else None, "peck_depth_mm": 0.3},
+            "blockers": [] if tool and tool.get("catalog_match", True) else
+                ["需提供实测全圆弧轮廓槽刀及轴向切削能力；工程候选仅可用于 DRAFT 几何试算"]})
+    steps.append({"id": "full_finish", "type": "turn_od_finishing",
+        "name": "完整外轮廓精车与残料复验", "feature_ids": [profile.id], "reference_profile_id": profile.id,
+        "tool_id": finish["id"], "parameters": {**common,
+            "profile_z_min_mm": low, "profile_z_max_mm": high}})
+    return {"status": "draft_requires_validation", "can_accept": False, "production_ready": False,
+        "source_operation_id": operation.id, "reference_profile_id": profile.id,
+        "protected_z_range_mm": [low, high], "residual_z_range_mm": list(residual),
+        "steps": steps, "retrial_roughing_required": True,
+        "reason": "完整轮廓包含凹低区，单道外圆精车仍留料；按真实特征补加工后必须复验完整轮廓，并重新绑定粗车残料责任"}
 
 
 def _external_groove_context(
@@ -475,7 +548,9 @@ def propose_l32_operation_repairs(
         observations.append(
             "No safe parameter-only repair was found. A geometry observation or a new/split operation is required."
         )
+    split_strategy = propose_outer_contour_split(operation, trial, profile, rotational)
     fallback_next_action = (
+        "build_split_outer_contour_draft_and_retrial_prefix" if split_strategy else
         "catalog_and_bind_verified_tool_or_define_special_process"
         if capability_requirements else
         "observe_model_or_split_operation"
@@ -488,6 +563,7 @@ def propose_l32_operation_repairs(
         "source_trial_status": trial.get("status"),
         "candidates": [item.model_dump(mode="json") for item in candidates[:5]],
         "capability_requirements": capability_requirements,
+        "split_strategy": split_strategy,
         "observations": observations,
         "automation_boundary": (
             "Only evidence-preserving repairs are proposed; tolerances are never inflated and regional profiles "

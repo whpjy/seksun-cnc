@@ -84,6 +84,17 @@ def guard_trial(job, geometry, result, state):
             if native.get('target_protection_status')!='passed' or native.get('target_contact_mm3',1)>.0001:
                 raise ValueError('Native cutting sweep contacts the STEP target')
             operation=next(o for s in job.plan.setups for o in s.operations if o.id==result['operation_id'])
+            if operation.type=='turn_cutoff':
+                from .cutoff_setup import bound_cutoff_inputs
+                _,_,_,_,revision=bound_cutoff_inputs(job,operation)
+                checks=evidence.get('cutoff_checks') or []
+                if evidence.get('cutoff_setup_revision')!=revision or len(checks)!=5 or any(c.get('status')!='passed' for c in checks):
+                    raise ValueError('Cutoff motion or holding evidence is missing or changed')
+                if (native.get('transfer_motion') or {}).get('status')!='passed':raise ValueError('Sub-spindle transfer motion did not pass')
+                report={'status':'passed','scope':'bound_cutoff_3d_material_and_confirmed_conservative_transfer_envelope',
+                    'initial_material_protection':initial,'target_contact_mm3':native['target_contact_mm3'],
+                    'material_sha256':evidence['material_state']['sha256']}
+                return {**result,'evidence':{**evidence,'exact_target_protection':report}}
             setup=load_setup(job)
             if not setup or operation.parameters.get('radial_setup_revision')!=setup['revision']:
                 raise ValueError('Radial coordinates changed or are missing')

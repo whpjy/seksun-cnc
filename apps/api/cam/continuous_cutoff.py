@@ -33,6 +33,16 @@ if __name__=='__main__':
     stock=Part.read(p['input_stock_brep'])
     if stock.isNull() or not stock.isValid() or not stock.Solids:raise ValueError('Inherited cutoff stock is invalid')
     result,report=cutoff(stock,target,p['axis'],p['z_mm'],p['cutting_width_mm'],p['stock_radius_mm'])
+    if p.get('cutoff_safety'):
+        from cutoff_safety import check_tool,check_retention
+        report['tool_clearance']=check_tool(stock,p)
+        report['retention']=check_retention(result,target,p)
+        from sub_spindle_motion import check_transfer
+        transfer=check_transfer(stock,result,target,p)
+        report['transfer_motion']=transfer
+        report['retention']['transfer_motion_status']=transfer['status']
+        if transfer['status']=='passed':
+            report['retention']['issues']=[i for i in report['retention']['issues'] if not i.startswith('背轴接近、夹紧及转接运动尚未')]
     report.update(initial_stock_volume_mm3=stock.Volume,target_protection_status='passed',remaining_stock_valid=True,
         material_removal_status='passed' if report['removed_volume_mm3']>.0001 else 'failed')
     root=Path(output);root.mkdir(parents=True,exist_ok=True)

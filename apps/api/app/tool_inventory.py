@@ -27,6 +27,11 @@ class ToolInventoryInput(BaseModel):
     measured_point_angle_deg:float|None=Field(default=None,ge=90,le=150,allow_inf_nan=False)
     physical_geometry_verified:bool=False
     center_cutting_verified:bool=False
+    measured_cutting_reach_mm:float|None=Field(default=None,gt=0,allow_inf_nan=False)
+    measured_blade_height_mm:float|None=Field(default=None,gt=0,allow_inf_nan=False)
+    measured_holder_width_mm:float|None=Field(default=None,gt=0,allow_inf_nan=False)
+    measured_holder_height_mm:float|None=Field(default=None,gt=0,allow_inf_nan=False)
+    cutoff_geometry_verified:bool=False
     groove_profile: Literal["rectangular", "full_radius"] | None = None
     axial_contouring_supported: bool = False
     capability_verified_by: str = Field(default="", max_length=120)
@@ -50,6 +55,15 @@ class ToolInventoryInput(BaseModel):
                 raise ValueError('实刀几何确认需完整实测尺寸、刀位、确认人及依据')
             if self.measured_stickout_mm<self.measured_flute_length_mm:raise ValueError('实测伸出不得小于刃长')
         if self.center_cutting_verified and not self.physical_geometry_verified:raise ValueError('中心切削确认需先确认实刀几何')
+        if self.cutoff_geometry_verified:
+            from math import isfinite
+            sizes=(self.measured_cutting_width_mm,self.measured_cutting_reach_mm,self.measured_blade_height_mm,
+                self.measured_stickout_mm,self.measured_holder_width_mm,self.measured_holder_height_mm,self.measured_holder_length_mm)
+            if any(v is None or not isfinite(v) for v in sizes) or not self.station or not self.capability_verified_by or not self.capability_verification_reference:
+                raise ValueError('切断刀确认需完整实测刃宽、径向切削能力、刀板高度、伸出、刀柄宽高长及刀位、确认依据')
+            if self.measured_cutting_reach_mm>self.measured_stickout_mm:raise ValueError('切断刀径向切削能力不得大于伸出长度')
+            if self.measured_holder_width_mm<self.measured_cutting_width_mm or self.measured_holder_height_mm<self.measured_blade_height_mm:
+                raise ValueError('当前刀柄模型宽高不能小于刀板宽高')
         if self.axial_contouring_supported:
             if self.custom_kind and self.custom_kind != "grooving":
                 raise ValueError("axial contouring capability is only supported for grooving tools")
@@ -82,6 +96,7 @@ def record_physical_tool(
     if catalog_tool is not None and source.catalog_tool_id != catalog_tool.id:
         raise ValueError("catalog tool identity mismatch")
     kind=catalog_tool.kind if catalog_tool else source.custom_kind
+    if source.cutoff_geometry_verified and kind!='cutoff':raise ValueError('切断刀几何确认仅用于切断刀')
     if source.physical_geometry_verified:
         from math import isfinite
         values=(source.measured_diameter_mm,source.measured_flute_length_mm,source.measured_stickout_mm,source.measured_shank_diameter_mm,source.measured_holder_diameter_mm,source.measured_holder_length_mm)
@@ -108,7 +123,7 @@ def record_physical_tool(
         catalog_tool_name=catalog_tool.name if catalog_tool else source.custom_name,
         tool_kind=catalog_tool.kind if catalog_tool else source.custom_kind,
         verification_state=(
-            "capability_verified" if source.axial_contouring_supported or source.physical_geometry_verified else "recorded"
+            "capability_verified" if source.axial_contouring_supported or source.physical_geometry_verified or source.cutoff_geometry_verified else "recorded"
         ),
         recorded_at=previous.recorded_at if previous else now,
         updated_at=now,

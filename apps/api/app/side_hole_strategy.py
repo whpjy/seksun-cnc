@@ -47,7 +47,7 @@ def compare_side_hole_strategies(job_id:str,feature_ids:str,tool_diameter_mm:flo
     kerf=next((o for o in operations if o.type=='turn_cutoff' and o.workpiece_side=='front'),None)
     if kerf and all(isinstance(kerf.parameters.get(k),(float,int)) for k in ('z_mm','cutting_width_mm')):
         payload['cutoff']={k:kerf.parameters[k] for k in ('z_mm','cutting_width_mm')}
-    signature=cached_preview_signature('side-hole-strategies-v2-continuous-cutoff',directory/job.filename,payload)
+    signature=cached_preview_signature('side-hole-strategies-v3-isolated-candidate-errors',directory/job.filename,payload)
     output=directory/'side-hole-strategies'/signature
     cache=output/'evidence.json'
     if cache.is_file():return json.loads(cache.read_text(encoding='utf-8'))
@@ -63,6 +63,7 @@ def compare_side_hole_strategies(job_id:str,feature_ids:str,tool_diameter_mm:flo
         if result.get('cutoff_continuation',{}).get('status')=='passed':records.append(('cutoff',result['cutoff_continuation']))
         for name,row in records:
             path=Path(scratch)/name/'remaining-stock.brep'
+            if row.get('geometry_status')=='unavailable':continue
             digest=hashlib.sha256(path.read_bytes()).hexdigest()
             material=directory/'radial-material'/digest;material.mkdir(parents=True,exist_ok=True)
             for file in ('remaining-stock.brep','remaining-stock.stl'):shutil.copyfile(path.parent/file,material/file)

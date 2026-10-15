@@ -28,6 +28,9 @@ NONROTATIONAL_OPERATION_TYPES = {
 
 def operation_signature(operation: Operation) -> str:
     operation_payload = operation.model_dump(mode="json")
+    if operation.type=='turn_cutoff' and operation.parameters.get('cutoff_setup_revision'):
+        from ..cutoff_setup import EXECUTION_REVISION
+        operation_payload['cutoff_execution_revision']=EXECUTION_REVISION
     if operation.type in {"turn_od_roughing", "turn_od_finishing", "turn_id_roughing", "turn_id_finishing", "turn_grooving"}:
         operation_payload["contour_execution_revision"] = "ordered-square-shoulder-v3"
     # Preserve signatures produced before reference_profile_id existed. Only an
@@ -62,18 +65,17 @@ def evidence_context_signature(
 ) -> str:
     analysis = job.analysis.model_dump(mode="json") if job.analysis else None
     geometry = rotational.model_dump(mode="json")
-    uncaptured_ids = {
-        profile.id for operation in enabled_operations(job) if not operation.profile_authorization
-        if (profile := _profile_for_operation(operation, rotational)) is not None
-    }
     if analysis:
         analysis.pop("rotational_profile_decisions", None)
         analysis["rotational_profile_reviews"] = {key: value for key, value in analysis.get("rotational_profile_reviews", {}).items() if value == "excluded"}
-    # Review choices are captured by each operation. Geometry remains immutable
-    # evidence; changing another region's provisional choice is not a stock edit.
+    # Review choices belong to operation authorization, not the material world.
+    # Never make geometry identity depend on which operations currently exist:
+    # appending an unreviewed inner operation must preserve the outer prefix.
+    # Exclusions remain in the context; uncaptured operations still have to pass
+    # _authorize_profile_for_draft_trial before they can generate evidence.
     for item in geometry.get("profiles", []):
         item["excluded"] = item.get("review_state") == "excluded"
-        for key in (("reasons", "review_reasons") if item["id"] in uncaptured_ids else ("review_state", "provisional_decision", "reasons", "review_reasons")):
+        for key in ("review_state", "provisional_decision", "reasons", "review_reasons"):
             item.pop(key, None)
     for item in geometry.get("axes", []):
         item["excluded"] = item.get("review_state") == "excluded"

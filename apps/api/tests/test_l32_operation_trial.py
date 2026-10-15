@@ -63,6 +63,63 @@ def test_operation_captures_scope_while_geometry_changes_invalidate_evidence():
     assert _authorize_profile_for_draft_trial(planned, geometry.profiles[0])[2]
 
 
+def test_appending_unreviewed_inner_operation_preserves_accepted_outer_material():
+    from app.agent.l32_operation_trial import capture_profile_authorization
+    geometry = rotational()
+    geometry.profiles.append(RotationalProfile(
+        id="RP-INNER", axis_id="RA-1", side="inner", extraction_method="exact_section",
+        points=[RotationalProfilePoint(z=-30, radius=3), RotationalProfilePoint(z=0, radius=3)],
+        confidence=1, review_state="review"))
+    face = operation("OP10", 10, "turn_facing")
+    capture_profile_authorization(face, geometry)
+    source = job(face)
+    machine = snapshot()
+    first, state = run_independent_trial(job=source, operation_id=face.id,
+        rotational=geometry, snapshot=machine, state=None)
+    state = accept_trial(job=source, state=state, trial=first,
+        operation_id=face.id, context_signature=first["context_signature"])
+    before = json.loads(json.dumps(state["accepted"][0]))
+    inner = operation("OP20", 20, "turn_id_roughing")
+    inner.feature_ids = ["RP-INNER"]
+    inner.reference_profile_id = "RP-INNER"
+    inner.tool = get_tool("TURN-ID-R")
+    source.plan.setups[0].operations.append(inner)
+
+    assert evidence_context_signature(source, geometry, machine) == first["context_signature"]
+    trial, reconciled = run_independent_trial(job=source, operation_id=inner.id,
+        rotational=geometry, snapshot=machine, state=state)
+    assert reconciled["accepted"] == [before]
+    assert not trial["can_accept"]
+    assert trial["reason"] == "profile_review_required"
+    assert state_summary(source, reconciled)["next_operation_id"] == inner.id
+
+    geometry.profiles[-1].review_state = "accepted"
+    capture_profile_authorization(inner, geometry)
+    context = evidence_context_signature(source, geometry, machine)
+    assert context == first["context_signature"]
+    assert reconcile_state(source, state, context)["accepted"] == [before]
+
+
+def test_review_exclusion_and_authorization_edit_still_invalidate_prefix():
+    from app.agent.l32_operation_trial import capture_profile_authorization
+    geometry = rotational()
+    face = operation("OP10", 10, "turn_facing")
+    capture_profile_authorization(face, geometry)
+    source = job(face)
+    machine = snapshot()
+    trial, state = run_independent_trial(job=source, operation_id=face.id,
+        rotational=geometry, snapshot=machine, state=None)
+    state = accept_trial(job=source, state=state, trial=trial,
+        operation_id=face.id, context_signature=trial["context_signature"])
+    changed = source.model_copy(deep=True)
+    changed.plan.setups[0].operations[0].profile_authorization["review_state"] = "review"
+    assert reconcile_state(changed, state, trial["context_signature"])["accepted"] == []
+    geometry.profiles[0].review_state = "excluded"
+    context = evidence_context_signature(source, geometry, machine)
+    assert context != trial["context_signature"]
+    assert reconcile_state(source, state, context)["accepted"] == []
+
+
 def test_coaxial_drilling_uses_model_entry_and_blocks_oversized_tool():
     from app.models import CylindricalFeature
     planned = operation("OP10", 10, "axial_drilling")

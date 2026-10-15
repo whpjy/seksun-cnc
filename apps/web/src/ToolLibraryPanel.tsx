@@ -23,6 +23,8 @@ type PhysicalTool = {
   measured_point_angle_deg:number|null;
   physical_geometry_verified:boolean;
   center_cutting_verified:boolean;
+  measured_cutting_reach_mm:number|null;measured_blade_height_mm:number|null;
+  measured_holder_width_mm:number|null;measured_holder_height_mm:number|null;cutoff_geometry_verified:boolean;
   capability_verified_by:string;
   capability_verification_reference:string;
   notes: string;
@@ -46,6 +48,8 @@ type ToolForm = {
   measured_point_angle_deg:string;
   physical_geometry_verified:boolean;
   center_cutting_verified:boolean;
+  measured_cutting_reach_mm:string;measured_blade_height_mm:string;
+  measured_holder_width_mm:string;measured_holder_height_mm:string;cutoff_geometry_verified:boolean;
   capability_verified_by:string;
   capability_verification_reference:string;
   notes: string;
@@ -58,6 +62,7 @@ const EMPTY_FORM: ToolForm = {
   measured_holder_diameter_mm: "", notes: "", active: true,
   measured_flute_length_mm:'',measured_shank_diameter_mm:'',measured_holder_length_mm:'',measured_point_angle_deg:'',
   physical_geometry_verified:false,center_cutting_verified:false,capability_verified_by:'',capability_verification_reference:'',
+  measured_cutting_reach_mm:'',measured_blade_height_mm:'',measured_holder_width_mm:'',measured_holder_height_mm:'',cutoff_geometry_verified:false,
 };
 
 function nullableNumber(value: string): number | null {
@@ -120,6 +125,8 @@ export function ToolLibraryPanel({
       measured_holder_length_mm:String(tool.measured_holder_length_mm ?? ''),
       measured_point_angle_deg:String(tool.measured_point_angle_deg ?? ''),
       physical_geometry_verified:tool.physical_geometry_verified || false,center_cutting_verified:tool.center_cutting_verified || false,
+      measured_cutting_reach_mm:String(tool.measured_cutting_reach_mm ?? ''),measured_blade_height_mm:String(tool.measured_blade_height_mm ?? ''),
+      measured_holder_width_mm:String(tool.measured_holder_width_mm ?? ''),measured_holder_height_mm:String(tool.measured_holder_height_mm ?? ''),cutoff_geometry_verified:tool.cutoff_geometry_verified || false,
       capability_verified_by:tool.capability_verified_by || '',capability_verification_reference:tool.capability_verification_reference || '',
       notes: tool.notes, active: tool.active,
     } : { ...EMPTY_FORM });
@@ -149,6 +156,8 @@ export function ToolLibraryPanel({
           measured_holder_length_mm:nullableNumber(form.measured_holder_length_mm),
           measured_point_angle_deg:nullableNumber(form.measured_point_angle_deg),
           physical_geometry_verified:form.physical_geometry_verified,center_cutting_verified:form.center_cutting_verified,
+          measured_cutting_reach_mm:nullableNumber(form.measured_cutting_reach_mm),measured_blade_height_mm:nullableNumber(form.measured_blade_height_mm),
+          measured_holder_width_mm:nullableNumber(form.measured_holder_width_mm),measured_holder_height_mm:nullableNumber(form.measured_holder_height_mm),cutoff_geometry_verified:form.cutoff_geometry_verified,
           capability_verified_by:form.capability_verified_by,capability_verification_reference:form.capability_verification_reference,
           notes: form.notes.trim(), active: form.active,
         }),
@@ -210,6 +219,16 @@ export function ToolLibraryPanel({
               <label>实测记录或厂家规格依据<input value={form.capability_verification_reference} maxLength={240} onChange={e=>setForm({...form,capability_verification_reference:e.target.value})}/></label>
               <label><input type="checkbox" checked={form.physical_geometry_verified} onChange={e=>setForm({...form,physical_geometry_verified:e.target.checked,center_cutting_verified:e.target.checked && form.center_cutting_verified})}/>确认上述完整实刀尺寸（伸出从钻尖或平底量起）</label>
               {(selectedTemplate?.kind ?? form.custom_kind)==='end_mill' && <label><input type="checkbox" disabled={!form.physical_geometry_verified} checked={form.center_cutting_verified} onChange={e=>setForm({...form,center_cutting_verified:e.target.checked})}/>确认平底刀具可中心切削</label>}
+            </>}
+            {(selectedTemplate?.kind ?? form.custom_kind)==='cutoff' && <>
+              <div className="tool-library-form-grid">{([
+                ['measured_cutting_reach_mm','实测径向切削能力 mm'],['measured_blade_height_mm','实测刀板高度 mm'],
+                ['measured_holder_width_mm','实测刀柄轴向宽度 mm'],['measured_holder_height_mm','实测刀柄切向高度 mm'],
+                ['measured_holder_length_mm','实测刀柄径向长度 mm'],
+              ] as const).map(([key,label])=><label key={key}>{label}<input type="number" min="0.001" step="any" value={form[key]} onChange={e=>setForm({...form,[key]:e.target.value})}/></label>)}</div>
+              <label>切断刀确认人<input maxLength={120} value={form.capability_verified_by} onChange={e=>setForm({...form,capability_verified_by:e.target.value})}/></label>
+              <label>切断刀实测或厂家规格依据<input maxLength={240} value={form.capability_verification_reference} onChange={e=>setForm({...form,capability_verification_reference:e.target.value})}/></label>
+              <label><input type="checkbox" checked={form.cutoff_geometry_verified} onChange={e=>setForm({...form,cutoff_geometry_verified:e.target.checked})}/>确认切断刀完整实测几何（包含上方刃宽、伸出及实际刀位）</label>
             </>}
             <label>备注<textarea rows={2} value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} /></label>
             {editingId && <label className="tool-library-active"><input type="checkbox" checked={form.active} onChange={(event) => setForm({ ...form, active: event.target.checked })} />在用</label>}

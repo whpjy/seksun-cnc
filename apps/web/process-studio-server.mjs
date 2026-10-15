@@ -7,6 +7,7 @@ import { extname, resolve, sep } from 'node:path';
 const root = resolve('public');
 const harness = new URL(process.env.PROCESS_HARNESS_TARGET || 'http://harness:3081');
 const cnc = new URL(process.env.PROCESS_CNC_TARGET || 'http://api:8090');
+const publicPort = process.env.PROCESS_PUBLIC_PORT || '3082';
 // The Harness trusts its local public endpoint; credentials stay in this server.
 const harnessHost = '127.0.0.1:3081';
 let cookie = '';
@@ -66,7 +67,7 @@ const mime = {
 function isLocalRequest(req) {
   try {
     const host = new URL(`http://${req.headers.host}`);
-    if (!['localhost', '127.0.0.1', '[::1]'].includes(host.hostname) || host.port !== '3082') return false;
+    if (!['localhost', '127.0.0.1', '[::1]'].includes(host.hostname) || host.port !== publicPort) return false;
     if (req.headers['sec-fetch-site'] === 'cross-site') return false;
     return !req.headers.origin || new URL(req.headers.origin).host === host.host;
   } catch { return false; }

@@ -5,6 +5,32 @@ from app.side_hole_strategy import strategy_drafts
 from app.side_hole_tool import SideDrillGeometry
 from app.engines import resolve_executable,run_freecad_adapter
 
+@pytest.mark.skipif(not resolve_executable('FreeCADCmd'),reason='requires real OCC')
+def test_invalid_direct_candidate_does_not_hide_valid_continuous_flat_finish(tmp_path):
+    drafts=strategy_drafts(draft(),SideDrillGeometry(point_angle_deg=118,evidence='candidate only'))
+    payload={'axis':{'direction':dict(x=0,y=0,z=1),'origin':dict(x=0,y=0,z=0)},'stock_diameter_mm':20,'z_range_mm':[0,10],'drafts':drafts}
+    script=tmp_path/'isolated.py';script.write_text('''
+import sys,json
+sys.path.insert(0,'/app/cam')
+import Part,FreeCAD as App
+import side_hole_strategy as strategy
+from pathlib import Path
+root=Path(ROOT);source=root/'target.step'
+Part.makeCylinder(10,10).cut(Part.makeCylinder(1,7,App.Vector(5,0,5),App.Vector(1,0,0))).exportStep(str(source))
+original=strategy.check
+def failed_direct(source,payload,output):
+    if Path(output).name=='direct':raise ValueError('invalid material subtraction')
+    return original(source,payload,output)
+strategy.check=failed_direct
+print('RESULT '+json.dumps(strategy.compare(str(source),PAYLOAD,root/'output')))
+'''.replace('ROOT',repr(str(tmp_path))).replace('PAYLOAD',repr(payload)),encoding='utf-8')
+    response=run_freecad_adapter('FreeCADCmd',script,[],timeout_seconds=90)
+    r=json.loads(next(l.split('RESULT ',1)[1] for l in response.stdout.splitlines() if 'RESULT ' in l))
+    assert r['strategies'][0]['geometry_status']=='unavailable'
+    assert r['strategies'][0]['target_contact_mm3'] is None
+    assert r['strategies'][2]['geometry_status']=='passed'
+    assert r['can_accept'] is False
+
 
 def draft():
     return {'holes':[{'feature_id':'H1','diameter_mm':2,'tool_diameter_mm':2,
