@@ -117,6 +117,7 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
   const [dataError, setDataError] = useState("");
   const [uploadOpen, setUploadOpen] = useState(!task);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadDragging, setUploadDragging] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
   const [resourceOpen, setResourceOpen] = useState(false);
@@ -151,7 +152,6 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
   const [snapshots, setSnapshots] = useState<{ urls: string[]; stages: { operationId: string; start: number; count: number }[] }>({ urls: [], stages: [] });
   const [snapshotError, setSnapshotError] = useState("");
   const input = useRef<HTMLInputElement>(null);
-  const drawingInput = useRef<HTMLInputElement>(null);
   const [drawingFile, setDrawingFile] = useState<File | null>(null);
   const seqs = useRef(new Map<number, JournalEvent>());
   const submitting = useRef(false);
@@ -357,20 +357,17 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
     return () => { active = false; };
   }, [stage, task?.jobId, workspace?.active_event_id, operations.length, job?.device_id, cam]);
 
-  const selectUploadFile = (files: File[]) => {
+  const selectUploadFiles = (files: File[]) => {
     if (busy || !files.length) return;
     setError("");
-    if (files.length !== 1 || !/\.(stp|step)$/i.test(files[0].name)) {
-      setUploadFile(null); setError("请选择一个 STEP 或 STP 三维模型文件。"); return;
-    }
-    setUploadFile(files[0]);
+    const models = files.filter(file => /\.(stp|step)$/i.test(file.name));
+    const drawings = files.filter(file => /\.pdf$/i.test(file.name));
+    if (models.length + drawings.length !== files.length) { setError("仅支持 STEP、STP 三维模型和 PDF 二维图纸。"); return; }
+    if (models.length > 1 || drawings.length > 1) { setError("每个任务需要一个三维模型和一份 PDF 图纸，请勿选择多个同类文件。"); return; }
+    if (models[0]) setUploadFile(models[0]);
+    if (drawings[0]) setDrawingFile(drawings[0]);
   };
-  const selectDrawingFile = (files: File[]) => {
-    if (busy || !files.length) return;
-    if (files.length !== 1 || !/\.pdf$/i.test(files[0].name)) { setDrawingFile(null); setError("请选择一个 PDF 二维图纸文件。"); return; }
-    setDrawingFile(files[0]); setError("");
-  };
-  const openUpload = () => { setUploadFile(null); setDrawingFile(null); setError(""); setUploadOpen(true); if (input.current) input.current.value = ""; if (drawingInput.current) drawingInput.current.value = ""; };
+  const openUpload = () => { setUploadFile(null); setDrawingFile(null); setUploadDragging(false); setError(""); setUploadOpen(true); if (input.current) input.current.value = ""; };
   const start = async (file?: File) => {
     if (!file || !drawingFile || submitting.current) return;
     if (!/\.(stp|step)$/i.test(file.name)) { setError("请选择 STEP 或 STP 三维模型文件。"); return; }
@@ -381,7 +378,7 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
       const drawingReceiptId = await upload(created.sessionId, drawingFile);
       await rpc("session/rename", { request: { sessionId: created.sessionId, title: `工艺设计 · ${file.name}` } });
       await rpc("session/prompt", { request: { sessionId: created.sessionId, requestId: crypto.randomUUID(), mode: "queue", clientTimeZone: "Asia/Shanghai", content: [{ type: "file", receiptId }, { type: "file", receiptId: drawingReceiptId }, { type: "text", text: PROCESS_PROMPT }] } });
-      selectTask({ sessionId: created.sessionId, filename: file.name }); setUploadOpen(false); setUploadFile(null);
+      selectTask({ sessionId: created.sessionId, filename: file.name }); setUploadOpen(false); setUploadFile(null); setDrawingFile(null);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "任务创建失败"); }
     finally { submitting.current = false; setBusy(false); if (input.current) input.current.value = ""; }
   };
@@ -436,8 +433,7 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
   const setupCards = job?.plan?.setups.map((setup, index) => <div className="studio-setup" key={setup.id}><h4><Box size={15} />装夹 {String(index + 1).padStart(2, "0")} <span>{setup.name}</span></h4>{setup.operations.map((item, opIndex) => <button className={`studio-operation ${selectedOperation === item.id ? "selected" : ""}`} key={item.id} onClick={() => inspectOperation(item.id)}><span>{String(job?.device_id === "citizen-cincom-l32" ? operations.findIndex(operation => operation.id === item.id) + 2 : opIndex + 1).padStart(2, "0")}</span><div><strong>{item.name}</strong><small>{item.tool.name} · {item.id}</small><em className="studio-operation-status">{stage === "gcode" ? gcodeUrl ? "整件程序已归档" : programStates[item.id] || "尚未生成" : operationState(item.id, trials, workspace)}</em></div></button>)}</div>);
 
   return <main className="studio">
-    <input ref={input} hidden type="file" accept=".stp,.step" onChange={event => selectUploadFile(Array.from(event.target.files || []))} />
-    <input ref={drawingInput} hidden type="file" accept=".pdf,application/pdf" onChange={event => selectDrawingFile(Array.from(event.target.files || []))} />
+    <input ref={input} hidden type="file" multiple accept=".stp,.step,.pdf,application/pdf" onChange={event => { selectUploadFiles(Array.from(event.target.files || [])); event.target.value = ""; }} />
     <header className="studio-header">
       <div className="studio-brand"><span className="studio-brand-mark"><Box size={23} /></span><div><strong>NEXUS <span>智能工艺设计</span></strong><small>AI PROCESS DESIGN STUDIO</small></div></div>
       <div className="studio-document"><span className="studio-status"><i className={liveRunning || busy ? "pulse" : ""} />{status}</span><strong title={task?.filename}>{task?.filename || "新建零件工艺"}</strong>{job?.drawing_filename && <small title={job.drawing_filename}>{job.drawing_filename}</small>}</div>
@@ -508,13 +504,12 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
       {uploadOpen && <div className="studio-modal-backdrop studio-upload-backdrop"><section className="studio-upload" role="dialog" aria-modal="true" aria-label="新建智能工艺设计">
         <header><span><FileUp size={17} />新建智能工艺设计</span><button aria-label="关闭上传" disabled={busy} onClick={() => setUploadOpen(false)}><X size={18} /></button></header>
         <div className="studio-upload-body">
-          <div className="studio-model-drop" onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); selectUploadFile(Array.from(event.dataTransfer.files)); }}>
-            <div className="studio-model-upload-row"><div className="studio-model-upload-icon"><Layers3 size={25} /></div><div className="studio-model-upload-copy"><h2>上传三维模型</h2><p>选择或拖入一个 STEP / STP 文件，智能体将自动分析并设计加工工艺。</p></div><button className="studio-model-select" disabled={busy} onClick={() => input.current?.click()}><FileUp size={14} />选择文件</button></div>
-            <div className={`studio-model-file ${uploadFile ? "has-file" : ""}`}><Box size={14} /><strong>STP/STEP</strong><span title={uploadFile?.name}>{uploadFile?.name || "等待选择"}</span>{uploadFile && <small>{uploadFile.size < 1024 * 1024 ? `${(uploadFile.size / 1024).toFixed(1)} KB` : `${(uploadFile.size / 1024 / 1024).toFixed(1)} MB`}</small>}</div>
-          </div>
-          <div className="studio-model-drop" onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); selectDrawingFile(Array.from(event.dataTransfer.files)); }}>
-            <div className="studio-model-upload-row"><div className="studio-model-upload-icon"><FileUp size={25} /></div><div className="studio-model-upload-copy"><h2>上传二维图纸</h2><p>配对同一零件的 PDF，读取材料、公差与最大外径，按外径加配置余量选择实心毛坯。</p></div><button className="studio-model-select" disabled={busy} onClick={() => drawingInput.current?.click()}>选择图纸</button></div>
-            <div className={`studio-model-file ${drawingFile ? "has-file" : ""}`}><strong>PDF</strong><span title={drawingFile?.name}>{drawingFile?.name || "等待选择"}</span></div>
+          <div className={`studio-model-drop${uploadDragging ? " is-dragging" : ""}`} role="group" aria-label="上传模型与图纸"
+            onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = busy ? "none" : "copy"; if (!busy) setUploadDragging(true); }}
+            onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setUploadDragging(false); }}
+            onDrop={event => { event.preventDefault(); setUploadDragging(false); selectUploadFiles(Array.from(event.dataTransfer.files)); }}>
+            <div className="studio-model-upload-row"><div className="studio-model-upload-icon"><FileUp size={25} /></div><div className="studio-model-upload-copy"><h2>{uploadDragging ? "松开即可添加文件" : "上传模型与图纸"}</h2><p>将同一零件的 STEP / STP 模型和 PDF 图纸拖到这里，或点击选择文件，可一次多选。</p></div><button className="studio-model-select" disabled={busy} onClick={() => input.current?.click()}><FileUp size={14} />选择文件</button></div>
+            {[{ kind: "model", label: "三维模型", type: "STEP / STP", file: uploadFile, icon: Box }, { kind: "drawing", label: "二维图纸", type: "PDF", file: drawingFile, icon: FileUp }].map(item => <div key={item.kind} className={`studio-model-file ${item.file ? "has-file" : ""}`}><item.icon size={14} /><strong>{item.type}</strong><span title={item.file?.name}>{item.file?.name || `等待选择${item.label}`}</span>{item.file && <><small>{item.file.size < 1024 * 1024 ? `${(item.file.size / 1024).toFixed(1)} KB` : `${(item.file.size / 1024 / 1024).toFixed(1)} MB`}</small><button className="studio-upload-remove" aria-label={`删除${item.label}`} title="删除后可重新选择文件" disabled={busy} onClick={() => { if (item.kind === "model") setUploadFile(null); else setDrawingFile(null); setError(""); }}><X size={14} /></button></>}</div>)}
           </div>
           {error && <p className="studio-upload-error" role="alert">{error}</p>}
         </div>

@@ -381,6 +381,7 @@ body.process-studio-page { min-width:0; }
 .studio-upload>header button:hover { background:#ffffff22; }
 .studio-upload-body { padding:12px; }
 .studio-model-drop { padding:21px 20px 19px; border:1px dashed #8daaff; background:#f8fbff; border-radius:7px; }
+.studio-model-drop.is-dragging { border-color:var(--blue); background:#edf3ff; box-shadow:inset 0 0 0 1px var(--blue); }
 .studio-model-upload-row { display:flex; gap:14px; align-items:center; padding-bottom:19px; border-bottom:1px solid #d4e0f4; }
 .studio-model-upload-icon { display:grid; place-items:center; flex-shrink:0; width:48px; height:48px; border-radius:8px; background:#e3edff; color:#4267e9; }
 .studio-model-upload-copy { min-width:0; flex:1; }
@@ -393,10 +394,14 @@ body.process-studio-page { min-width:0; }
 .studio-model-file span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
 .studio-model-file small { flex-shrink:0; font-size:10px; }
 .studio-model-file.has-file { border-color:#a9bff3; color:#5273b0; }
+.studio .studio-upload-remove { flex-shrink:0; width:24px; height:24px; padding:4px; border-radius:4px; color:#7b91b1; }
+.studio .studio-upload-remove:hover { background:#fff0ee; color:#c04e48; }
 .studio-upload>footer { display:flex; justify-content:flex-end; gap:7px; padding:10px 13px; background:#eaf3ff; border-top:1px solid #dce8f7; }
 .studio .studio-upload-cancel,.studio .studio-upload-start { display:flex; align-items:center; gap:7px; font-size:10px; padding:8px 11px; border-radius:4px; }
 .studio .studio-upload-cancel { color:#4e6f9d; background:white; border:1px solid #a8c0eb; }
 .studio .studio-upload-start { color:white; background:#4267e9; border:1px solid #4267e9; }
+.studio .studio-upload-start:hover:not(:disabled) { color:#fff; background:#355ad7; border-color:#355ad7; }
+.studio .studio-upload-start:active:not(:disabled) { color:#fff; background:#294dc6; border-color:#294dc6; }
 .studio .studio-upload-start:disabled { background:#a0b5ef; border-color:#a0b5ef; opacity:1; cursor:default; }
 .studio-upload-error { color:#b95a53; background:#fff3f0; border-radius:5px; padding:9px; margin:10px 0 0; font-size:11px; line-height:1.6; }
 @media(max-width:600px) { .studio-model-upload-row { flex-wrap:wrap; gap:12px; }.studio-model-upload-copy { flex-basis:calc(100% - 70px); }.studio .studio-model-select { margin-left:64px; }.studio-model-drop { padding:18px 14px; } }
