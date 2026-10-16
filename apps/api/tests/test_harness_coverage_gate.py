@@ -53,3 +53,26 @@ def test_finalization_distinguishes_available_boring_from_unsupported_radial_dri
     summary = main.get_l32_independent_operation_state(source.id)
     assert summary["accepted_operation_ids"] == ["OP10"]
     assert summary["planning_status"] == result["status"]
+
+
+def test_successful_finalization_records_current_gcode_authorization(monkeypatch, tmp_path):
+    source = job(operation("OP10", 10, "turn_od_finishing"))
+    source.plan.stock.update(type="round_bar", profile_review_state="accepted")
+    geometry, machine = rotational(), snapshot()
+    for point in geometry.profiles[0].points:
+        point.radius = 6
+    trial, state = run_independent_trial(job=source, operation_id="OP10", rotational=geometry, snapshot=machine, state=None)
+    assert trial["can_accept"], trial
+    accepted = accept_trial(job=source, state=state, trial=trial, operation_id="OP10")
+    for name, value in {"rotational-features.json": geometry.model_dump(mode="json"), "machine-configuration.json": machine.model_dump(mode="json"), "harness-l32-operation-state.json": accepted}.items():
+        (tmp_path / name).write_text(json.dumps(value), encoding="utf-8")
+    monkeypatch.setattr(main, "job_directory", lambda _: tmp_path)
+    monkeypatch.setattr(main, "load_job", lambda _: source)
+    monkeypatch.setattr(main, "validate_l32_agent_plan", lambda _: {"status": "passed"})
+    result = main.finalize_harness_l32_process_plan(source.id)
+    assert result["completion_allowed"] is True
+    assert result["context_signature"] == accepted["context_signature"]
+    assert result["nc_source_signature"] == main._generic_nc_source(source.id)[2]
+    assert main.get_gcode_planning_status(source.id)["allowed"] is True
+    source.plan.setups[0].operations[0].parameters["face_z_mm"] = -1
+    assert main.get_gcode_planning_status(source.id)["allowed"] is False

@@ -3681,6 +3681,8 @@ def finalize_harness_l32_process_plan(job_id: str) -> dict[str, object]:
         ),
         "reason": None if passed else validation.get("reason", "whole_plan_validation_failed"),
         "completion_allowed": passed,
+        "context_signature": context_signature,
+        "nc_source_signature": _generic_nc_source(job_id)[2],
         "coverage": {
             "status": coverage.status, "score": coverage.score,
             "covered_count": coverage.covered_count, "target_count": coverage.target_count,
@@ -7446,10 +7448,48 @@ def _generic_nc_source(job_id: str):
     return job, rotational, signature(job, rotational)
 
 
+@app.get("/api/v1/jobs/{job_id}/gcode/planning-status")
+def get_gcode_planning_status(job_id: str) -> dict[str, object]:
+    job, _, source_signature = _generic_nc_source(job_id)
+    blocked = {"allowed": False, "reason": "工艺规划尚未成功完成，请先完成工艺规划并通过整件方案校验。"}
+    if job.status != "completed" or not job.plan:
+        return blocked
+    operations = [op.id for setup in job.plan.setups for op in sorted(setup.operations, key=lambda op: op.sequence) if op.enabled]
+    if not operations:
+        return blocked
+    if job.device_id == "citizen-cincom-l32":
+        finalization = _optional_job_json(job_directory(job_id), "harness-l32-plan-finalization.json") or {}
+        if (finalization.get("status") not in {"validated_draft", "validated_draft_with_review"}
+                or finalization.get("completion_allowed") is not True
+                or finalization.get("nc_source_signature") != source_signature
+                or (finalization.get("whole_plan_validation") or {}).get("status") != "passed"):
+            return blocked
+        state = get_l32_independent_operation_state(job_id)
+        if (state.get("planning_status") != finalization["status"]
+                or state.get("accepted_operation_ids") != operations
+                or state.get("provisional_operation_ids")
+                or state.get("outstanding_deferred_material_contracts")
+                or state.get("unassigned_material_obligations")):
+            return blocked
+    elif not job.plan.coverage or not job.plan.coverage.production_ready:
+        return blocked
+    return {"allowed": True, "reason": "工艺规划已完成", "source_signature": source_signature}
+
+
+def _require_gcode_planning_complete(job_id: str) -> None:
+    status = get_gcode_planning_status(job_id)
+    if not status["allowed"]:
+        raise HTTPException(status_code=409, detail=status["reason"])
+
+
 @app.get("/api/v1/jobs/{job_id}/gcode/generic")
 def get_generic_nc(job_id: str) -> dict[str, object]:
     from .generic_nc import NOTICE
     _, _, current_signature = _generic_nc_source(job_id)
+    planning = get_gcode_planning_status(job_id)
+    if not planning["allowed"]:
+        return {"status": "blocked", "production_ready": False, "notice": planning["reason"],
+                "programs": [], "missing": [], "generated_count": 0}
     manifest = _optional_job_json(job_directory(job_id) / "generic-nc", "manifest.json")
     if not manifest:
         return {"status": "not_generated", "production_ready": False, "notice": NOTICE,
@@ -7464,6 +7504,7 @@ def get_generic_nc(job_id: str) -> dict[str, object]:
 @app.post("/api/v1/jobs/{job_id}/gcode/generic")
 def generate_generic_nc(job_id: str) -> dict[str, object]:
     from .generic_nc import build_programs
+    _require_gcode_planning_complete(job_id)
     job, rotational, source_signature = _generic_nc_source(job_id)
     with GENERIC_NC_LOCK:
         if job_id in GENERIC_NC_JOBS:
@@ -7485,6 +7526,7 @@ def generate_generic_nc(job_id: str) -> dict[str, object]:
             raise HTTPException(status_code=422, detail=str(error)) from error
         if _generic_nc_source(job_id)[2] != source_signature:
             raise HTTPException(status_code=409, detail="生成期间方案已变化，请重新生成")
+        _require_gcode_planning_complete(job_id)
         directory = job_directory(job_id) / "generic-nc"
         directory.mkdir(exist_ok=True)
         # Immutable source directories prevent a concurrent download from mixing revisions.
@@ -7506,6 +7548,7 @@ def generate_generic_nc(job_id: str) -> dict[str, object]:
 
 @app.get("/api/v1/jobs/{job_id}/gcode/generic/files/{filename}")
 def download_generic_nc(job_id: str, filename: str) -> FileResponse:
+    _require_gcode_planning_complete(job_id)
     manifest = get_generic_nc(job_id)
     if manifest["status"] == "stale": raise HTTPException(status_code=409, detail="通用程序已失效，请重新生成")
     item = next((p for p in manifest["programs"] if p["filename"] == filename), None)
@@ -7519,6 +7562,7 @@ def download_generic_nc(job_id: str, filename: str) -> FileResponse:
 
 @app.get("/api/v1/jobs/{job_id}/gcode/generic/bundle")
 def download_generic_nc_bundle(job_id: str) -> Response:
+    _require_gcode_planning_complete(job_id)
     from io import BytesIO
     from zipfile import ZIP_DEFLATED, ZipFile
     manifest = get_generic_nc(job_id)
@@ -7571,6 +7615,7 @@ def get_job_file(job_id: str, filename: str) -> FileResponse:
     if filename not in allowed and not generated_artifact:
         raise HTTPException(status_code=404, detail="File not found")
     if filename.endswith(".nc"):
+        _require_gcode_planning_complete(job_id)
         if ai_block_reason := _ai_review_block_reason(job_directory(job_id)):
             raise HTTPException(
                 status_code=409,

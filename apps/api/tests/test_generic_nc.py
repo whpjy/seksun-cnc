@@ -9,8 +9,25 @@ from fastapi.testclient import TestClient
 from app import main
 from app.generic_nc import build_programs, number, turning_lines
 from app.toolpath_ir import ToolpathChannel, ToolpathCommand, ToolpathProgram, ToolpathTrace
-from test_l32_operation_trial import job, operation, rotational
+from test_l32_operation_trial import job, operation, rotational, snapshot
 from test_l32_indexed_pocket import pocket_analysis
+
+
+def complete_planning(source, directory, status="validated_draft"):
+    """Install a successful finalization fixture bound to the current source and accepted prefix."""
+    from app.agent.l32_operation_trial import evidence_context_signature, operation_signature
+    geometry, machine = rotational(), snapshot()
+    context = evidence_context_signature(source, geometry, machine)
+    main.write_json(directory / "rotational-features.json", geometry.model_dump(mode="json"))
+    main.write_json(directory / "machine-configuration.json", machine.model_dump(mode="json"))
+    operations = [op for setup in source.plan.setups for op in setup.operations if op.enabled]
+    main.write_json(directory / "harness-l32-operation-state.json", {"context_signature": context, "accepted": [
+        {"operation_id": op.id, "operation_signature": operation_signature(op), "cumulative_simulation": {}}
+        for op in operations]})
+    main.write_json(directory / "harness-l32-plan-finalization.json", {
+        "status": status, "completion_allowed": True, "context_signature": context,
+        "nc_source_signature": main._generic_nc_source(source.id)[2],
+        "accepted_operation_ids": [op.id for op in operations], "whole_plan_validation": {"status": "passed"}})
 
 
 def test_turning_uses_diameter_coordinates_and_preserves_plan():
@@ -87,6 +104,7 @@ def test_api_generation_download_and_stale_detection_do_not_bypass_production_ga
     (directory / "program.nc").write_text("PRODUCTION FILE", encoding="utf-8")
     client = TestClient(main.app)
     base = f"/api/v1/jobs/{source.id}/gcode/generic"
+    complete_planning(source, directory)
     assert client.get(base).json()["status"] == "not_generated"
     response = client.post(base)
     assert response.status_code == 200
@@ -105,9 +123,11 @@ def test_api_generation_download_and_stale_detection_do_not_bypass_production_ga
     assert client.get(base + "/files/unknown.nc").status_code == 404
     source.plan.setups[0].operations[0].parameters["feed_per_revolution_mm"] = 0.12
     main.save_job(directory, source)
-    assert client.get(base).json()["status"] == "stale"
+    assert client.get(base).json()["status"] == "blocked"
     assert client.get(program["url"]).status_code == 409
     assert client.get(base + "/bundle").status_code == 409
+    assert client.post(base).status_code == 409
+    complete_planning(source, directory)
     regenerated = client.post(base).json()
     assert "G95 F0.12" in client.get(regenerated["programs"][0]["url"]).text
 
@@ -119,6 +139,7 @@ def test_api_detects_plan_change_during_generation(tmp_path, monkeypatch):
     directory = tmp_path / source.id
     directory.mkdir()
     main.save_job(directory, source)
+    complete_planning(source, directory)
     original = generic_nc.build_programs
     def changing(*args):
         result = original(*args)
@@ -129,3 +150,65 @@ def test_api_detects_plan_change_during_generation(tmp_path, monkeypatch):
     response = TestClient(main.app).post(f"/api/v1/jobs/{source.id}/gcode/generic")
     assert response.status_code == 409
     assert not (directory / "generic-nc" / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("state", ["missing", "blocked", "plan_incomplete", "not_allowed", "stale", "unaccepted", "provisional"])
+def test_incomplete_planning_blocks_generation_and_existing_downloads(tmp_path, monkeypatch, state):
+    from app import generic_nc
+    source = job(operation("OP10", 10, "turn_facing"))
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    directory = tmp_path / source.id
+    directory.mkdir()
+    main.save_job(directory, source)
+    complete_planning(source, directory)
+    final_path = directory / "harness-l32-plan-finalization.json"
+    final = json.loads(final_path.read_text())
+    if state == "missing":
+        final_path.unlink()
+    elif state in {"blocked", "plan_incomplete"}:
+        main.write_json(final_path, {**final, "status": state})
+    elif state == "not_allowed":
+        main.write_json(final_path, {**final, "completion_allowed": False})
+    elif state == "stale":
+        main.write_json(final_path, {**final, "nc_source_signature": "old"})
+    else:
+        accepted_path = directory / "harness-l32-operation-state.json"
+        accepted = json.loads(accepted_path.read_text())
+        if state == "unaccepted": accepted["accepted"] = []
+        else: accepted["accepted"][0]["acceptance_state"] = "provisional"
+        main.write_json(accepted_path, accepted)
+    archived = directory / "generic-nc"
+    archived.mkdir()
+    main.write_json(archived / "manifest.json", {"programs": [{"filename": "old.nc"}]})
+    (directory / "program.nc").write_text("HISTORICAL PROGRAM")
+    def forbidden(*args):
+        pytest.fail("Incomplete plans must never invoke NC generation")
+    monkeypatch.setattr(generic_nc, "build_programs", forbidden)
+    client = TestClient(main.app)
+    base = f"/api/v1/jobs/{source.id}/gcode/generic"
+    assert client.get(f"/api/v1/jobs/{source.id}/gcode/planning-status").json()["allowed"] is False
+    assert client.post(base).status_code == 409
+    assert client.get(base).json()["programs"] == []
+    assert client.get(base + "/files/old.nc").status_code == 409
+    assert client.get(base + "/bundle").status_code == 409
+    assert client.get(f"/api/v1/jobs/{source.id}/files/program.nc").status_code == 409
+    assert (directory / "program.nc").read_text() == "HISTORICAL PROGRAM"
+
+
+def test_revoked_finalization_during_generation_does_not_publish_programs(tmp_path, monkeypatch):
+    from app import generic_nc
+    source = job(operation("OP10", 10, "turn_facing"))
+    monkeypatch.setattr(main, "STORAGE_ROOT", tmp_path)
+    directory = tmp_path / source.id
+    directory.mkdir()
+    main.save_job(directory, source)
+    complete_planning(source, directory)
+    original = generic_nc.build_programs
+    def revoke(*args):
+        result = original(*args)
+        main.write_json(directory / "harness-l32-plan-finalization.json", {"status": "blocked"})
+        return result
+    monkeypatch.setattr(generic_nc, "build_programs", revoke)
+    response = TestClient(main.app).post(f"/api/v1/jobs/{source.id}/gcode/generic")
+    assert response.status_code == 409
+    assert not (directory / "generic-nc").exists()

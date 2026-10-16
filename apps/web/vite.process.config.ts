@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { readdir, readFile } from "node:fs/promises";
 
 // Separate server and build directory: the original Harness and CNC entries are untouched.
 export default defineConfig(async () => {
@@ -15,7 +16,24 @@ export default defineConfig(async () => {
     if (!cookie) throw new Error("Harness did not issue a session cookie.");
   }
   return {
-    plugins: [react(), { name: "process-studio-entry", configureServer(server) {
+    plugins: [react(), {
+      name: "pdf-viewer-resources",
+      async generateBundle() {
+        const root = new URL("./node_modules/pdfjs-dist/", import.meta.url);
+        for (const directory of ["cmaps", "standard_fonts", "wasm"]) {
+          for (const entry of await readdir(new URL(`${directory}/`, root), { withFileTypes: true })) {
+            if (entry.isFile()) this.emitFile({ type: "asset", fileName: `pdfjs/${directory}/${entry.name}`, source: await readFile(new URL(`${directory}/${entry.name}`, root)) });
+          }
+        }
+      },
+      configureServer(server) {
+        server.middlewares.use("/pdfjs", async (req, res, next) => {
+          const relative = (req.url || "").split("?")[0];
+          if (!/^\/(cmaps|standard_fonts|wasm)\/[a-zA-Z0-9_.-]+$/.test(relative)) return next();
+          try { res.end(await readFile(new URL(`./node_modules/pdfjs-dist${relative}`, import.meta.url))); } catch { next(); }
+        });
+      },
+    }, { name: "process-studio-entry", configureServer(server) {
       server.middlewares.use((req, _res, next) => { if (req.url === "/") req.url = "/process.html"; next(); });
     } }],
     server: {

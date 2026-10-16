@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Box, ChevronDown, Code2, FileUp, Focus, History, Layers3, Library, Link2, LoaderCircle, Maximize2, MousePointer2, Pause, ScanSearch, ShieldCheck, Sparkles, Wrench, X } from "lucide-react";
 import { ModelViewer } from "../ModelViewer";
-import { featureDisplayName } from "../featurePresentation";
 import type { AgentWorkspace, CamResult, Job, ManufacturingFeature, RotationalFeatureAnalysis, RotationalManufacturingFeature, ToolpathSegment } from "../types";
 import { activitiesFrom, follow, jobIdIn, PROCESS_PROMPT, rpc, upload } from "./harness";
 import type { Activity, JournalEvent, Stage } from "./harness";
@@ -28,12 +27,14 @@ import type { LiveTranscript } from "./transcript";
 import type { StreamProgress } from "./progress";
 import { cumulativeMaterial, machiningEventStage, previewMaterial, previewSegments } from "./machining-preview";
 import type { MachiningPreview } from "./machining-preview";
+import DrawingViewer from "./DrawingViewer";
 
+type ViewStage = Stage | "drawing" | "model";
 const tabs = [
-  { id: "features", label: "特征识别", icon: ScanSearch }, { id: "process", label: "工序设计", icon: Layers3 },
-  { id: "toolpath", label: "刀路计算", icon: Wrench }, { id: "simulation", label: "仿真验证", icon: ShieldCheck }, { id: "gcode", label: "G 代码", icon: Code2 },
+  { id: "drawing", label: "2d图纸", icon: FileUp }, { id: "model", label: "3d图纸", icon: Box }, { id: "features", label: "特征识别", icon: ScanSearch },
+  { id: "toolpath", label: "加工需求", icon: Wrench }, { id: "process", label: "工艺规划", icon: Layers3 }, { id: "gcode", label: "G代码", icon: Code2 },
 ] as const;
-type Task = { sessionId?: string; jobId?: string; filename: string; view?: { stage: Stage; following: boolean } };
+type Task = { sessionId?: string; jobId?: string; filename: string; view?: { stage: ViewStage; following: boolean } };
 const storageKey = "nexus.process-studio.task.v1";
 const emptyIds: string[] = [];
 const emptySegments: ToolpathSegment[] = [];
@@ -57,9 +58,9 @@ function taskAddress(jobId?: string): string {
   if (jobId) url.searchParams.set("task", jobId); else url.searchParams.delete("task");
   return url.href;
 }
-function restoreView(task: Task | null): { stage: Stage; following: boolean } {
+function restoreView(task: Task | null): { stage: ViewStage; following: boolean } {
   const view = task?.view;
-  return view && tabs.some(tab => tab.id === view.stage) && typeof view.following === "boolean"
+  return view && (tabs.some(tab => tab.id === view.stage) || view.stage === "simulation") && typeof view.following === "boolean"
     ? view : { stage: "features", following: true };
 }
 async function get<T>(path: string, optional = false): Promise<T | null> {
@@ -94,7 +95,7 @@ function featuresOf(job: Job | null, rotational: RotationalFeatureAnalysis | nul
 export default function Studio({ onLogout }: { onLogout: () => void }) {
   const translateToChinese = processStudioDisplayConfig.translateToChinese;
   const [task, setTask] = useState<Task | null>(restore);
-  const [stage, setStage] = useState<Stage>(() => restoreView(task).stage);
+  const [stage, setStage] = useState<ViewStage>(() => restoreView(task).stage);
   const [following, setFollowing] = useState(() => restoreView(task).following);
   const [job, setJob] = useState<Job | null>(null);
   const [workspace, setWorkspace] = useState<AgentWorkspace | null>(null);
@@ -418,10 +419,8 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
     try { await rpc("session/cancel", { request: { sessionId: task?.sessionId } }); } catch (reason) { setError((reason as Error).message); }
   };
   const viewedFeatures = selectedFeatures.length ? selectedFeatures : operation?.feature_ids || emptyIds;
-  const focusedFeature = features.find(feature => feature.id === selectedFeatures[0]);
   const stockSelected = selectedOperation === "stock" && (stage === "process" || stage === "simulation");
   const inspectStock = () => { changeFollowing(false); setStage("process"); setSelectedOperation("stock"); setSelectedFeatures([]); setDetails(true); };
-  const focusTitle = stockSelected ? "毛坯选择 · 初始实心毛坯" : operation ? operation.name : selectedFeatures.length === 1 && focusedFeature ? featureDisplayName(focusedFeature) : following ? currentAction?.label || activeEvent?.title || "零件工程视图" : tabs.find(tab => tab.id === stage)?.label;
   const setup = job?.plan?.setups.find(item => item.operations.some(candidate => candidate.id === selectedOperation));
   const axis = setup?.work_axis;
   const stableWorkAxis = useMemo(() => axis, [axis?.x, axis?.y, axis?.z]);
@@ -441,17 +440,18 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
     <input ref={drawingInput} hidden type="file" accept=".pdf,application/pdf" onChange={event => selectDrawingFile(Array.from(event.target.files || []))} />
     <header className="studio-header">
       <div className="studio-brand"><span className="studio-brand-mark"><Box size={23} /></span><div><strong>NEXUS <span>智能工艺设计</span></strong><small>AI PROCESS DESIGN STUDIO</small></div></div>
-      <div className="studio-document"><span className="studio-status"><i className={liveRunning || busy ? "pulse" : ""} />{status}</span><strong title={task?.filename}>{task?.filename || "新建零件工艺"}</strong></div>
+      <div className="studio-document"><span className="studio-status"><i className={liveRunning || busy ? "pulse" : ""} />{status}</span><strong title={task?.filename}>{task?.filename || "新建零件工艺"}</strong>{job?.drawing_filename && <small title={job.drawing_filename}>{job.drawing_filename}</small>}</div>
       <div className="studio-header-actions">{task?.jobId && <button onClick={() => void copyTaskLink()}><Link2 size={16} />{linkCopied ? "链接已复制" : "复制任务链接"}</button>}<button onClick={() => setStockRulesOpen(true)}><Wrench size={16} />工艺规则</button><button onClick={() => setResourceOpen(true)}><Library size={16} />资源库</button><button disabled={busy} onClick={() => void openHistory()}><History size={16} />历史任务</button><button onClick={openUpload} disabled={busy}><FileUp size={16} />新建任务</button><AccountMenu onLogout={onLogout} /></div>
     </header>
     {resourceOpen && <ResourceLibrary machineInstanceId={job?.machine_instance_id} onClose={() => setResourceOpen(false)} />}
     {stockRulesOpen && <StockRuleDialog onClose={() => setStockRulesOpen(false)} onSaved={() => setStockRuleRevision(value => value + 1)} />}
-    <section className={`studio-canvas${stage === "gcode" ? " studio-code-canvas" : ""}`} onPointerDown={event => { if ((event.target as HTMLElement).tagName === "CANVAS") changeFollowing(false); }}>
-      {job?.model_url && stage !== "gcode" && <ModelViewer modelUrl={solidPreviewUrl || job.model_url} features={stockSelected || solidPreviewUrl ? emptyFeatures : features} selectedFeatureIds={stockSelected || solidPreviewUrl ? emptyIds : viewedFeatures} onSelectFeature={inspectFeature}
-        viewMode={stockSelected ? "仿真" : stage === "features" ? "特征" : stage === "process" ? "工艺" : stage === "toolpath" ? "刀路" : "仿真"}
+    <section className={`studio-canvas${stage === "gcode" ? " studio-code-canvas" : stage === "drawing" ? " studio-drawing-canvas" : ""}`} onPointerDown={event => { if ((event.target as HTMLElement).tagName === "CANVAS") changeFollowing(false); }}>
+      {stage === "drawing" && <DrawingViewer key={task?.jobId} job={job} />}
+      {job?.model_url && stage !== "gcode" && stage !== "drawing" && <ModelViewer modelUrl={solidPreviewUrl || job.model_url} features={stage === "model" || stockSelected || solidPreviewUrl ? emptyFeatures : features} selectedFeatureIds={stage === "model" || stockSelected || solidPreviewUrl ? emptyIds : viewedFeatures} onSelectFeature={inspectFeature}
+        viewMode={stockSelected ? "仿真" : stage === "features" || stage === "model" ? "特征" : stage === "process" ? "工艺" : stage === "toolpath" ? "刀路" : "仿真"}
         toolpathSegments={stage === "toolpath" || stage === "simulation" ? visibleSegments : emptySegments} topologyEdges={stockSelected || solidPreviewUrl ? undefined : job.analysis?.visual_edges}
-        activeOperationId={selectedOperation} activeOperationLabel={stockSelected ? "毛坯选择" : operation?.name} workAxis={stableWorkAxis}
-        showFeatureSummary={false} showFeatureAnnotations={stage === "features"} operationContextVisible={!stockSelected}
+        activeOperationId={stage === "model" ? undefined : selectedOperation} activeOperationLabel={stage === "model" ? undefined : stockSelected ? "毛坯选择" : operation?.name} workAxis={stage === "model" ? undefined : stableWorkAxis}
+        showFeatureSummary={false} showFeatureAnnotations={stage === "features"} operationContextVisible={stage !== "model" && !stockSelected}
         releaseContextOnCleanup backgroundColor={0xdce7f1}
         isolatedFeatureId={stage === "features" && selectedFeatures.length === 1 ? selectedFeatures[0] : null}
         compositionInsetLeftRatio={0} compositionInsetRightRatio={0}
@@ -461,12 +461,11 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
         materialSnapshotUrls={stage === "simulation" && !stockSelected && !activePreview ? snapshots.urls : emptyIds} materialSnapshotStages={stage === "simulation" && !stockSelected && !activePreview ? snapshots.stages : undefined}
         profileBoundaries={stage === "toolpath" || stage === "simulation" ? cam?.profile_boundaries : undefined} toolpathLoaded={visibleSegments.length > 0} />}
       {!stockSelected && (stage === "toolpath" || stage === "simulation") && <div className={`studio-machining-state ${activePreview && !activePreview.can_accept ? "blocked" : ""}`} role="status"><strong>{selectedOperation || "整件加工"} · {activePreview ? "试算结果回放" : visibleSegments.length ? "刀路结果回放" : "正在等待加工证据"}</strong><span>{activePreview ? `${visibleSegments.length} 段刀路 · ${effectivePlaybackMode === "cumulative" ? "从毛坯累计切削" : "单工序切削"} · ${activePreview.can_accept ? "试算可接受（DRAFT）" : activePreview.reason === "profile_overcut" ? "检测到过切，未通过验证" : "验证受阻"}` : machiningError || "刀路与仿真结果生成后将自动展示"}</span>{trialMaterial && <small>按仿真器记录的切削状态回放，最终显示实际余料。</small>}{activePreview && !chainReady && <small>累计回放暂不可用：{playbackChain?.missing_operation_id} {playbackChain?.message || "等待前序材料记录"}</small>}</div>}
-      <nav className="studio-tabs" aria-label="工艺设计阶段">{tabs.map(tab => <button key={tab.id} aria-pressed={stage === tab.id} className={stage === tab.id ? "active" : ""} onClick={() => { setStage(tab.id); changeFollowing(false); }}><tab.icon size={17} />{tab.label}</button>)}</nav>
+      <nav className="studio-tabs" aria-label="工艺设计阶段">{tabs.map(tab => <button key={tab.id} aria-pressed={stage === tab.id || stage === "simulation" && tab.id === "process"} className={stage === tab.id || stage === "simulation" && tab.id === "process" ? "active" : ""} onClick={() => { setStage(tab.id); changeFollowing(false); if (tab.id === "drawing") setConsoleMinimized(true); }}><tab.icon size={17} />{tab.label}</button>)}</nav>
       <div className="studio-follow"><button className={following ? "active" : ""} onClick={() => changeFollowing(!following)}>{following ? <Focus size={16} /> : <MousePointer2 size={16} />}{following ? "跟随智能体" : "自由查看"}<ChevronDown size={12} /></button><button title="显示工程详情" aria-label="显示工程详情" onClick={() => setDetails(!details)}><Layers3 size={18} /></button><button title="全屏工作台" aria-label="全屏工作台" onClick={() => document.fullscreenElement ? void document.exitFullscreen() : void document.documentElement.requestFullscreen()}><Maximize2 size={17} /></button></div>
-      {task && stage !== "gcode" && <div className="studio-focus"><small>{tabs.find(tab => tab.id === stage)?.label} <span>/ {following ? "智能体当前观察" : "手动观察"}</span></small><strong>{focusTitle}</strong>{task.jobId && <code>PART {task.jobId.slice(0, 8).toUpperCase()}</code>}</div>}
-      {!job?.model_url && stage !== "gcode" && !uploadOpen && <div className={`studio-await${details && job ? " with-inspector" : ""}`} role="status" aria-live="polite"><LoaderCircle size={34} className={busy || liveRunning ? "spin" : ""} /><h2>{task ? "等待三维模型就绪" : "从一个零件开始"}</h2><p>{task ? "解析完成后，模型与制造特征将在这里显示。" : "上传 STEP / STP，智能体将开始工艺设计。"}</p></div>}
+      {!job?.model_url && stage !== "gcode" && stage !== "drawing" && !uploadOpen && <div className={`studio-await${details && job ? " with-inspector" : ""}`} role="status" aria-live="polite"><LoaderCircle size={34} className={busy || liveRunning ? "spin" : ""} /><h2>{task ? "等待三维模型就绪" : "从一个零件开始"}</h2><p>{task ? "解析完成后，模型与制造特征将在这里显示。" : "上传 STEP / STP，智能体将开始工艺设计。"}</p></div>}
       {stage === "gcode" && <GCodePanel key={task?.jobId} jobId={task?.jobId} existingUrl={gcodeUrl} onAvailability={setGenericProgramAvailable} onProgramStates={setProgramStates} selectedOperationId={selectedOperation} onSelectOperationId={setSelectedOperation} detailsVisible={details} />}
-      {details && job && <aside className={`studio-inspector${stage === "features" ? " studio-feature-inspector" : ""}`}><header><div><small>ENGINEERING DETAILS</small><strong>{stage === "features" ? `制造特征 · ${features.length}` : stage === "process" ? "装夹与工序" : stage === "toolpath" ? "刀路轨迹" : stage === "gcode" ? "工序代码" : "验证结果"}</strong></div><button aria-label="收起详情" onClick={() => setDetails(false)}><X size={16} /></button></header>
+      {details && job && stage !== "drawing" && stage !== "model" && <aside className={`studio-inspector${stage === "features" ? " studio-feature-inspector" : ""}`}><header><div><small>ENGINEERING DETAILS</small><strong>{stage === "features" ? `制造特征 · ${features.length}` : stage === "process" ? "装夹与工序" : stage === "toolpath" ? "刀路轨迹" : stage === "gcode" ? "工序代码" : "验证结果"}</strong></div><button aria-label="收起详情" onClick={() => setDetails(false)}><X size={16} /></button></header>
         <div className="studio-inspector-body">
           {stage==='process' && job.device_id==='citizen-cincom-l32' && job.plan && <RadialSetupPanel key={job.id} job={job} running={liveRunning} onChanged={updated=>{setJob(updated);setCam(null);setTrials(null);setMachining(null);setPlaybackChain(null);}}/>}
           {stage==='process' && job.device_id==='citizen-cincom-l32' && job.plan && <CutoffSetupPanel key={job.id} job={job} running={liveRunning} onChanged={updated=>{setJob(updated);setCam(null);setTrials(null);setMachining(null);setPlaybackChain(null);}}/>}
@@ -504,7 +503,7 @@ export default function Studio({ onLogout }: { onLogout: () => void }) {
         </div><footer><i /><span>{job.machine || "Citizen Cincom L32"}<small>{job.material || "材料待确认"}</small></span></footer>
       </aside>}
       {(error || dataError || job?.error) && <div className="studio-error" role="alert"><span>{error || dataError || job?.error}</span><button aria-label="关闭提示" onClick={() => { setError(""); setDataError(""); }}><X size={15} /></button></div>}
-      <section ref={floatingConsole.ref} style={floatingConsole.style} className={`studio-console ${expanded ? "expanded" : ""} ${consoleCompact ? "minimized" : ""}`} aria-label="智能体任务进度"><header {...floatingConsole.headerProps} title="拖动移动智能体窗口"><div><Sparkles size={16} /><strong>工艺设计智能体</strong><span className={liveRunning ? "running" : ""}>{status}</span></div><div><button onClick={() => setConsoleMinimized(!consoleCompact)} aria-label={consoleCompact ? "展开智能体窗口" : "最小化智能体窗口"} aria-expanded={!consoleCompact}><ChevronDown size={14} style={{ transform: consoleCompact ? "rotate(180deg)" : undefined }} /></button>{liveRunning && task?.sessionId && <button onClick={() => void cancel()} title="停止当前任务"><Pause size={14} /></button>}<button onClick={() => { setExpanded(!expanded); setConsoleMinimized(false); }} aria-label={expanded ? "收起历史动态" : "查看历史动态"}><History size={15} /></button></div></header><p className="studio-console-summary">{ended && !liveRunning ? `${result.label} · ${genericProgramAvailable ? "已生成通用 G 代码" : "查看任务结果"}` : currentAction?.label || status}</p>{ended && !liveRunning ? <><ResultCard key={task?.jobId} job={job} workspace={workspace} trials={trials} events={journal} sessionId={task?.sessionId} programAvailable={Boolean(gcodeUrl)} genericProgramAvailable={genericProgramAvailable} onValidation={() => { setStage("simulation"); setDetails(true); changeFollowing(false); }} />{expanded && <HarnessTranscript key={String(task?.sessionId) + String(translateToChinese)} translateToChinese={translateToChinese} events={journal} live={null} expanded running={false} />}</> : <HarnessTranscript key={String(task?.sessionId) + String(translateToChinese)} translateToChinese={translateToChinese} events={journal} live={liveTranscript} expanded={expanded && !questionWaiting} running={liveRunning && !questionWaiting} />}{task?.sessionId && <Interaction key={task.sessionId} sessionId={task.sessionId} onWaiting={setQuestionWaiting} onSubmitted={() => changeFollowing(true)} />}</section>
+      <section ref={floatingConsole.ref} style={floatingConsole.style} className={`studio-console ${expanded ? "expanded" : ""} ${consoleCompact ? "minimized" : ""}`} aria-label="智能体任务进度"><header {...floatingConsole.headerProps} title="拖动移动智能体窗口"><div><Sparkles size={16} /><strong>工艺设计智能体</strong><span className={liveRunning ? "running" : ""}>{status}</span></div><div><button onClick={() => setConsoleMinimized(!consoleCompact)} aria-label={consoleCompact ? "展开智能体窗口" : "最小化智能体窗口"} aria-expanded={!consoleCompact}><ChevronDown size={14} style={{ transform: consoleCompact ? "rotate(180deg)" : undefined }} /></button>{liveRunning && task?.sessionId && <button onClick={() => void cancel()} title="停止当前任务"><Pause size={14} /></button>}<button onClick={() => { setExpanded(!expanded); setConsoleMinimized(false); }} aria-label={expanded ? "收起历史动态" : "查看历史动态"}><History size={15} /></button></div></header><p className="studio-console-summary">{ended && !liveRunning ? `${result.label} · ${genericProgramAvailable ? "已生成通用 G 代码" : "查看任务结果"}` : currentAction?.label || status}</p>{ended && !liveRunning ? <><ResultCard key={task?.jobId} job={job} workspace={workspace} trials={trials} events={journal} sessionId={task?.sessionId} programAvailable={Boolean(gcodeUrl) && genericProgramAvailable} genericProgramAvailable={genericProgramAvailable} onValidation={() => { setStage("simulation"); setDetails(true); changeFollowing(false); }} />{expanded && <HarnessTranscript key={String(task?.sessionId) + String(translateToChinese)} translateToChinese={translateToChinese} events={journal} live={null} expanded running={false} />}</> : <HarnessTranscript key={String(task?.sessionId) + String(translateToChinese)} translateToChinese={translateToChinese} events={journal} live={liveTranscript} expanded={expanded && !questionWaiting} running={liveRunning && !questionWaiting} />}{task?.sessionId && <Interaction key={task.sessionId} sessionId={task.sessionId} onWaiting={setQuestionWaiting} onSubmitted={() => changeFollowing(true)} />}</section>
       <div className="studio-metrics"><span><b>{features.length}</b> 特征</span><span><b>{operations.length}</b> 工序</span><span><b>{segments.length.toLocaleString()}</b> 刀路段</span><span className="studio-draft">{ended ? `${result.label} · ${result.ready ? "验证门禁通过" : "尚不可用于生产"}` : "工程草案 · 待审查"}</span></div>
       {uploadOpen && <div className="studio-modal-backdrop studio-upload-backdrop"><section className="studio-upload" role="dialog" aria-modal="true" aria-label="新建智能工艺设计">
         <header><span><FileUp size={17} />新建智能工艺设计</span><button aria-label="关闭上传" disabled={busy} onClick={() => setUploadOpen(false)}><X size={18} /></button></header>

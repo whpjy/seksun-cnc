@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Code2, LoaderCircle } from "lucide-react";
 
 type Program = { filename: string; operation_id: string; name: string; channel: string; coordinate_frame: string; line_count: number; assumptions: string[]; url: string };
 type Manifest = { status: string; notice: string; generated_count: number; operation_count?: number; programs: Program[]; missing: { operation_id: string; name: string; reason: string }[]; bundle_url?: string; source_signature?: string };
+type PlanningStatus = { allowed: boolean; reason: string };
 
 async function load<T>(url: string, signal: AbortSignal, method = "GET"): Promise<T> {
   const response = await fetch(url, { method, signal, cache: "no-store" });
@@ -58,48 +59,50 @@ export default function GCodePanel({ jobId, existingUrl, onAvailability, onProgr
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const generating = useRef(false);
+  const [planning, setPlanning] = useState<PlanningStatus | null>(null);
   const base = jobId ? `/api/v1/jobs/${jobId}/gcode/generic` : undefined;
 
   useEffect(() => {
-    setManifest(null); setError("");
-    if (!base || existingUrl) return;
+    setManifest(null); setError(""); setPlanning(null);
+    if (!base) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     let active = true;
-    const accept = (next: Manifest) => {
-      if (!active) return;
-      setManifest(next);
-    };
     const refresh = async () => {
-      try { if (!generating.current) accept(await load<Manifest>(base, controller.signal)); }
-      catch (reason) { if (active) setError(reason instanceof Error ? reason.message : "程序读取失败"); }
-      if (active) timer = setTimeout(refresh, 10000);
-    };
-    const start = async () => {
-      generating.current = true; setBusy(true);
       try {
+        const status = await load<PlanningStatus>(base.replace(/\/generic$/, "/planning-status"), controller.signal);
+        if (!active) return;
+        setPlanning(status); setError("");
+        if (!status.allowed) { setManifest(null); return; }
+        if (existingUrl) return;
         let next = await load<Manifest>(base, controller.signal);
-        if (next.status === "not_generated" || next.status === "stale") next = await load<Manifest>(base, controller.signal, "POST");
-        accept(next);
-      } catch (reason) { if (active) setError(reason instanceof Error ? reason.message : "程序生成失败"); }
+        if (next.status === "not_generated" || next.status === "stale") {
+          setBusy(true);
+          next = await load<Manifest>(base, controller.signal, "POST");
+        }
+        if (active) {
+          setManifest(next);
+          if (next.status === "blocked") setPlanning({ allowed: false, reason: next.notice });
+        }
+      } catch (reason) { if (active) { setPlanning(null); setManifest(null); setError(reason instanceof Error ? reason.message : "程序生成失败"); } }
       finally {
-        if (active) { generating.current = false; setBusy(false); timer = setTimeout(refresh, 10000); }
+        if (active) { setBusy(false); timer = setTimeout(refresh, 10000); }
       }
     };
-    void start();
-    return () => { active = false; controller.abort(); clearTimeout(timer); generating.current = false; };
+    void refresh();
+    return () => { active = false; controller.abort(); clearTimeout(timer); };
   }, [base, existingUrl]);
 
-  useEffect(() => { if (manifest) onAvailability(manifest.programs.length > 0 && manifest.status !== "stale"); }, [manifest, onAvailability]);
+  const allowed = planning?.allowed === true;
+  useEffect(() => { onAvailability(allowed && Boolean(existingUrl || manifest && manifest.programs.length > 0 && manifest.status !== "stale")); }, [allowed, existingUrl, manifest, onAvailability]);
 
   useEffect(() => {
-    if (!manifest) return;
+    if (!allowed || !manifest) { onProgramStates({}); return; }
     const states: Record<string, string> = {};
     for (const item of manifest.programs) states[item.operation_id] = manifest.status === "stale" ? "方案已变化" : "代码已生成";
     for (const item of manifest.missing) states[item.operation_id] = "尚未生成";
     onProgramStates(states);
-  }, [manifest, onProgramStates]);
+  }, [allowed, manifest, onProgramStates]);
 
   const program = manifest?.programs.find(item => item.operation_id === selectedOperationId) || (!selectedOperationId ? manifest?.programs[0] : undefined);
   const missing = manifest?.missing.find(item => item.operation_id === selectedOperationId);
@@ -111,7 +114,8 @@ export default function GCodePanel({ jobId, existingUrl, onAvailability, onProgr
 
   return <section className={`studio-code studio-code-premium studio-code-flat studio-code-selected${detailsVisible ? " with-inspector" : ""}`}>
     {error && <p className="studio-code-error" role="alert">{error}</p>}
-    {existingUrl ? <div className="studio-code-content"><article className="studio-nc-card studio-nc-card-full"><header><div className="studio-nc-card-title"><Code2 size={16} /><strong>完整加工程序</strong></div></header><CodeContent url={existingUrl} /></article></div>
+    {!allowed ? <div className="studio-code-empty"><Code2 size={30} /><strong>{planning ? "工艺规划尚未成功完成" : "正在确认工艺规划状态"}</strong><p>{planning?.reason || (error ? "暂时无法确认规划结果，已暂停生成 G 代码。" : "工艺规划成功完成后，才会生成和显示 G 代码。")}</p></div>
+      : existingUrl ? <div className="studio-code-content"><article className="studio-nc-card studio-nc-card-full"><header><div className="studio-nc-card-title"><Code2 size={16} /><strong>完整加工程序</strong></div></header><CodeContent url={existingUrl} /></article></div>
       : program ? <div className="studio-code-content" key={program.filename}><ProgramCard program={program} revision={manifest?.source_signature} /></div>
       : missing ? <div className="studio-code-empty"><Code2 size={30} /><strong>{missing.operation_id} {missing.name.replace(missing.operation_id + " ", "")}</strong><p>{missing.reason}</p></div>
       : <div className="studio-code-empty">{busy ? <LoaderCircle size={30} className="spin" /> : <Code2 size={30} />}<strong>{busy ? "正在生成通用加工程序" : manifest?.status === "stale" ? "工艺方案已变化" : "尚无可预览的程序"}</strong><p>{manifest?.status === "stale" ? "重新进入 G 代码页面，使用当前方案更新程序。" : "选择右侧工序，在这里查看对应的加工程序。"}</p></div>}
